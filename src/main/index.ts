@@ -1,14 +1,30 @@
 import { app, shell, BrowserWindow, ipcMain } from 'electron'
 import { join } from 'path'
+import os from 'os'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
 import { startExpressServer } from './server'
 
+function getMacAddress(): string {
+  const interfaces = os.networkInterfaces()
+  for (const iface of Object.values(interfaces)) {
+    if (!iface) continue
+    for (const info of iface) {
+      if (!info.internal && info.mac && info.mac !== '00:00:00:00:00:00') {
+        return info.mac
+      }
+    }
+  }
+  return 'UNKNOWN-MAC'
+}
+
 function createWindow(): void {
   // Create the browser window.
   const mainWindow = new BrowserWindow({
-    width: 900,
-    height: 670,
+    width: 1280,
+    height: 800,
+    minWidth: 900,
+    minHeight: 600,
     show: false,
     autoHideMenuBar: true,
     ...(process.platform === 'linux' ? { icon } : {}),
@@ -31,6 +47,7 @@ function createWindow(): void {
   // Load the remote URL for development or the local html file for production.
   if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
     mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
+    mainWindow.webContents.openDevTools({ mode: 'detach' })
   } else {
     mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
   }
@@ -53,9 +70,12 @@ app.whenReady().then(async () => {
   // IPC test
   ipcMain.on('ping', () => console.log('pong'))
 
+  // Expose real MAC address to the renderer securely via IPC
+  ipcMain.handle('get-mac-address', () => getMacAddress())
+
   // Start the local express server
   try {
-    const port = await startExpressServer(5000)
+    const port = await startExpressServer(parseInt(process.env.LOCAL_SERVER_PORT || '52001'))
     console.log(`Express API started on port ${port}`)
   } catch (err) {
     console.error('Failed to start Express API', err)

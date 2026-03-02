@@ -1,210 +1,590 @@
 import React, { useState } from 'react'
-import { Key, Database, Server, User, Lock, Activity, ArrowRight } from 'lucide-react'
+import {
+  Key,
+  Store,
+  Activity,
+  ArrowRight,
+  Home,
+  MonitorSmartphone,
+  Settings,
+  LogOut,
+  Shield,
+  Lock
+} from 'lucide-react'
 import { Button } from './components/ui/button'
 import { Input } from './components/ui/input'
 import axios from 'axios'
 
+// Always fall back to the known local port so requests never go to "undefined/..."
+const LOCAL_API = (import.meta.env.VITE_LOCAL_API_URL as string) || 'http://127.0.0.1:52001'
+
+// Steps:
+// 0 = Splash (checks setup status, routes automatically)
+// 1 = License entry          (first-time only)
+// 2 = Shop profile setup     (first-time only)
+// 3 = Login                  (every launch after setup)
+// 4 = Manager Dashboard
+
 function App(): React.JSX.Element {
+  const [step, setStep] = useState(0)
   const [loading, setLoading] = useState(false)
-  const [formData, setFormData] = useState({
-    licenseKey: '',
-    dbHost: 'localhost',
-    dbPort: '5432',
-    dbUser: 'postgres',
-    dbPassword: '',
-    dbName: 'shopms_local'
+  const [errorMsg, setErrorMsg] = useState('')
+
+  // Step 1 data
+  const [licenseData, setLicenseData] = useState({ licenseKey: '' })
+
+  // Step 2 data
+  const [shopData, setShopData] = useState({
+    branchName: '',
+    shopName: '',
+    location: '',
+    gst: '',
+    adminUsername: '',
+    adminPassword: '',
+    confirmPassword: ''
   })
 
-  const handleChange = (e: React.ChangeEvent<HTMLInputElement>): void => {
-    setFormData((prev) => ({ ...prev, [e.target.name]: e.target.value }))
-  }
+  // Step 3 data
+  const [loginData, setLoginData] = useState({ username: '', password: '' })
 
-  const handleSubmit = async (e: React.FormEvent): Promise<void> => {
+  // Dashboard state
+  const [activeTab, setActiveTab] = useState('overview')
+  const [authToken, setAuthToken] = useState<string | null>(
+    () => localStorage.getItem('managerToken')
+  )
+  type AuthorizedClient = {
+    id: string
+    friendlyName: string
+    macAddress: string
+    authorizedAt: string
+  }
+  const [devices, setDevices] = useState<AuthorizedClient[]>([])
+  const [devicesLoading, setDevicesLoading] = useState(false)
+
+  // ─── Splash: check setup status, then route ───────────────────────────────
+  React.useEffect(() => {
+    if (step !== 0) return
+    const timer = setTimeout(async () => {
+      try {
+        const res = await axios.get(`${LOCAL_API}/api/v1/system/status`)
+        if (res.data.setupDone) {
+          setStep(3) // Already set up → go straight to Login
+        } else {
+          setStep(1) // Fresh install → License entry
+        }
+      } catch {
+        setStep(1) // Server not yet ready or fresh install
+      }
+    }, 3000)
+    return () => clearTimeout(timer)
+  }, [step])
+
+  // ─── Step 1: License activation ───────────────────────────────────────────
+  const handleLicenseSubmit = async (e: React.FormEvent): Promise<void> => {
     e.preventDefault()
     setLoading(true)
-
+    setErrorMsg('')
     try {
-      // Mock Axios call to the Admin SaaS
-      const response = await axios.post('http://localhost:3000/api/v1/licenses/activate', {
-        licenseKey: formData.licenseKey,
-        hardwareId: 'MOCK-MAC-1234'
+      const hardwareId: string = await window.electron.ipcRenderer.invoke('get-mac-address')
+      await axios.post(`${LOCAL_API}/api/v1/system/save-config`, {
+        licenseKey: licenseData.licenseKey,
+        hardwareId,
+        branchName: 'PENDING_SETUP'
       })
-
-      console.log('Activation Response:', response.data)
-      alert('Phase 1: Activation Successful (Mock)!')
-    } catch (err) {
-      console.error('Activation Failed:', err)
-      alert('Activation Failed (Mock fallback triggered or endpoint down).')
+      setStep(2)
+    } catch (err: unknown) {
+      if (axios.isAxiosError(err)) {
+        setErrorMsg(err.response?.data?.error || err.message || 'Activation Failed')
+      } else {
+        setErrorMsg('Activation Failed')
+      }
     } finally {
       setLoading(false)
     }
   }
 
-  return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex items-center justify-center p-6 font-sans">
-      <div className="absolute inset-0 bg-[url('https://grainy-gradients.vercel.app/noise.svg')] opacity-20 pointer-events-none mix-blend-overlay"></div>
+  // ─── Step 2: Profile setup ────────────────────────────────────────────────
+  const handleShopSubmit = async (e: React.FormEvent): Promise<void> => {
+    e.preventDefault()
+    if (shopData.adminPassword !== shopData.confirmPassword) {
+      setErrorMsg('Passwords do not match')
+      return
+    }
+    setLoading(true)
+    setErrorMsg('')
+    try {
+      await axios.post(`${LOCAL_API}/api/v1/system/setup-profile`, {
+        branchName: shopData.branchName,
+        shopName: shopData.shopName,
+        location: shopData.location,
+        gst: shopData.gst,
+        adminUsername: shopData.adminUsername,
+        adminPassword: shopData.adminPassword
+      })
+      setStep(4) // First-time setup complete → go directly to Dashboard
+    } catch (err: unknown) {
+      if (axios.isAxiosError(err)) {
+        setErrorMsg(err.response?.data?.error || err.message || 'Profile Setup Failed')
+      } else {
+        setErrorMsg('Profile Setup Failed')
+      }
+    } finally {
+      setLoading(false)
+    }
+  }
 
-      {/* Dynamic Background */}
-      <div className="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] bg-blue-600/30 rounded-full blur-[120px] pointer-events-none"></div>
-      <div className="absolute bottom-[-10%] right-[-10%] w-[40%] h-[40%] bg-emerald-600/30 rounded-full blur-[120px] pointer-events-none"></div>
+  // ─── Step 3: Login ────────────────────────────────────────────────────────
+  const handleLogin = async (e: React.FormEvent): Promise<void> => {
+    e.preventDefault()
+    setLoading(true)
+    setErrorMsg('')
+    try {
+      const res = await axios.post(`${LOCAL_API}/api/v1/auth/login`, {
+        username: loginData.username,
+        password: loginData.password
+      })
+      const token: string = res.data.token
+      setAuthToken(token)
+      localStorage.setItem('managerToken', token)
+      setStep(4)
+    } catch (err: unknown) {
+      if (axios.isAxiosError(err)) {
+        setErrorMsg(err.response?.data?.error || err.message || 'Login Failed')
+      } else {
+        setErrorMsg('Login Failed')
+      }
+    } finally {
+      setLoading(false)
+    }
+  }
 
-      <div className="relative w-full max-w-xl">
-        <div className="text-center mb-10">
-          <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-gradient-to-br from-blue-500 to-emerald-400 mb-6 shadow-xl shadow-blue-500/20">
-            <Activity className="w-8 h-8 text-white" />
+  const handleSignOut = (): void => {
+    setAuthToken(null)
+    localStorage.removeItem('managerToken')
+    setLoginData({ username: '', password: '' })
+    setErrorMsg('')
+    setActiveTab('overview')
+    setDevices([])
+    setStep(3)
+  }
+
+  // ─── Devices: fetch when tab is active ────────────────────────────────────
+  React.useEffect(() => {
+    if (activeTab !== 'devices' || step !== 4) return
+    setDevicesLoading(true)
+    axios
+      .get(`${LOCAL_API}/api/v1/system/authorized-clients`)
+      .then((res) => setDevices(res.data.clients ?? []))
+      .catch(() => setDevices([]))
+      .finally(() => setDevicesLoading(false))
+  }, [activeTab, step])
+
+  // ─── Step 0: Splash ───────────────────────────────────────────────────────
+  if (step === 0) {
+    return (
+      <div className="min-h-screen bg-zinc-950 text-white flex flex-col items-center justify-center p-6 font-sans drag-region">
+        <div className="flex items-center gap-3 animate-pulse">
+          <div className="w-12 h-12 rounded-xl bg-white flex items-center justify-center shadow-lg">
+            <Activity className="w-8 h-8 text-black" />
           </div>
-          <h1 className="text-4xl font-bold tracking-tight mb-3">ShopMS Main Setup</h1>
-          <p className="text-slate-400 text-lg">
-            Enter your license key and database credentials to initialize the central system.
-          </p>
+          <span className="text-4xl font-bold tracking-tight">Cashlio</span>
         </div>
+        <p className="mt-4 text-zinc-400 font-medium">Initializing Local Branch Engine...</p>
+      </div>
+    )
+  }
 
-        <div className="bg-slate-900/60 backdrop-blur-xl border border-slate-800 rounded-3xl p-8 shadow-2xl">
-          <form onSubmit={handleSubmit} className="space-y-6">
-            {/* License Section */}
-            <div className="space-y-4">
-              <h2 className="text-sm font-semibold text-emerald-400 tracking-wider uppercase mb-2 flex items-center gap-2">
-                <Key className="w-4 h-4" /> License Activation
-              </h2>
+  // ─── Step 1: License ──────────────────────────────────────────────────────
+  if (step === 1) {
+    return (
+      <div className="min-h-screen bg-background text-foreground flex items-center justify-center p-6 font-sans drag-region">
+        <div className="relative w-full max-w-xl no-drag-region">
+          <div className="text-center mb-10">
+            <div className="inline-flex items-center justify-center w-16 h-16 rounded-xl bg-zinc-100 border border-zinc-200 mb-6 shadow-sm">
+              <Activity className="w-8 h-8 text-zinc-900" />
+            </div>
+            <h1 className="text-3xl font-bold tracking-tight mb-3">System Activation</h1>
+            <p className="text-muted-foreground text-base">
+              Enter your license key provided by the SaaS admin.
+            </p>
+          </div>
 
+          <div className="bg-card text-card-foreground border rounded-xl p-8 shadow-sm">
+            {errorMsg && (
+              <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-md text-red-600 text-sm font-medium">
+                {errorMsg}
+              </div>
+            )}
+
+            <form onSubmit={handleLicenseSubmit} className="space-y-6">
               <div>
-                <label className="block text-sm font-medium text-slate-300 mb-1.5 ml-1">
-                  License Key
-                </label>
+                <label className="block text-sm font-semibold mb-1.5 ml-1">License Key</label>
                 <div className="relative">
                   <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none">
-                    <Key className="w-5 h-5 text-slate-500 z-10" />
+                    <Key className="w-5 h-5 text-muted-foreground z-10" />
                   </div>
                   <Input
                     type="text"
-                    name="licenseKey"
-                    value={formData.licenseKey}
-                    onChange={handleChange}
-                    className="pl-11 bg-slate-800/50 border-slate-700 text-slate-100 placeholder-slate-500 focus-visible:ring-emerald-500 h-12 rounded-xl"
-                    placeholder="SHP-XYZ1-ABC2-9988"
+                    value={licenseData.licenseKey}
+                    onChange={(e) => setLicenseData({ licenseKey: e.target.value })}
+                    className="pl-11 h-12"
+                    placeholder="E.g. SHP-XYZ..."
                     required
                   />
                 </div>
               </div>
+
+              <Button
+                type="submit"
+                disabled={loading}
+                className="mt-8 w-full group flex justify-center items-center gap-2 h-12 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 font-medium transition-all"
+              >
+                {loading ? (
+                  <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                ) : (
+                  <>
+                    <span>Activate & Continue</span>
+                    <ArrowRight className="w-4 h-4 group-hover:translate-x-1 transition-transform" />
+                  </>
+                )}
+              </Button>
+            </form>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // ─── Step 2: Shop Profile ─────────────────────────────────────────────────
+  if (step === 2) {
+    return (
+      <div className="min-h-screen bg-background text-foreground flex items-center justify-center p-6 font-sans drag-region">
+        <div className="relative w-full max-w-xl no-drag-region">
+          <div className="text-center mb-10">
+            <div className="inline-flex items-center justify-center w-16 h-16 rounded-xl bg-zinc-100 border border-zinc-200 mb-6 shadow-sm">
+              <Store className="w-8 h-8 text-zinc-900" />
             </div>
+            <h1 className="text-3xl font-bold tracking-tight mb-3">Shop Profile</h1>
+            <p className="text-muted-foreground text-base">
+              Configure your shop details and Super Admin account.
+            </p>
+          </div>
 
-            <hr className="border-slate-800 my-8" />
+          <div className="bg-card text-card-foreground border rounded-xl p-8 shadow-sm">
+            {errorMsg && (
+              <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-md text-red-600 text-sm font-medium">
+                {errorMsg}
+              </div>
+            )}
 
-            {/* Database Section */}
-            <div className="space-y-4">
-              <h2 className="text-sm font-semibold text-blue-400 tracking-wider uppercase mb-2 flex items-center gap-2">
-                <Database className="w-4 h-4" /> Local PostgreSQL Instance
-              </h2>
-
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-sm font-medium text-slate-300 mb-1.5 ml-1">
-                    Host
-                  </label>
-                  <div className="relative">
-                    <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none">
-                      <Server className="w-5 h-5 text-slate-500 z-10" />
-                    </div>
+            <form onSubmit={handleShopSubmit} className="space-y-6">
+              <div className="space-y-4">
+                <h2 className="text-sm font-bold text-zinc-900 uppercase tracking-wider mb-2">
+                  Shop Details
+                </h2>
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm font-semibold mb-1.5 ml-1">Branch Name</label>
                     <Input
                       type="text"
-                      name="dbHost"
-                      value={formData.dbHost}
-                      onChange={handleChange}
-                      className="pl-11 bg-slate-800/50 border-slate-700 text-slate-100 focus-visible:ring-blue-500 h-12 rounded-xl"
+                      value={shopData.branchName}
+                      onChange={(e) => setShopData({ ...shopData, branchName: e.target.value })}
+                      placeholder="e.g. Downtown Store"
+                      className="h-11"
+                      required
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-semibold mb-1.5 ml-1">Shop Name</label>
+                    <Input
+                      type="text"
+                      value={shopData.shopName}
+                      onChange={(e) => setShopData({ ...shopData, shopName: e.target.value })}
+                      placeholder="e.g. Acme Electronics"
+                      className="h-11"
                       required
                     />
                   </div>
                 </div>
-                <div>
-                  <label className="block text-sm font-medium text-slate-300 mb-1.5 ml-1">
-                    Port
-                  </label>
-                  <Input
-                    type="text"
-                    name="dbPort"
-                    value={formData.dbPort}
-                    onChange={handleChange}
-                    className="bg-slate-800/50 border-slate-700 text-slate-100 focus-visible:ring-blue-500 h-12 rounded-xl px-4"
-                    required
-                  />
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm font-semibold mb-1.5 ml-1">Location</label>
+                    <Input
+                      type="text"
+                      value={shopData.location}
+                      onChange={(e) => setShopData({ ...shopData, location: e.target.value })}
+                      className="h-11"
+                      required
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-semibold mb-1.5 ml-1">GST/Tax ID</label>
+                    <Input
+                      type="text"
+                      value={shopData.gst}
+                      onChange={(e) => setShopData({ ...shopData, gst: e.target.value })}
+                      className="h-11"
+                      required
+                    />
+                  </div>
                 </div>
               </div>
 
-              <div className="grid grid-cols-2 gap-4">
+              <hr className="border-border my-6" />
+
+              <div className="space-y-4">
+                <h2 className="text-sm font-bold text-zinc-900 uppercase tracking-wider mb-2">
+                  Super Admin Account
+                </h2>
                 <div>
-                  <label className="block text-sm font-medium text-slate-300 mb-1.5 ml-1">
-                    Database User
-                  </label>
-                  <div className="relative">
-                    <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none">
-                      <User className="w-5 h-5 text-slate-500 z-10" />
-                    </div>
-                    <Input
-                      type="text"
-                      name="dbUser"
-                      value={formData.dbUser}
-                      onChange={handleChange}
-                      className="pl-11 bg-slate-800/50 border-slate-700 text-slate-100 focus-visible:ring-blue-500 h-12 rounded-xl"
-                      required
-                    />
-                  </div>
+                  <label className="block text-sm font-semibold mb-1.5 ml-1">Admin Username</label>
+                  <Input
+                    type="text"
+                    value={shopData.adminUsername}
+                    onChange={(e) => setShopData({ ...shopData, adminUsername: e.target.value })}
+                    className="h-11"
+                    required
+                  />
                 </div>
-                <div>
-                  <label className="block text-sm font-medium text-slate-300 mb-1.5 ml-1">
-                    Password
-                  </label>
-                  <div className="relative">
-                    <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none">
-                      <Lock className="w-5 h-5 text-slate-500 z-10" />
-                    </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm font-semibold mb-1.5 ml-1">Password</label>
                     <Input
                       type="password"
-                      name="dbPassword"
-                      value={formData.dbPassword}
-                      onChange={handleChange}
-                      className="pl-11 bg-slate-800/50 border-slate-700 text-slate-100 focus-visible:ring-blue-500 h-12 rounded-xl"
+                      value={shopData.adminPassword}
+                      onChange={(e) => setShopData({ ...shopData, adminPassword: e.target.value })}
+                      className="h-11"
+                      required
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-semibold mb-1.5 ml-1">Confirm</label>
+                    <Input
+                      type="password"
+                      value={shopData.confirmPassword}
+                      onChange={(e) =>
+                        setShopData({ ...shopData, confirmPassword: e.target.value })
+                      }
+                      className="h-11"
                       required
                     />
                   </div>
                 </div>
               </div>
 
+              <Button
+                type="submit"
+                disabled={loading}
+                className="mt-8 w-full group flex justify-center items-center gap-2 h-12 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 font-medium transition-all"
+              >
+                {loading ? (
+                  <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                ) : (
+                  <>
+                    <span>Complete Setup</span>
+                    <ArrowRight className="w-4 h-4 group-hover:translate-x-1 transition-transform" />
+                  </>
+                )}
+              </Button>
+            </form>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // ─── Step 3: Login ────────────────────────────────────────────────────────
+  if (step === 3) {
+    return (
+      <div className="min-h-screen bg-background text-foreground flex items-center justify-center p-6 font-sans drag-region">
+        <div className="relative w-full max-w-sm no-drag-region">
+          <div className="text-center mb-10">
+            <div className="inline-flex items-center justify-center w-16 h-16 rounded-xl bg-zinc-100 border border-zinc-200 mb-6 shadow-sm">
+              <Lock className="w-8 h-8 text-zinc-900" />
+            </div>
+            <h1 className="text-3xl font-bold tracking-tight mb-3">Cashlio</h1>
+            <p className="text-muted-foreground text-base">Sign in to your Manager account.</p>
+          </div>
+
+          <div className="bg-card text-card-foreground border rounded-xl p-8 shadow-sm">
+            {errorMsg && (
+              <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-md text-red-600 text-sm font-medium">
+                {errorMsg}
+              </div>
+            )}
+
+            <form onSubmit={handleLogin} className="space-y-5">
               <div>
-                <label className="block text-sm font-medium text-slate-300 mb-1.5 ml-1">
-                  Database Name
-                </label>
-                <div className="relative">
-                  <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none">
-                    <Database className="w-5 h-5 text-slate-500 z-10" />
-                  </div>
-                  <Input
-                    type="text"
-                    name="dbName"
-                    value={formData.dbName}
-                    onChange={handleChange}
-                    className="pl-11 bg-slate-800/50 border-slate-700 text-slate-100 focus-visible:ring-blue-500 h-12 rounded-xl"
-                    required
-                  />
+                <label className="block text-sm font-semibold mb-1.5 ml-1">Username</label>
+                <Input
+                  type="text"
+                  value={loginData.username}
+                  onChange={(e) => setLoginData({ ...loginData, username: e.target.value })}
+                  className="h-11"
+                  placeholder="Enter your username"
+                  required
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-semibold mb-1.5 ml-1">Password</label>
+                <Input
+                  type="password"
+                  value={loginData.password}
+                  onChange={(e) => setLoginData({ ...loginData, password: e.target.value })}
+                  className="h-11"
+                  placeholder="••••••••"
+                  required
+                />
+              </div>
+
+              <Button
+                type="submit"
+                disabled={loading}
+                className="w-full group flex justify-center items-center gap-2 h-12 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 font-medium transition-all"
+              >
+                {loading ? (
+                  <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                ) : (
+                  <>
+                    <span>Sign In</span>
+                    <ArrowRight className="w-4 h-4 group-hover:translate-x-1 transition-transform" />
+                  </>
+                )}
+              </Button>
+            </form>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // ─── Step 4: Manager Dashboard ────────────────────────────────────────────
+  return (
+    <div className="min-h-screen bg-background text-foreground flex font-sans drag-region">
+      {/* Sidebar */}
+      <div className="w-64 border-r bg-muted/30 p-4 flex flex-col h-screen sticky top-0 no-drag-region">
+        <div className="flex items-center gap-3 mb-10 px-2 mt-2">
+          <div className="w-8 h-8 rounded-lg bg-zinc-900 flex items-center justify-center shadow-sm">
+            <Shield className="w-5 h-5 text-white" />
+          </div>
+          <span className="text-xl font-bold">Manager</span>
+        </div>
+
+        <nav className="flex-1 space-y-1">
+          <button
+            type="button"
+            onClick={() => setActiveTab('overview')}
+            className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-md transition-all text-sm font-medium ${activeTab === 'overview' ? 'bg-zinc-200 text-zinc-900' : 'text-muted-foreground hover:bg-zinc-100 hover:text-zinc-900'}`}
+          >
+            <Home className="w-4 h-4" /> Overview
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab('devices')}
+            className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-md transition-all text-sm font-medium ${activeTab === 'devices' ? 'bg-zinc-200 text-zinc-900' : 'text-muted-foreground hover:bg-zinc-100 hover:text-zinc-900'}`}
+          >
+            <MonitorSmartphone className="w-4 h-4" /> Devices (App C)
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab('settings')}
+            className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-md transition-all text-sm font-medium ${activeTab === 'settings' ? 'bg-zinc-200 text-zinc-900' : 'text-muted-foreground hover:bg-zinc-100 hover:text-zinc-900'}`}
+          >
+            <Settings className="w-4 h-4" /> Settings
+          </button>
+        </nav>
+
+        <div className="mt-auto border-t pt-4">
+          <button
+            type="button"
+            onClick={handleSignOut}
+            className="w-full flex items-center gap-3 px-3 py-2.5 rounded-md hover:bg-red-50 hover:text-red-600 transition-all text-sm font-medium text-muted-foreground"
+          >
+            <LogOut className="w-4 h-4" /> Sign Out
+          </button>
+        </div>
+      </div>
+
+      {/* Main Content */}
+      <div className="flex-1 p-8 no-drag-region">
+        <header className="mb-8 border-b pb-4">
+          <h1 className="text-3xl font-bold tracking-tight capitalize">{activeTab}</h1>
+          <p className="text-muted-foreground mt-1 text-sm">
+            Manage your local branch configurations.
+          </p>
+        </header>
+
+        {activeTab === 'overview' && (
+          <div className="grid grid-cols-3 gap-6">
+            <div className="p-6 rounded-xl bg-card border shadow-sm">
+              <h3 className="text-muted-foreground text-sm font-medium mb-2">Total Sales</h3>
+              <p className="text-3xl font-bold">$0.00</p>
+            </div>
+            <div className="p-6 rounded-xl bg-card border shadow-sm">
+              <h3 className="text-muted-foreground text-sm font-medium mb-2">
+                Connected Terminals
+              </h3>
+              <p className="text-3xl font-bold">0 / 3</p>
+            </div>
+            <div className="p-6 rounded-xl bg-zinc-50 border shadow-sm">
+              <h3 className="text-zinc-600 text-sm font-medium mb-2">System Status</h3>
+              <div className="text-3xl font-bold text-zinc-900 flex items-center gap-2">
+                <div className="relative flex h-3 w-3">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                  <span className="relative inline-flex rounded-full h-3 w-3 bg-emerald-500"></span>
                 </div>
+                Online
               </div>
             </div>
+          </div>
+        )}
 
-            <Button
-              type="submit"
-              disabled={loading}
-              className="mt-8 w-full group relative flex justify-center items-center gap-2 h-14 rounded-xl text-white font-semibold bg-gradient-to-r from-blue-600 to-emerald-500 hover:from-blue-500 hover:to-emerald-400 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-emerald-500 focus:ring-offset-slate-900 transition-all shadow-[0_0_20px_rgba(16,185,129,0.3)] hover:shadow-[0_0_30px_rgba(16,185,129,0.5)] border-0"
-            >
-              {loading ? (
-                <div className="w-6 h-6 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-              ) : (
-                <>
-                  <span className="text-lg">Activate System</span>
-                  <ArrowRight className="w-5 h-5 group-hover:translate-x-1 transition-transform" />
-                </>
+        {activeTab === 'devices' && (
+          <div className="p-6 rounded-xl bg-card border shadow-sm min-h-[400px]">
+            <div className="flex items-center justify-between mb-6">
+              <h2 className="text-lg font-bold">Authorized Billing Clients</h2>
+              {devicesLoading && (
+                <div className="w-4 h-4 border-2 border-zinc-300 border-t-zinc-700 rounded-full animate-spin" />
               )}
-            </Button>
-          </form>
-        </div>
+            </div>
+
+            {!devicesLoading && devices.length === 0 ? (
+              <div className="flex flex-col items-center justify-center p-12 mt-10 border-2 border-dashed rounded-xl bg-zinc-50/50">
+                <MonitorSmartphone className="w-10 h-10 text-muted-foreground mb-4" />
+                <h3 className="text-sm font-bold text-zinc-900">No Terminals Connected</h3>
+                <p className="text-muted-foreground mt-1 max-w-sm text-center text-sm">
+                  App C billing clients will appear here once they pair successfully.
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {devices.map((device) => (
+                  <div
+                    key={device.id}
+                    className="flex items-center gap-4 p-4 rounded-lg border bg-zinc-50/50"
+                  >
+                    <div className="w-10 h-10 rounded-lg bg-zinc-900 flex items-center justify-center shrink-0">
+                      <MonitorSmartphone className="w-5 h-5 text-white" />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="font-semibold text-zinc-900 text-sm">{device.friendlyName}</p>
+                      <p className="text-xs text-muted-foreground font-mono mt-0.5">{device.macAddress}</p>
+                    </div>
+                    <div className="text-right shrink-0">
+                      <span className="inline-flex items-center gap-1.5 text-xs font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-full px-2.5 py-0.5">
+                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 inline-block" />
+                        Authorized
+                      </span>
+                      <p className="text-xs text-muted-foreground mt-1">
+                        {new Date(device.authorizedAt).toLocaleDateString()}
+                      </p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </div>
   )

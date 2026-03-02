@@ -6,7 +6,6 @@
 
 generator client {
   provider = "prisma-client-js"
-  output   = "../src/generated/prisma"
 }
 
 datasource db {
@@ -18,7 +17,9 @@ model ShopConfig {
   id               String   @id @default(uuid())
   shopName         String
   branchName       String
+  licenseKey       String   @unique
   licenseJwt       String   @db.Text
+  lastSyncedAt     DateTime @default(now())
   setupCompletedAt DateTime @default(now())
 }
 
@@ -27,6 +28,8 @@ model AuthorizedClient {
   friendlyName String
   macAddress   String   @unique
   authorizedAt DateTime @default(now())
+
+  invoices     Invoice[]
 }
 
 model User {
@@ -35,4 +38,19 @@ model User {
   passwordHash String
   role         String   @default("CASHIER")
   createdAt    DateTime @default(now())
+
+  invoices     Invoice[]
+}
+
+model Invoice {
+  id               String           @id @default(uuid())
+  totalAmount      Decimal          @db.Decimal(10, 2)
+  paymentMethod    String           @default("CASH")
+  createdAt        DateTime         @default(now())
+
+  originDeviceId   String
+  originDevice     AuthorizedClient @relation(fields: [originDeviceId], references: [id])
+  
+  cashierId        String
+  cashier          User             @relation(fields: [cashierId], references: [id])
 }

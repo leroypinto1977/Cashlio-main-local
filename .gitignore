@@ -1,8 +1,34 @@
+# Dependencies
 node_modules
+
+# Build outputs
 dist
 out
-.DS_Store
-.eslintcache
-*.log*
+.dist
+release
 
+# Environment — never commit secrets
+.env
+.env.local
+.env.*.local
+
+# Prisma generated client (regenerated via postinstall)
 /src/generated/prisma
+
+# TypeScript build cache
+*.tsbuildinfo
+
+# Vite / electron-vite path alias artifacts
+@/
+
+# Editor & OS
+.DS_Store
+Thumbs.db
+.eslintcache
+
+# Logs
+*.log
+*.log*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
