@@ -1,9 +1,3 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
-// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
-// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
-
 generator client {
   provider = "prisma-client-js"
 }
@@ -18,9 +12,19 @@ model ShopConfig {
   shopName         String
   branchName       String
   licenseKey       String   @unique
-  licenseJwt       String   @db.Text
+  licenseJwt       String
   lastSyncedAt     DateTime @default(now())
   setupCompletedAt DateTime @default(now())
+
+  // License hardening (Phase 4)
+  hardwareId            String?   // The MAC bound to this license, snapshotted at activation
+  licenseExpiresAt      DateTime? // Hard expiry from JWT claims
+  lastSeenServerTime    DateTime? // Server-issued time floor; used to detect clock-tampering
+  lastRefreshAt         DateTime? // Last successful /licenses/refresh
+  lastRefreshAttempt    DateTime? // Last attempt regardless of outcome
+  lastRefreshError      String?   // Last refresh failure reason (for the manager UI)
+  licenseLocked         Boolean   @default(false) // True after grace period expires; blocks new bills
+  gracePeriodDays       Int       @default(30)
 }
 
 model AuthorizedClient {
@@ -28,8 +32,25 @@ model AuthorizedClient {
   friendlyName String
   macAddress   String   @unique
   authorizedAt DateTime @default(now())
+  // Short prefix (T1, T2, ...) handed to the terminal at pair time. Lets
+  // terminals mint globally-unique bill numbers offline without server
+  // coordination.
+  terminalCode String?  @unique
+  bills        Bill[]
+}
 
-  invoices     Invoice[]
+// Append-only change log. Every write to an entity that terminals mirror
+// (product, customer, bill, …) must insert one row here in the same tx.
+// Terminals pull rows ordered by `id` and keep a cursor.
+model SyncEvent {
+  id        BigInt   @id @default(autoincrement())
+  entity    String   // 'product' | 'customer' | 'bill'
+  entityId  String
+  op        String   // 'upsert' | 'delete'
+  payload   Json?    // full row snapshot for upsert; null for delete
+  createdAt DateTime @default(now())
+
+  @@index([entity, id])
 }
 
 model User {
@@ -38,19 +59,161 @@ model User {
   passwordHash String
   role         String   @default("CASHIER")
   createdAt    DateTime @default(now())
-
-  invoices     Invoice[]
+  bills        Bill[]
 }
 
-model Invoice {
-  id               String           @id @default(uuid())
-  totalAmount      Decimal          @db.Decimal(10, 2)
-  paymentMethod    String           @default("CASH")
-  createdAt        DateTime         @default(now())
+model Warehouse {
+  id        String         @id @default(uuid())
+  name      String         @unique
+  location  String?
+  isActive  Boolean        @default(true)
+  createdAt DateTime       @default(now())
+  batches   ProductBatch[]
+}
 
-  originDeviceId   String
-  originDevice     AuthorizedClient @relation(fields: [originDeviceId], references: [id])
-  
-  cashierId        String
-  cashier          User             @relation(fields: [cashierId], references: [id])
+model Category {
+  id        String    @id @default(uuid())
+  name      String    @unique
+  createdAt DateTime  @default(now())
+  products  Product[]
+}
+
+model Supplier {
+  id            String            @id @default(uuid())
+  name          String
+  contactPerson String?
+  phone         String
+  email         String?
+  address       String?
+  gstin         String?
+  isActive      Boolean           @default(true)
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+  batches       ProductBatch[]
+  products      ProductSupplier[]
+}
+
+model ProductSupplier {
+  id         String   @id @default(uuid())
+  productId  String
+  supplierId String
+  isDefault  Boolean  @default(false)
+  product    Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  supplier   Supplier @relation(fields: [supplierId], references: [id])
+
+  @@unique([productId, supplierId])
+}
+
+model Product {
+  id                 String            @id @default(uuid())
+  itemCode           String            @unique
+  brand              String?
+  name               String
+  specification      String?
+  categoryId         String
+  productType        String?
+  unitOfMeasure      String            @default("pcs")
+  gstPercentage      Decimal           @default(0) @db.Decimal(5, 2)
+  warrantyPeriodDays Int               @default(0)
+  minStockLevel      Int               @default(0)
+  isActive           Boolean           @default(true)
+  createdAt          DateTime          @default(now())
+  updatedAt          DateTime          @updatedAt
+  sellingRate        Decimal           @default(0) @db.Decimal(10, 2)
+  billItems          BillItem[]
+  category           Category          @relation(fields: [categoryId], references: [id])
+  batches            ProductBatch[]
+  suppliers          ProductSupplier[]
+}
+
+model ProductBatch {
+  id              String     @id @default(uuid())
+  productId       String
+  batchCode       String
+  uniqueStockCode String     @unique
+  supplierId      String?
+  purchaseRate    Decimal    @db.Decimal(10, 2)
+  warehouseId     String?
+  receivedQty     Int        @default(0)
+  currentQty      Int        @default(0)
+  receivedDate    DateTime   @default(now())
+  notes           String?
+  isActive        Boolean    @default(true)
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+  product         Product    @relation(fields: [productId], references: [id])
+  supplier        Supplier?  @relation(fields: [supplierId], references: [id])
+  warehouse       Warehouse? @relation(fields: [warehouseId], references: [id])
+
+  @@unique([productId, batchCode])
+}
+
+model Customer {
+  id        String   @id @default(uuid())
+  name      String
+  phone     String   @unique
+  email     String?
+  address   String?
+  gstin     String?
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  bills     Bill[]
+}
+
+model Bill {
+  id             String           @id @default(uuid())
+  billNumber     String           @unique
+  clientLocalId  String?          @unique // idempotency key from billing client
+  status         String           @default("PAID") // PAID | VOID | RETURN
+  customerId     String?
+  originDeviceId String
+  cashierId      String
+  subtotal       Decimal          @db.Decimal(10, 2)
+  gstAmount      Decimal          @db.Decimal(10, 2)
+  discountAmount Decimal          @default(0) @db.Decimal(10, 2)
+  totalAmount    Decimal          @db.Decimal(10, 2)
+  paymentMethod  String
+  amountReceived Decimal?         @db.Decimal(10, 2)
+  changeGiven    Decimal?         @db.Decimal(10, 2)
+  notes          String?
+  paidAt         DateTime         @default(now())
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+  // Return-bill fields: when status='RETURN', originalBillId points to the
+  // PAID bill being refunded. Amounts on the return bill are stored as
+  // positive values representing the refund amount.
+  originalBillId String?
+  originalBill   Bill?            @relation("BillReturns", fields: [originalBillId], references: [id])
+  returns        Bill[]           @relation("BillReturns")
+  returnReason   String?
+  cashier        User             @relation(fields: [cashierId], references: [id])
+  customer       Customer?        @relation(fields: [customerId], references: [id])
+  originDevice   AuthorizedClient @relation(fields: [originDeviceId], references: [id])
+  items          BillItem[]
+}
+
+model BillItem {
+  id                 String     @id @default(uuid())
+  billId             String
+  productId          String
+  itemCode           String
+  productName        String
+  unitOfMeasure      String
+  quantity           Int
+  unitRate           Decimal    @db.Decimal(10, 2)
+  gstPercentage      Decimal    @db.Decimal(5, 2)
+  lineDiscountPct    Decimal    @default(0) @db.Decimal(5, 2)
+  lineDiscountAmt    Decimal    @default(0) @db.Decimal(10, 2)
+  lineGstAmount      Decimal    @db.Decimal(10, 2)
+  lineTotal          Decimal    @db.Decimal(10, 2)
+  createdAt          DateTime   @default(now())
+  // For return-bill items: pointer to the original BillItem being refunded.
+  // Lets us validate cumulative-returned-qty per original line without
+  // ambiguity when the same product appears on multiple lines.
+  originalBillItemId String?
+  originalBillItem   BillItem?  @relation("BillItemReturns", fields: [originalBillItemId], references: [id])
+  returnedAs         BillItem[] @relation("BillItemReturns")
+  bill               Bill       @relation(fields: [billId], references: [id], onDelete: Cascade)
+  product            Product    @relation(fields: [productId], references: [id])
 }

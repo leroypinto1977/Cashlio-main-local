@@ -9,10 +9,23 @@ import {
   Settings,
   LogOut,
   Shield,
-  Lock
+  Lock,
+  Package,
+  Truck,
+  Users,
+  Receipt,
+  BarChart3,
+  TrendingUp,
 } from 'lucide-react'
 import { Button } from './components/ui/button'
 import { Input } from './components/ui/input'
+import { ProductsScreen } from './screens/ProductsScreen'
+import { SuppliersScreen } from './screens/SuppliersScreen'
+import { CustomersScreen } from './screens/CustomersScreen'
+import { BillingScreen } from './screens/BillingScreen'
+import { SalesScreen } from './screens/SalesScreen'
+import { AnalyticsScreen } from './screens/AnalyticsScreen'
+import { BackupSettings } from './components/BackupSettings'
 import axios from 'axios'
 
 // Always fall back to the known local port so requests never go to "undefined/..."
@@ -52,6 +65,7 @@ function App(): React.JSX.Element {
   const [authToken, setAuthToken] = useState<string | null>(
     () => localStorage.getItem('managerToken')
   )
+  const [deviceId, setDeviceId] = useState<string | null>(null)
   type AuthorizedClient = {
     id: string
     friendlyName: string
@@ -60,6 +74,19 @@ function App(): React.JSX.Element {
   }
   const [devices, setDevices] = useState<AuthorizedClient[]>([])
   const [devicesLoading, setDevicesLoading] = useState(false)
+
+  type Stats = {
+    todayBills: number
+    todaySales: number
+    totalProducts: number
+    activeCustomers: number
+    connectedTerminals: number
+  }
+  const [stats, setStats] = useState<Stats | null>(null)
+  const [statsLoading, setStatsLoading] = useState(false)
+
+  type ShopInfo = { shopName: string; branchName: string }
+  const [shopInfo, setShopInfo] = useState<ShopInfo | null>(null)
 
   // ─── Splash: check setup status, then route ───────────────────────────────
   React.useEffect(() => {
@@ -146,6 +173,15 @@ function App(): React.JSX.Element {
       const token: string = res.data.token
       setAuthToken(token)
       localStorage.setItem('managerToken', token)
+      // Fetch / auto-create manager device ID
+      try {
+        const devRes = await axios.get(`${LOCAL_API}/api/v1/system/self-device-id`, {
+          headers: { Authorization: `Bearer ${token}` }
+        })
+        setDeviceId(devRes.data.deviceId)
+      } catch {
+        // non-fatal — billing will show error if attempted without deviceId
+      }
       setStep(4)
     } catch (err: unknown) {
       if (axios.isAxiosError(err)) {
@@ -160,6 +196,7 @@ function App(): React.JSX.Element {
 
   const handleSignOut = (): void => {
     setAuthToken(null)
+    setDeviceId(null)
     localStorage.removeItem('managerToken')
     setLoginData({ username: '', password: '' })
     setErrorMsg('')
@@ -173,10 +210,38 @@ function App(): React.JSX.Element {
     if (activeTab !== 'devices' || step !== 4) return
     setDevicesLoading(true)
     axios
-      .get(`${LOCAL_API}/api/v1/system/authorized-clients`)
+      .get(`${LOCAL_API}/api/v1/system/authorized-clients`, {
+        headers: authToken ? { Authorization: `Bearer ${authToken}` } : {}
+      })
       .then((res) => setDevices(res.data.clients ?? []))
       .catch(() => setDevices([]))
       .finally(() => setDevicesLoading(false))
+  }, [activeTab, step, authToken])
+
+  // ─── Overview stats: fetch when tab is active ─────────────────────────────
+  React.useEffect(() => {
+    if (activeTab !== 'overview' || step !== 4 || !authToken) return
+    setStatsLoading(true)
+    axios
+      .get(`${LOCAL_API}/api/v1/system/stats`, {
+        headers: { Authorization: `Bearer ${authToken}` }
+      })
+      .then((res) => setStats(res.data.stats))
+      .catch(() => setStats(null))
+      .finally(() => setStatsLoading(false))
+  }, [activeTab, step, authToken])
+
+  // ─── Shop info: fetch when settings tab is active ─────────────────────────
+  React.useEffect(() => {
+    if (activeTab !== 'settings' || step !== 4) return
+    axios
+      .get(`${LOCAL_API}/api/v1/system/status`)
+      .then((res) => {
+        if (res.data.shopName) {
+          setShopInfo({ shopName: res.data.shopName, branchName: res.data.branchName })
+        }
+      })
+      .catch(() => {})
   }, [activeTab, step])
 
   // ─── Step 0: Splash ───────────────────────────────────────────────────────
@@ -470,28 +535,29 @@ function App(): React.JSX.Element {
           <span className="text-xl font-bold">Manager</span>
         </div>
 
-        <nav className="flex-1 space-y-1">
-          <button
-            type="button"
-            onClick={() => setActiveTab('overview')}
-            className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-md transition-all text-sm font-medium ${activeTab === 'overview' ? 'bg-zinc-200 text-zinc-900' : 'text-muted-foreground hover:bg-zinc-100 hover:text-zinc-900'}`}
-          >
-            <Home className="w-4 h-4" /> Overview
-          </button>
-          <button
-            type="button"
-            onClick={() => setActiveTab('devices')}
-            className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-md transition-all text-sm font-medium ${activeTab === 'devices' ? 'bg-zinc-200 text-zinc-900' : 'text-muted-foreground hover:bg-zinc-100 hover:text-zinc-900'}`}
-          >
-            <MonitorSmartphone className="w-4 h-4" /> Devices (App C)
-          </button>
-          <button
-            type="button"
-            onClick={() => setActiveTab('settings')}
-            className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-md transition-all text-sm font-medium ${activeTab === 'settings' ? 'bg-zinc-200 text-zinc-900' : 'text-muted-foreground hover:bg-zinc-100 hover:text-zinc-900'}`}
-          >
-            <Settings className="w-4 h-4" /> Settings
-          </button>
+        <nav className="flex-1 space-y-0.5">
+          {(
+            [
+              ['overview',   <Home className="w-4 h-4" />,             'Overview'],
+              ['billing',    <Receipt className="w-4 h-4" />,          'Billing'],
+              ['sales',      <BarChart3 className="w-4 h-4" />,        'Sales'],
+              ['analytics',  <TrendingUp className="w-4 h-4" />,       'Analytics'],
+              ['products',   <Package className="w-4 h-4" />,          'Products'],
+              ['suppliers',  <Truck className="w-4 h-4" />,            'Suppliers'],
+              ['customers',  <Users className="w-4 h-4" />,            'Customers'],
+              ['devices',    <MonitorSmartphone className="w-4 h-4" />, 'Devices'],
+              ['settings',   <Settings className="w-4 h-4" />,         'Settings'],
+            ] as [string, React.ReactNode, string][]
+          ).map(([tab, icon, label]) => (
+            <button
+              key={tab}
+              type="button"
+              onClick={() => setActiveTab(tab)}
+              className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-md transition-all text-sm font-medium ${activeTab === tab ? 'bg-zinc-200 text-zinc-900' : 'text-muted-foreground hover:bg-zinc-100 hover:text-zinc-900'}`}
+            >
+              {icon} {label}
+            </button>
+          ))}
         </nav>
 
         <div className="mt-auto border-t pt-4">
@@ -506,83 +572,169 @@ function App(): React.JSX.Element {
       </div>
 
       {/* Main Content */}
-      <div className="flex-1 p-8 no-drag-region">
-        <header className="mb-8 border-b pb-4">
-          <h1 className="text-3xl font-bold tracking-tight capitalize">{activeTab}</h1>
-          <p className="text-muted-foreground mt-1 text-sm">
-            Manage your local branch configurations.
-          </p>
-        </header>
+      <div className={`flex-1 p-8 no-drag-region ${activeTab === 'billing' ? 'flex flex-col overflow-hidden' : 'overflow-y-auto'}`}>
 
+        {/* Phase 2 screens manage their own headers */}
+        {activeTab === 'products' && <ProductsScreen token={authToken} />}
+        {activeTab === 'suppliers' && <SuppliersScreen token={authToken} />}
+        {activeTab === 'customers' && <CustomersScreen token={authToken} />}
+
+        {/* Phase 3 billing screens */}
+        {activeTab === 'billing' && (
+          <BillingScreen token={authToken} deviceId={deviceId ?? ''} />
+        )}
+        {activeTab === 'sales' && <SalesScreen token={authToken} />}
+        {activeTab === 'analytics' && <AnalyticsScreen token={authToken} />}
+
+        {/* Overview */}
         {activeTab === 'overview' && (
-          <div className="grid grid-cols-3 gap-6">
-            <div className="p-6 rounded-xl bg-card border shadow-sm">
-              <h3 className="text-muted-foreground text-sm font-medium mb-2">Total Sales</h3>
-              <p className="text-3xl font-bold">$0.00</p>
-            </div>
-            <div className="p-6 rounded-xl bg-card border shadow-sm">
-              <h3 className="text-muted-foreground text-sm font-medium mb-2">
-                Connected Terminals
-              </h3>
-              <p className="text-3xl font-bold">0 / 3</p>
-            </div>
-            <div className="p-6 rounded-xl bg-zinc-50 border shadow-sm">
-              <h3 className="text-zinc-600 text-sm font-medium mb-2">System Status</h3>
-              <div className="text-3xl font-bold text-zinc-900 flex items-center gap-2">
-                <div className="relative flex h-3 w-3">
-                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                  <span className="relative inline-flex rounded-full h-3 w-3 bg-emerald-500"></span>
-                </div>
-                Online
+          <div className="space-y-8">
+            <header className="border-b pb-4">
+              <h1 className="text-3xl font-bold tracking-tight">Overview</h1>
+              <p className="text-muted-foreground mt-1 text-sm">Today's activity at a glance.</p>
+            </header>
+            {statsLoading ? (
+              <div className="flex items-center gap-2 text-zinc-400 text-sm">
+                <div className="w-4 h-4 border-2 border-zinc-300 border-t-zinc-600 rounded-full animate-spin" />
+                Loading stats…
               </div>
+            ) : (
+              <>
+                <div className="grid grid-cols-2 gap-5">
+                  <div className="p-6 rounded-xl bg-card border shadow-sm">
+                    <p className="text-muted-foreground text-xs font-semibold uppercase tracking-wide mb-2">Bills Today</p>
+                    <p className="text-4xl font-bold text-zinc-900">{stats?.todayBills ?? 0}</p>
+                    <p className="text-xs text-zinc-400 mt-2">PAID bills processed</p>
+                  </div>
+                  <div className="p-6 rounded-xl bg-card border shadow-sm">
+                    <p className="text-muted-foreground text-xs font-semibold uppercase tracking-wide mb-2">Sales Today</p>
+                    <p className="text-4xl font-bold text-zinc-900">
+                      ₹{stats ? new Intl.NumberFormat('en-IN', { maximumFractionDigits: 0 }).format(stats.todaySales) : '0'}
+                    </p>
+                    <p className="text-xs text-zinc-400 mt-2">Total revenue collected</p>
+                  </div>
+                  <div className="p-6 rounded-xl bg-card border shadow-sm">
+                    <p className="text-muted-foreground text-xs font-semibold uppercase tracking-wide mb-2">Active Products</p>
+                    <p className="text-4xl font-bold text-zinc-900">{stats?.totalProducts ?? 0}</p>
+                    <p className="text-xs text-zinc-400 mt-2">In product catalog</p>
+                  </div>
+                  <div className="p-6 rounded-xl bg-card border shadow-sm">
+                    <p className="text-muted-foreground text-xs font-semibold uppercase tracking-wide mb-2">Active Customers</p>
+                    <p className="text-4xl font-bold text-zinc-900">{stats?.activeCustomers ?? 0}</p>
+                    <p className="text-xs text-zinc-400 mt-2">Registered customers</p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-4">
+                  <div className="p-5 rounded-xl bg-zinc-50 border flex items-center gap-4 flex-1">
+                    <div className="relative flex h-3 w-3 shrink-0">
+                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                      <span className="relative inline-flex rounded-full h-3 w-3 bg-emerald-500"></span>
+                    </div>
+                    <div>
+                      <p className="text-sm font-bold text-zinc-900">Local Server Online</p>
+                      <p className="text-xs text-zinc-500 mt-0.5">
+                        {stats?.connectedTerminals ?? 0} terminal{stats?.connectedTerminals !== 1 ? 's' : ''} paired · Port 52001
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setStats(null)
+                      setStatsLoading(true)
+                      axios.get(`${LOCAL_API}/api/v1/system/stats`, {
+                        headers: authToken ? { Authorization: `Bearer ${authToken}` } : {}
+                      }).then((r) => setStats(r.data.stats)).catch(() => {}).finally(() => setStatsLoading(false))
+                    }}
+                    className="px-4 py-2 rounded-lg border text-sm font-medium text-zinc-600 hover:bg-zinc-50 transition-colors"
+                  >
+                    Refresh
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
+        {/* Devices */}
+        {activeTab === 'devices' && (
+          <div className="space-y-6">
+            <header className="border-b pb-4">
+              <h1 className="text-3xl font-bold tracking-tight">Devices</h1>
+              <p className="text-muted-foreground mt-1 text-sm">Billing terminals authorized to connect to this server.</p>
+            </header>
+            <div className="p-6 rounded-xl bg-card border shadow-sm min-h-[400px]">
+              <div className="flex items-center justify-between mb-6">
+                <h2 className="text-lg font-bold">Authorized Billing Clients</h2>
+                {devicesLoading && (
+                  <div className="w-4 h-4 border-2 border-zinc-300 border-t-zinc-700 rounded-full animate-spin" />
+                )}
+              </div>
+              {!devicesLoading && devices.length === 0 ? (
+                <div className="flex flex-col items-center justify-center p-12 mt-10 border-2 border-dashed rounded-xl bg-zinc-50/50">
+                  <MonitorSmartphone className="w-10 h-10 text-muted-foreground mb-4" />
+                  <h3 className="text-sm font-bold text-zinc-900">No Terminals Connected</h3>
+                  <p className="text-muted-foreground mt-1 max-w-sm text-center text-sm">
+                    App C billing clients will appear here once they pair successfully.
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {devices.map((device) => (
+                    <div key={device.id} className="flex items-center gap-4 p-4 rounded-lg border bg-zinc-50/50">
+                      <div className="w-10 h-10 rounded-lg bg-zinc-900 flex items-center justify-center shrink-0">
+                        <MonitorSmartphone className="w-5 h-5 text-white" />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="font-semibold text-zinc-900 text-sm">{device.friendlyName}</p>
+                        <p className="text-xs text-muted-foreground font-mono mt-0.5">{device.macAddress}</p>
+                      </div>
+                      <div className="text-right shrink-0">
+                        <span className="inline-flex items-center gap-1.5 text-xs font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-full px-2.5 py-0.5">
+                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 inline-block" />
+                          Authorized
+                        </span>
+                        <p className="text-xs text-muted-foreground mt-1">
+                          {new Date(device.authorizedAt).toLocaleDateString()}
+                        </p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
         )}
 
-        {activeTab === 'devices' && (
-          <div className="p-6 rounded-xl bg-card border shadow-sm min-h-[400px]">
-            <div className="flex items-center justify-between mb-6">
-              <h2 className="text-lg font-bold">Authorized Billing Clients</h2>
-              {devicesLoading && (
-                <div className="w-4 h-4 border-2 border-zinc-300 border-t-zinc-700 rounded-full animate-spin" />
-              )}
+        {/* Settings */}
+        {activeTab === 'settings' && (
+          <div className="space-y-6">
+            <header className="border-b pb-4">
+              <h1 className="text-3xl font-bold tracking-tight">Settings</h1>
+              <p className="text-muted-foreground mt-1 text-sm">Branch configuration and system information.</p>
+            </header>
+            <div className="grid grid-cols-2 gap-5 max-w-2xl">
+              <div className="p-5 rounded-xl border bg-card space-y-1">
+                <p className="text-xs font-semibold text-zinc-500 uppercase tracking-wide">Shop Name</p>
+                <p className="text-lg font-bold text-zinc-900">{shopInfo?.shopName ?? '—'}</p>
+              </div>
+              <div className="p-5 rounded-xl border bg-card space-y-1">
+                <p className="text-xs font-semibold text-zinc-500 uppercase tracking-wide">Branch Name</p>
+                <p className="text-lg font-bold text-zinc-900">{shopInfo?.branchName ?? '—'}</p>
+              </div>
+              <div className="p-5 rounded-xl border bg-card space-y-1 col-span-2">
+                <p className="text-xs font-semibold text-zinc-500 uppercase tracking-wide">Server Address</p>
+                <p className="text-base font-mono font-semibold text-zinc-900">127.0.0.1:52001 (local) · 0.0.0.0:52001 (LAN)</p>
+              </div>
+              <div className="p-5 rounded-xl border bg-zinc-50 space-y-1 col-span-2">
+                <p className="text-xs font-semibold text-zinc-500 uppercase tracking-wide">Database</p>
+                <p className="text-sm text-zinc-700">Local PostgreSQL — managed by Prisma ORM</p>
+                <p className="text-xs text-zinc-400 mt-1">All data is stored locally on this machine. No cloud sync in this phase.</p>
+              </div>
+              <div className="col-span-2">
+                <BackupSettings />
+              </div>
             </div>
-
-            {!devicesLoading && devices.length === 0 ? (
-              <div className="flex flex-col items-center justify-center p-12 mt-10 border-2 border-dashed rounded-xl bg-zinc-50/50">
-                <MonitorSmartphone className="w-10 h-10 text-muted-foreground mb-4" />
-                <h3 className="text-sm font-bold text-zinc-900">No Terminals Connected</h3>
-                <p className="text-muted-foreground mt-1 max-w-sm text-center text-sm">
-                  App C billing clients will appear here once they pair successfully.
-                </p>
-              </div>
-            ) : (
-              <div className="space-y-3">
-                {devices.map((device) => (
-                  <div
-                    key={device.id}
-                    className="flex items-center gap-4 p-4 rounded-lg border bg-zinc-50/50"
-                  >
-                    <div className="w-10 h-10 rounded-lg bg-zinc-900 flex items-center justify-center shrink-0">
-                      <MonitorSmartphone className="w-5 h-5 text-white" />
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <p className="font-semibold text-zinc-900 text-sm">{device.friendlyName}</p>
-                      <p className="text-xs text-muted-foreground font-mono mt-0.5">{device.macAddress}</p>
-                    </div>
-                    <div className="text-right shrink-0">
-                      <span className="inline-flex items-center gap-1.5 text-xs font-medium text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-full px-2.5 py-0.5">
-                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 inline-block" />
-                        Authorized
-                      </span>
-                      <p className="text-xs text-muted-foreground mt-1">
-                        {new Date(device.authorizedAt).toLocaleDateString()}
-                      </p>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
           </div>
         )}
       </div>
