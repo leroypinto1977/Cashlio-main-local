@@ -17,6 +17,7 @@ const t = (name, cond, detail) => {
   else { fail++; console.log('  FAIL', name, detail !== undefined ? JSON.stringify(detail) : '') }
 }
 const near = (a, b) => Math.abs(a - b) < 0.005
+const eqp = (name, actual, expected) => t(`${name} (${actual} == ${expected})`, near(Number(actual), Number(expected)))
 
 async function api(path, opts = {}, token) {
   const res = await fetch(BASE + path, {
@@ -290,6 +291,168 @@ async function api(path, opts = {}, token) {
   t('taxable value reported', a.totalTaxableValue > 0, a.totalTaxableValue)
   t('margin computed on ex-GST revenue', a.revenueExGst <= a.totalRevenue, { ex: a.revenueExGst, gross: a.totalRevenue })
   t('margin is a sane percentage', a.estimatedMarginPct < 100, a.estimatedMarginPct)
+
+
+  console.log('\n— credit billing —')
+  // A customer with a credit limit
+  const creditCust = await prisma.customer.create({ data: {
+    name: 'Credit Buyer', phone: '9000000050', creditLimit: 10000, creditDays: 30 }})
+  const stockProd = await prisma.product.create({ data: {
+    itemCode: 'CRED-TEST-001', name: 'Credit Test Item', categoryId: cat.id,
+    sellingRate: 1000, gstPercentage: 18 }})
+  await prisma.productBatch.create({ data: {
+    productId: stockProd.id, batchCode: 'CB', uniqueStockCode: 'CRED-TEST-001/CB',
+    purchaseRate: 500, receivedQty: 500, currentQty: 500 }})
+  const line = (qty) => [{ productId: stockProd.id, quantity: qty, unitRate: 1000, gstPercentage: 18, lineDiscountPct: 0, lineDiscountAmt: 0 }]
+
+  // full payment
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, customerId: creditCust.id,
+    payments: [{ method: 'CASH', amount: 1000 }], items: line(1) })}, token)
+  t('full payment is PAID', r.body.bill?.status === 'PAID', r.body.bill?.status)
+  eqp('balance zero', r.body.bill.balanceDue, 0)
+
+  // part payment -> PARTIAL with a balance
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, customerId: creditCust.id,
+    payments: [{ method: 'UPI', amount: 400 }], items: line(1) })}, token)
+  t('part payment is PARTIAL', r.body.bill?.status === 'PARTIAL', r.body.bill?.status)
+  eqp('balance carried', r.body.bill.balanceDue, 600)
+  eqp('paid recorded', r.body.bill.paidAmount, 400)
+  t('due date set from credit days', !!r.body.bill.dueDate, r.body.bill.dueDate)
+  const partialBillId = r.body.bill.id
+
+  // no payment at all -> CREDIT
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, customerId: creditCust.id, payments: [], items: line(2) })}, token)
+  t('no tender is CREDIT', r.body.bill?.status === 'CREDIT', r.body.bill?.status)
+  eqp('whole amount owed', r.body.bill.balanceDue, 2000)
+  const creditBillId = r.body.bill.id
+
+  // split tender
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, customerId: creditCust.id,
+    payments: [{ method: 'CASH', amount: 300 }, { method: 'UPI', amount: 700 }], items: line(1) })}, token)
+  t('split tender settles the bill', r.body.bill?.status === 'PAID', r.body.bill?.status)
+  t('both tenders recorded', (await prisma.payment.count({ where: { billId: r.body.bill.id } })) === 2)
+
+  // outstanding
+  r = await api(`/api/v1/customers/${creditCust.id}/outstanding`, {}, token)
+  eqp('outstanding is the sum of balances', r.body.outstanding, 2600)
+  eqp('available credit reduced', r.body.availableCredit, 7400)
+  t('two open bills listed', r.body.bills.length === 2, r.body.bills.length)
+
+  console.log('\n— credit limits —')
+  // walk-in cannot take credit
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, payments: [], items: line(1) })}, token)
+  t('walk-in refused credit', r.status === 409 && r.body.reason === 'NO_CUSTOMER', r.body)
+  // customer with no limit
+  const noCreditCust = await prisma.customer.create({ data: { name: 'Cash Only', phone: '9000000051' }})
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, customerId: noCreditCust.id, payments: [], items: line(1) })}, token)
+  t('customer without a limit refused', r.status === 409 && r.body.reason === 'NO_CREDIT_ALLOWED', r.body)
+  // over the limit
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, customerId: creditCust.id, payments: [], items: line(20) })}, token)
+  t('over-limit refused', r.status === 409 && r.body.reason === 'LIMIT_EXCEEDED', r.body)
+  t('tells you how far over', r.body.overBy > 0, r.body.overBy)
+  // super-admin override
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, customerId: creditCust.id, payments: [], items: line(20),
+    allowCreditOverride: true })}, token)
+  t('super admin can override', r.status === 201 && r.body.bill.status === 'CREDIT', r.body)
+  const overrideBillId = r.body.bill.id
+  // stock must not have moved on a refused bill
+  r = await api(`/api/v1/products/${stockProd.id}`, {}, token)
+  t('refused bills did not consume stock', r.body.product.totalStock === 500 - 1 - 1 - 2 - 1 - 20,
+    r.body.product.totalStock)
+
+  console.log('\n— collecting payment —')
+  r = await api('/api/v1/payments', { method: 'POST', body: JSON.stringify({
+    customerId: creditCust.id, amount: 600, method: 'CASH' })}, token)
+  t('payment recorded', r.status === 201, r.body)
+  t('oldest bill settled first', (await prisma.bill.findUnique({ where: { id: partialBillId } })).status === 'PAID')
+  r = await api(`/api/v1/customers/${creditCust.id}/outstanding`, {}, token)
+  eqp('outstanding reduced', r.body.outstanding, 2000 + 20000)
+  // explicit allocation
+  r = await api('/api/v1/payments', { method: 'POST', body: JSON.stringify({
+    customerId: creditCust.id, amount: 500, method: 'UPI', reference: 'UPI123',
+    allocations: [{ billId: creditBillId, amount: 500 }] })}, token)
+  t('explicit allocation accepted', r.status === 201, r.body)
+  t('that bill is now PARTIAL', (await prisma.bill.findUnique({ where: { id: creditBillId } })).status === 'PARTIAL')
+  // over-collection refused
+  r = await api('/api/v1/payments', { method: 'POST', body: JSON.stringify({
+    customerId: creditCust.id, amount: 999999, method: 'CASH' })}, token)
+  t('paying more than owed refused', r.status === 409 && r.body.error === 'AMOUNT_EXCEEDS_OUTSTANDING', r.body)
+  // allocation larger than the bill
+  r = await api('/api/v1/payments', { method: 'POST', body: JSON.stringify({
+    customerId: creditCust.id, amount: 999999, method: 'CASH',
+    allocations: [{ billId: creditBillId, amount: 999999 }] })}, token)
+  t('allocation beyond a bill balance refused', r.status === 409 && r.body.error === 'ALLOCATION_EXCEEDS_BALANCE', r.body)
+  // idempotency
+  const key = 'pay-key-1'
+  r = await api('/api/v1/payments', { method: 'POST', body: JSON.stringify({
+    customerId: creditCust.id, amount: 100, method: 'CASH', clientLocalId: key })}, token)
+  t('keyed payment accepted', r.status === 201, r.body)
+  r = await api('/api/v1/payments', { method: 'POST', body: JSON.stringify({
+    customerId: creditCust.id, amount: 100, method: 'CASH', clientLocalId: key })}, token)
+  t('replay does not double-post', r.status === 200 && r.body.replayed === true, r.body)
+  t('only one payment for the key', (await prisma.payment.count({ where: { clientLocalId: key } })) === 1)
+
+  console.log('\n— voiding and returning credit bills —')
+  r = await api(`/api/v1/bills/${creditBillId}/void`, { method: 'POST' }, token)
+  t('cannot void a bill with collections', r.status === 409 && r.body.error === 'BILL_HAS_SETTLEMENTS', r.body)
+  // a return against a credit bill reduces what is owed
+  const before = Number((await prisma.bill.findUnique({ where: { id: overrideBillId } })).balanceDue)
+  const ob = await api(`/api/v1/bills/${overrideBillId}`, {}, token)
+  r = await api(`/api/v1/bills/${overrideBillId}/return`, { method: 'POST', body: JSON.stringify({
+    items: [{ billItemId: ob.body.bill.items[0].id, quantity: 5 }], reason: 'Damaged' })}, token)
+  t('return against a credit bill allowed', r.status === 201, r.body)
+  const after = Number((await prisma.bill.findUnique({ where: { id: overrideBillId } })).balanceDue)
+  t('returning reduces the balance owed', after < before, { before, after })
+  eqp('reduced by the credit note value', before - after, Number(r.body.bill.totalAmount))
+
+  console.log('\n— receivables —')
+  r = await api('/api/v1/receivables', {}, token)
+  t('receivables lists debtors', r.body.customers.length >= 1, r.body.customers?.length)
+  t('totals match the customer rows',
+    Math.abs(r.body.totalOutstanding - r.body.customers.reduce((s, c) => s + c.outstanding, 0)) < 0.01,
+    { total: r.body.totalOutstanding })
+  t('ageing buckets present', typeof r.body.buckets['0-30'] === 'number', r.body.buckets)
+
+  console.log('\n— follow-ups —')
+  r = await api(`/api/v1/customers/${creditCust.id}/followups`, { method: 'POST', body: JSON.stringify({
+    note: 'Call about the overdue balance', dueAt: '2026-09-01' })}, token)
+  t('follow-up created', r.status === 201, r.body)
+  const fuId = r.body.followUp.id
+  r = await api('/api/v1/followups?open=1', {}, token)
+  t('open follow-ups listed', r.body.followUps.some(f => f.id === fuId), r.body.followUps?.length)
+  r = await api(`/api/v1/followups/${fuId}`, { method: 'PUT', body: JSON.stringify({ resolved: true }) }, token)
+  t('follow-up resolved', !!r.body.followUp.resolvedAt, r.body.followUp)
+  r = await api('/api/v1/followups?open=1', {}, token)
+  t('resolved one drops off the open list', !r.body.followUps.some(f => f.id === fuId))
+  r = await api(`/api/v1/customers/${creditCust.id}/followups`, { method: 'POST', body: JSON.stringify({ note: '  ' }) }, token)
+  t('empty note refused', r.status === 400 && r.body.error === 'NOTE_REQUIRED', r.body)
+
+  console.log('\n— credit terms are super-admin only —')
+  const cashierPass = await bcrypt.hash('cashier123', 10)
+  const cashier = await prisma.user.create({ data: { username: 'cashier1', passwordHash: cashierPass, role: 'CASHIER' }})
+  r = await api('/api/v1/auth/login', { method: 'POST', body: JSON.stringify({ username: 'cashier1', password: 'cashier123' }) })
+  const cashierToken = r.body.token
+  r = await api(`/api/v1/customers/${creditCust.id}`, { method: 'PUT', body: JSON.stringify({ creditLimit: 999999 }) }, cashierToken)
+  t('cashier cannot change credit terms', r.status === 403 && r.body.error === 'CREDIT_TERMS_FORBIDDEN', r.body)
+  r = await api(`/api/v1/customers/${creditCust.id}`, { method: 'PUT', body: JSON.stringify({ creditLimit: 20000 }) }, token)
+  t('super admin can', r.status === 200, r.body)
+  // a cashier may still extend credit within the limit
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, customerId: creditCust.id, payments: [], items: line(1) })}, cashierToken)
+  t('cashier can sell on credit within the limit', r.status === 201 && r.body.bill.status === 'CREDIT', r.body)
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, customerId: creditCust.id, payments: [], items: line(1),
+    allowCreditOverride: true })}, cashierToken)
+  t('cashier override flag is ignored when over limit',
+    r.status === 201 || (r.status === 409 && r.body.reason === 'LIMIT_EXCEEDED'), r.body)
 
   console.log(`\n${pass} passed, ${fail} failed`)
   await prisma.$disconnect()

@@ -1,15 +1,17 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react'
 import {
-  Search, Plus, Minus, Trash2, User, X, CheckCircle2,
-  ShoppingCart, ChevronDown, CreditCard, Banknote, Smartphone, Printer
+  Search, Plus, Minus, Trash2, User, X, CheckCircle2, AlertTriangle,
+  ShoppingCart, ChevronDown, CreditCard, Banknote, Smartphone, Printer,
+  FileText, ShieldCheck, SplitSquareHorizontal
 } from 'lucide-react'
 import { Button } from '../components/ui/button'
 import { Input } from '../components/ui/input'
 import { Modal } from '../components/Modal'
 import { apiFetch } from '../lib/api'
 import { printReceipt, type ReceiptBill, type ReceiptShop } from '../lib/receipt'
-import { computeInvoiceTotals } from '@shared/money'
+import { computeInvoiceTotals, round2 } from '@shared/money'
 import { isLengthMode, parseQty, qtyStep, roundQty, formatQty } from '@shared/units'
+import { settle, checkCredit, PAYMENT_METHODS, type PaymentMethod, type Tender } from '@shared/credit'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -47,6 +49,26 @@ type Customer = {
   name: string
   phone: string
   email: string | null
+  /** Present on the autocomplete payload; absent on a freshly created customer. */
+  creditLimit?: number
+  outstanding?: number
+  creditDays?: number
+}
+
+/** The customer's ledger as the counter needs it while taking payment. */
+type CreditInfo = {
+  outstanding: number
+  creditLimit: number
+  creditDays: number
+}
+
+/** One payment line in the tender list. The amount is kept as a string so the
+ *  field can be cleared mid-typing without collapsing to 0. */
+type TenderLine = {
+  key: string
+  method: PaymentMethod
+  amount: string
+  reference: string
 }
 
 type SavedBill = {
@@ -63,6 +85,15 @@ type SavedBill = {
   amountReceived?: number | null
   changeGiven: number | null
   paymentMethod: string
+  /** Settlement, as decided by the server. */
+  paidAmount?: number
+  balanceDue?: number
+  dueDate?: string | null
+  status?: string
+  /** Filled in locally from what was actually tendered — the create response
+   *  does not echo the payment rows back. */
+  tenders?: Tender[]
+  customerOutstanding?: number | null
   items: {
     productName: string; itemCode?: string; quantity: number; unitRate?: number; lineTotal: number
     gstPercentage?: number; taxableValue?: number; cgstAmount?: number; sgstAmount?: number
@@ -74,7 +105,45 @@ type SavedBill = {
 const AUTO_PRINT_KEY = 'cashlio_auto_print'
 const isAutoPrintEnabled = () => localStorage.getItem(AUTO_PRINT_KEY) !== 'false'
 
+const METHOD_META: Record<PaymentMethod, { label: string; icon: React.ReactNode }> = {
+  CASH: { label: 'Cash', icon: <Banknote className="w-4 h-4" /> },
+  UPI: { label: 'UPI', icon: <Smartphone className="w-4 h-4" /> },
+  CARD: { label: 'Card', icon: <CreditCard className="w-4 h-4" /> },
+  CHEQUE: { label: 'Cheque', icon: <FileText className="w-4 h-4" /> }
+}
+
+/** Methods where a transaction id / cheque number is worth capturing. */
+const NEEDS_REFERENCE: PaymentMethod[] = ['UPI', 'CHEQUE']
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/**
+ * Reads the signed-in user's role out of the manager session JWT.
+ *
+ * The app carries no role context in React state yet, and the only place the
+ * role is available to the renderer is the token itself. This decodes the
+ * payload without verifying the signature, which is fine because it decides
+ * nothing more than whether to *offer* the credit-override button — the server
+ * re-checks the role before honouring `allowCreditOverride`.
+ */
+function currentUserRole(): string | null {
+  try {
+    const payload = localStorage.getItem('managerToken')?.split('.')[1]
+    if (!payload) return null
+    const json = atob(payload.replace(/-/g, '+').replace(/_/g, '/'))
+    return (JSON.parse(json) as { role?: string }).role ?? null
+  } catch {
+    return null
+  }
+}
+
+let tenderKeySeq = 0
+const newTenderLine = (method: PaymentMethod, amount = ''): TenderLine => ({
+  key: `tender-${++tenderKeySeq}`,
+  method,
+  amount,
+  reference: ''
+})
 
 function calcLine(item: Omit<CartItem, 'lineTotal' | 'lineGstAmount'>): Pick<CartItem, 'lineTotal' | 'lineGstAmount'> {
   const base = item.quantity * item.unitRate
@@ -117,6 +186,7 @@ export function BillingScreen({
 
   // Customer
   const [customer, setCustomer] = useState<Customer | null>(null)
+  const [creditInfo, setCreditInfo] = useState<CreditInfo | null>(null)
   const [showCustomerModal, setShowCustomerModal] = useState(false)
   const [customerSearch, setCustomerSearch] = useState('')
   const [customerResults, setCustomerResults] = useState<Customer[]>([])
@@ -130,14 +200,17 @@ export function BillingScreen({
   const [billDiscountFlat, setBillDiscountFlat] = useState('')
   const [billDiscountPct, setBillDiscountPct] = useState('')
 
-  // Payment
-  const [paymentMethod, setPaymentMethod] = useState<'CASH' | 'UPI' | 'CARD'>('CASH')
-  const [cashReceived, setCashReceived] = useState('')
+  // Payment — one or more tenders. The common case is a single cash line that
+  // tracks the grand total, so nothing has to be typed to take full payment.
+  const [tenders, setTenders] = useState<TenderLine[]>(() => [newTenderLine('CASH')])
+  const [tenderTouched, setTenderTouched] = useState(false)
 
   // Submit
   const [submitting, setSubmitting] = useState(false)
   const [submitError, setSubmitError] = useState('')
+  const [creditError, setCreditError] = useState<{ message: string; needsOverride: boolean } | null>(null)
   const [successBill, setSuccessBill] = useState<SavedBill | null>(null)
+  const isSuperAdmin = currentUserRole() === 'SUPER_ADMIN'
 
   // Bill number preview
   const [billNumber, setBillNumber] = useState<string>('')
@@ -185,6 +258,12 @@ export function BillingScreen({
     igstAmount: b.igstAmount,
     amountReceived: b.amountReceived ?? null,
     changeGiven: b.changeGiven,
+    paidAmount: b.paidAmount,
+    balanceDue: b.balanceDue,
+    dueDate: b.dueDate ?? null,
+    status: b.status,
+    tenders: b.tenders,
+    customerOutstanding: b.customerOutstanding ?? null,
     customerName: b.customer?.name ?? null,
     items: b.items.map((it) => ({
       itemCode: it.itemCode || '',
@@ -406,10 +485,101 @@ export function BillingScreen({
   const taxableValue = totals.taxableValue
   const cgstAmount = totals.cgstAmount
   const sgstAmount = totals.sgstAmount
-  const cashRec = parseFloat(cashReceived) || 0
-  const shortBy = paymentMethod === 'CASH' ? Math.max(0, grandTotal - cashRec) : 0
-  const change = paymentMethod === 'CASH' ? Math.max(0, cashRec - grandTotal) : 0
-  const canPay = grandTotal > 0 && (paymentMethod !== 'CASH' || cashRec >= grandTotal)
+
+  // ─── Settlement ──────────────────────────────────────────────────────────
+
+  const tenderList: Tender[] = tenders.map((t) => ({
+    method: t.method,
+    amount: parseFloat(t.amount) || 0,
+    reference: t.reference.trim() || null
+  }))
+  // Same arithmetic the server applies, so the counter and the stored bill
+  // agree on what was collected and what is still owed.
+  const settlement = settle(grandTotal, tenderList)
+  const balanceDue = settlement.balanceDue
+
+  // A lone untouched cash line follows the bill total, so the cashier only
+  // types an amount when the payment is not a straightforward full tender.
+  useEffect(() => {
+    if (tenderTouched) return
+    setTenders((prev) => {
+      const want = grandTotal > 0 ? String(round2(grandTotal)) : ''
+      if (prev.length !== 1 || prev[0].method !== 'CASH' || prev[0].amount === want) return prev
+      return [{ ...prev[0], amount: want }]
+    })
+  }, [grandTotal, tenderTouched])
+
+  useEffect(() => {
+    if (!customer) { setCreditInfo(null); return }
+    let cancelled = false
+    apiFetch<{ outstanding: number; customer: { creditLimit: number; creditDays: number } }>(
+      `/api/v1/customers/${customer.id}/outstanding`, token
+    )
+      .then((d) => {
+        if (cancelled) return
+        setCreditInfo({
+          outstanding: d.outstanding,
+          creditLimit: d.customer.creditLimit,
+          creditDays: d.customer.creditDays
+        })
+      })
+      .catch(() => {
+        if (cancelled) return
+        // Fall back to whatever the autocomplete payload carried.
+        setCreditInfo({
+          outstanding: customer.outstanding ?? 0,
+          creditLimit: customer.creditLimit ?? 0,
+          creditDays: customer.creditDays ?? 0
+        })
+      })
+    return () => { cancelled = true }
+  }, [customer, token])
+
+  const updateTender = (idx: number, patch: Partial<Omit<TenderLine, 'key'>>) => {
+    setTenderTouched(true)
+    setCreditError(null)
+    setTenders((prev) => prev.map((t, i) => (i === idx ? { ...t, ...patch } : t)))
+  }
+
+  /** What is still unpaid once every *other* line is counted. */
+  const remainingExcluding = (idx: number) =>
+    round2(Math.max(0, grandTotal - tenderList.reduce((s, t, i) => (i === idx ? s : s + t.amount), 0)))
+
+  const addTender = () => {
+    setTenderTouched(true)
+    setCreditError(null)
+    setTenders((prev) => {
+      const rest = round2(Math.max(0, grandTotal - tenderList.reduce((s, t) => s + t.amount, 0)))
+      const method: PaymentMethod = prev.some((t) => t.method === 'CASH') ? 'UPI' : 'CASH'
+      return [...prev, newTenderLine(method, rest > 0 ? String(rest) : '')]
+    })
+  }
+
+  const removeTender = (idx: number) => {
+    setTenderTouched(true)
+    setCreditError(null)
+    setTenders((prev) => (prev.length <= 1 ? prev : prev.filter((_, i) => i !== idx)))
+  }
+
+  const resetTenders = () => {
+    setTenders([newTenderLine('CASH')])
+    setTenderTouched(false)
+  }
+
+  // ─── Credit gate ─────────────────────────────────────────────────────────
+
+  // Mirrors the server's decision so a refusal is visible before the cashier
+  // commits, rather than arriving as a 409 afterwards.
+  const creditCheck = checkCredit({
+    hasCustomer: !!customer,
+    creditLimit: creditInfo?.creditLimit ?? 0,
+    currentOutstanding: creditInfo?.outstanding ?? 0,
+    newBalance: balanceDue
+  })
+  const availableCredit = Math.max(0, (creditInfo?.creditLimit ?? 0) - (creditInfo?.outstanding ?? 0))
+  // Only "no customer" is a hard stop on this side — an over-limit balance is
+  // still worth attempting, because a super-admin can authorise the refusal.
+  const canPay = grandTotal > 0 && !(balanceDue > 0 && creditCheck.reason === 'NO_CUSTOMER')
 
   // ─── Customer search ─────────────────────────────────────────────────────
 
@@ -456,10 +626,11 @@ export function BillingScreen({
 
   // ─── Submit Bill ─────────────────────────────────────────────────────────
 
-  const handlePay = async () => {
+  const handlePay = async (allowCreditOverride = false) => {
     if (!canPay || cartItems.length === 0) return
     setSubmitting(true)
     setSubmitError('')
+    setCreditError(null)
     try {
       const body = {
         customerId: customer?.id ?? null,
@@ -473,18 +644,35 @@ export function BillingScreen({
           lineDiscountAmt: it.lineDiscountAmt
         })),
         discountAmount: billDiscAmt,
-        paymentMethod,
-        amountReceived: paymentMethod === 'CASH' ? cashRec : null
+        payments: tenderList.filter((t) => t.amount > 0),
+        ...(allowCreditOverride ? { allowCreditOverride: true } : {})
       }
       const d = await apiFetch<{ bill: SavedBill }>('/api/v1/bills', token, {
         method: 'POST',
         body: JSON.stringify(body)
       })
-      setSuccessBill(d.bill)
+      // The create response does not echo the payment rows, so the tenders are
+      // attached here for the receipt.
+      setSuccessBill({
+        ...d.bill,
+        tenders: tenderList.filter((t) => t.amount > 0),
+        customerOutstanding:
+          creditInfo != null ? round2(creditInfo.outstanding + (d.bill.balanceDue ?? 0)) : null
+      })
     } catch (err: unknown) {
-      const e = err as { data?: { error?: string; productName?: string; available?: number } }
+      const e = err as {
+        data?: {
+          error?: string; message?: string; productName?: string
+          available?: number; needsOverride?: boolean
+        }
+      }
       if (e.data?.error === 'INSUFFICIENT_STOCK') {
         setSubmitError(`Insufficient stock for "${e.data.productName}" (available: ${e.data.available}).`)
+      } else if (e.data?.error === 'CREDIT_NOT_ALLOWED') {
+        setCreditError({
+          message: e.data.message ?? 'Credit is not available for this bill.',
+          needsOverride: Boolean(e.data.needsOverride)
+        })
       } else {
         setSubmitError('Failed to process bill. Please try again.')
       }
@@ -500,9 +688,10 @@ export function BillingScreen({
     setCustomer(null)
     setBillDiscountFlat('')
     setBillDiscountPct('')
-    setPaymentMethod('CASH')
-    setCashReceived('')
+    resetTenders()
+    setCreditInfo(null)
     setSubmitError('')
+    setCreditError(null)
     setSuccessBill(null)
     apiFetch<{ billNumber: string }>('/api/v1/system/next-bill-number', token)
       .then((d) => setBillNumber(d.billNumber))
@@ -518,7 +707,9 @@ export function BillingScreen({
           <CheckCircle2 className="w-11 h-11 text-emerald-600" strokeWidth={1.5} />
         </div>
         <div>
-          <h2 className="text-2xl font-bold text-zinc-900">Payment Collected</h2>
+          <h2 className="text-2xl font-bold text-zinc-900">
+            {(successBill.balanceDue ?? 0) > 0 ? 'Bill Saved' : 'Payment Collected'}
+          </h2>
           <p className="text-muted-foreground mt-1 font-mono text-sm">{successBill.billNumber}</p>
         </div>
         <div className="bg-zinc-50 border rounded-xl p-6 w-full max-w-sm text-left space-y-2">
@@ -526,6 +717,24 @@ export function BillingScreen({
             <span className="text-muted-foreground">Total Charged</span>
             <span className="font-bold text-lg">₹{fmt(successBill.totalAmount)}</span>
           </div>
+          {(successBill.balanceDue ?? 0) > 0 && (
+            <>
+              <div className="flex justify-between text-sm">
+                <span className="text-muted-foreground">Paid now</span>
+                <span className="font-medium">₹{fmt(successBill.paidAmount ?? 0)}</span>
+              </div>
+              <div className="flex justify-between text-sm font-bold text-orange-600 pt-1 border-t">
+                <span>Balance due</span>
+                <span>₹{fmt(successBill.balanceDue ?? 0)}</span>
+              </div>
+              {successBill.dueDate && (
+                <div className="flex justify-between text-xs">
+                  <span className="text-muted-foreground">Payable by</span>
+                  <span>{new Date(successBill.dueDate).toLocaleDateString('en-IN')}</span>
+                </div>
+              )}
+            </>
+          )}
           <div className="flex justify-between text-sm">
             <span className="text-muted-foreground">Payment</span>
             <span className="font-medium">{successBill.paymentMethod}</span>
@@ -593,6 +802,11 @@ export function BillingScreen({
               <User className="w-3.5 h-3.5 text-zinc-500" />
               <span className="font-medium text-zinc-800">{customer.name}</span>
               <span className="text-muted-foreground text-xs">{customer.phone}</span>
+              {creditInfo != null && creditInfo.outstanding > 0 && (
+                <span className="text-xs font-semibold text-orange-600 border-l pl-2">
+                  owes ₹{fmt(creditInfo.outstanding)}
+                </span>
+              )}
               <button type="button" onClick={() => setCustomer(null)} className="text-zinc-400 hover:text-zinc-700 ml-1">
                 <X className="w-3.5 h-3.5" />
               </button>
@@ -936,82 +1150,147 @@ export function BillingScreen({
           <div className="rounded-xl border bg-card p-5 flex flex-col gap-4">
             <p className="text-xs font-bold text-zinc-500 uppercase tracking-wider">Payment</p>
 
-            {/* Method selector */}
-            <div className="flex gap-2">
-              {(
-                [
-                  ['CASH', <Banknote className="w-4 h-4" />, 'Cash'],
-                  ['UPI', <Smartphone className="w-4 h-4" />, 'UPI'],
-                  ['CARD', <CreditCard className="w-4 h-4" />, 'Card']
-                ] as [string, React.ReactNode, string][]
-              ).map(([m, icon, label]) => (
-                <button
-                  key={m}
-                  type="button"
-                  onClick={() => { setPaymentMethod(m as 'CASH' | 'UPI' | 'CARD'); setCashReceived('') }}
-                  className={`flex-1 flex flex-col items-center gap-1.5 py-3 rounded-xl border text-xs font-semibold transition-all ${paymentMethod === m ? 'bg-zinc-900 text-white border-zinc-900' : 'text-zinc-600 hover:bg-zinc-50 border-zinc-200'}`}
-                >
-                  {icon}
-                  {label}
-                </button>
+            {/* Tender lines. A single cash line covers the common case and
+                tracks the bill total; splitting is one click away. */}
+            <div className="space-y-2">
+              {tenders.map((t, idx) => (
+                <div key={t.key} className="space-y-1.5">
+                  <div className="flex gap-2">
+                    <select
+                      value={t.method}
+                      onChange={(e) => updateTender(idx, { method: e.target.value as PaymentMethod })}
+                      className="h-11 rounded-lg border border-zinc-200 bg-white px-2 text-sm font-semibold text-zinc-700 focus:outline-none focus:border-zinc-900"
+                    >
+                      {PAYMENT_METHODS.map((m) => (
+                        <option key={m} value={m}>{METHOD_META[m].label}</option>
+                      ))}
+                    </select>
+                    <div className="relative flex-1">
+                      <span className="absolute left-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground font-medium">₹</span>
+                      <Input
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        value={t.amount}
+                        onChange={(e) => updateTender(idx, { amount: e.target.value })}
+                        placeholder={fmt(remainingExcluding(idx))}
+                        className="pl-8 h-11 text-base font-medium"
+                      />
+                    </div>
+                    {tenders.length > 1 && (
+                      <button
+                        type="button"
+                        onClick={() => removeTender(idx)}
+                        className="w-9 h-11 flex items-center justify-center rounded-lg text-zinc-400 hover:text-red-600 hover:bg-red-50 transition-colors"
+                        title="Remove this payment"
+                      >
+                        <X className="w-4 h-4" />
+                      </button>
+                    )}
+                  </div>
+                  {NEEDS_REFERENCE.includes(t.method) && (
+                    <Input
+                      value={t.reference}
+                      onChange={(e) => updateTender(idx, { reference: e.target.value })}
+                      placeholder={t.method === 'CHEQUE' ? 'Cheque number' : 'UPI reference'}
+                      className="h-9 text-sm font-mono"
+                    />
+                  )}
+                </div>
               ))}
+
+              <button
+                type="button"
+                onClick={addTender}
+                className="w-full flex items-center justify-center gap-2 py-2 rounded-lg border border-dashed text-xs font-semibold text-muted-foreground hover:bg-zinc-50 hover:text-zinc-700 transition-colors"
+              >
+                <SplitSquareHorizontal className="w-3.5 h-3.5" /> Split payment
+              </button>
             </div>
 
-            {/* Cash received + change */}
-            {paymentMethod === 'CASH' && (
-              <div className="space-y-3">
-                <div>
-                  <label className="block text-xs font-semibold text-zinc-600 mb-1.5">Amount Received</label>
-                  <div className="relative">
-                    <span className="absolute left-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground font-medium">₹</span>
-                    <Input
-                      type="number"
-                      min="0"
-                      step="1"
-                      value={cashReceived}
-                      onChange={(e) => setCashReceived(e.target.value)}
-                      placeholder={fmt(grandTotal)}
-                      className="pl-8 h-11 text-base font-medium"
-                      autoFocus={false}
-                    />
-                  </div>
-                </div>
-                {cashRec > 0 && (
-                  <div className={`flex items-center justify-between p-3 rounded-lg text-sm font-semibold ${shortBy > 0 ? 'bg-amber-50 text-amber-800' : 'bg-emerald-50 text-emerald-800'}`}>
-                    <span>{shortBy > 0 ? 'Short by' : 'Change to return'}</span>
-                    <span className="text-base">₹{fmt(shortBy > 0 ? shortBy : change)}</span>
-                  </div>
-                )}
-                {shortBy > 0 && (
-                  <p className="text-xs text-muted-foreground">
-                    Part payment isn't available yet — collect the full amount to continue.
-                  </p>
-                )}
-                {/* Quick amount buttons */}
-                {grandTotal > 0 && (
-                  <div className="flex gap-1.5 flex-wrap">
-                    {[grandTotal, Math.ceil(grandTotal / 10) * 10, Math.ceil(grandTotal / 50) * 50, Math.ceil(grandTotal / 100) * 100]
-                      .filter((v, i, a) => a.indexOf(v) === i)
-                      .slice(0, 4)
-                      .map((amt) => (
-                        <button
-                          key={amt}
-                          type="button"
-                          onClick={() => setCashReceived(String(amt))}
-                          className="px-2.5 py-1 rounded-md border text-xs font-medium hover:bg-zinc-100 transition-colors"
-                        >
-                          ₹{fmt(amt)}
-                        </button>
-                      ))}
-                  </div>
-                )}
+            {/* Quick tender amounts for the first cash line */}
+            {grandTotal > 0 && tenders.length === 1 && tenders[0].method === 'CASH' && (
+              <div className="flex gap-1.5 flex-wrap">
+                {[grandTotal, Math.ceil(grandTotal / 10) * 10, Math.ceil(grandTotal / 50) * 50, Math.ceil(grandTotal / 100) * 100]
+                  .filter((v, i, a) => a.indexOf(v) === i)
+                  .slice(0, 4)
+                  .map((amt) => (
+                    <button
+                      key={amt}
+                      type="button"
+                      onClick={() => updateTender(0, { amount: String(amt) })}
+                      className="px-2.5 py-1 rounded-md border text-xs font-medium hover:bg-zinc-100 transition-colors"
+                    >
+                      ₹{fmt(amt)}
+                    </button>
+                  ))}
               </div>
             )}
 
-            {(paymentMethod === 'UPI' || paymentMethod === 'CARD') && (
-              <p className="text-xs text-muted-foreground text-center py-2">
-                {paymentMethod === 'UPI' ? 'Accept UPI payment and confirm below.' : 'Swipe or tap card and confirm below.'}
-              </p>
+            {/* Where the money landed */}
+            {settlement.tendered > 0 && settlement.changeGiven > 0 && (
+              <div className="flex items-center justify-between p-3 rounded-lg text-sm font-semibold bg-emerald-50 text-emerald-800">
+                <span>Change to return</span>
+                <span className="text-base">₹{fmt(settlement.changeGiven)}</span>
+              </div>
+            )}
+            {balanceDue > 0 && (
+              <div className="flex items-center justify-between p-3 rounded-lg text-sm font-semibold bg-orange-50 text-orange-800">
+                <span>Balance due</span>
+                <span className="text-base">₹{fmt(balanceDue)}</span>
+              </div>
+            )}
+
+            {/* Credit position for the selected customer */}
+            {balanceDue > 0 && (
+              creditCheck.reason === 'NO_CUSTOMER' ? (
+                <div className="flex items-start gap-2 p-3 rounded-lg bg-amber-50 text-amber-800 text-xs">
+                  <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                  <span>Select a customer before leaving a balance — a walk-in bill has to be paid in full.</span>
+                </div>
+              ) : creditInfo ? (
+                <div className={`p-3 rounded-lg text-xs ${creditCheck.allowed ? 'bg-zinc-50 text-zinc-600' : 'bg-amber-50 text-amber-800'}`}>
+                  <div className="flex justify-between">
+                    <span>Already owes</span>
+                    <span className="font-semibold">₹{fmt(creditInfo.outstanding)}</span>
+                  </div>
+                  <div className="flex justify-between mt-0.5">
+                    <span>Credit available</span>
+                    <span className="font-semibold">₹{fmt(availableCredit)}</span>
+                  </div>
+                  {!creditCheck.allowed && (
+                    <p className="mt-1.5 font-semibold flex items-start gap-1.5">
+                      <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                      {creditCheck.reason === 'NO_CREDIT_ALLOWED'
+                        ? 'This customer has no credit limit set.'
+                        : `Over their limit by ₹${fmt(creditCheck.overBy)}.`}
+                    </p>
+                  )}
+                </div>
+              ) : null
+            )}
+
+            {creditError && (
+              <div className="p-3 bg-amber-50 border border-amber-200 rounded-md text-xs text-amber-800 space-y-2">
+                <p className="flex items-start gap-1.5 font-medium">
+                  <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                  {creditError.message}
+                </p>
+                {creditError.needsOverride && (
+                  isSuperAdmin ? (
+                    <Button
+                      onClick={() => handlePay(true)}
+                      disabled={submitting}
+                      variant="outline"
+                      className="h-8 w-full text-xs gap-1.5"
+                    >
+                      <ShieldCheck className="w-3.5 h-3.5" /> Authorise anyway
+                    </Button>
+                  ) : (
+                    <p className="text-[11px] text-amber-700">Ask a manager to authorise this.</p>
+                  )
+                )}
+              </div>
             )}
 
             {submitError && (
@@ -1021,14 +1300,19 @@ export function BillingScreen({
             {/* Action buttons */}
             <div className="flex flex-col gap-2 mt-1">
               <Button
-                onClick={handlePay}
+                onClick={() => handlePay()}
                 disabled={!canPay || submitting || cartItems.length === 0}
                 className="h-12 text-base font-bold gap-2 w-full"
               >
                 {submitting ? (
                   <><div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" /> Processing...</>
                 ) : (
-                  <><CheckCircle2 className="w-5 h-5" /> Collect ₹{fmt(grandTotal)}</>
+                  <>
+                    <CheckCircle2 className="w-5 h-5" />
+                    {balanceDue > 0
+                      ? `Collect ₹${fmt(settlement.paidAmount)} · ₹${fmt(balanceDue)} on credit`
+                      : `Collect ₹${fmt(grandTotal)}`}
+                  </>
                 )}
               </Button>
               <button
@@ -1038,8 +1322,9 @@ export function BillingScreen({
                     setCartItems([])
                     setBillDiscountFlat('')
                     setBillDiscountPct('')
-                    setCashReceived('')
+                    resetTenders()
                     setSubmitError('')
+                    setCreditError(null)
                   }
                 }}
                 className="text-xs text-muted-foreground hover:text-red-600 transition-colors text-center py-1"

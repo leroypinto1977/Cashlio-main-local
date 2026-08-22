@@ -31,6 +31,10 @@ import {
 } from '../shared/validation'
 import { round2, computeInvoiceTotals } from '../shared/money'
 import { parseQty, roundQty, computePurchaseCost, defaultMeasureFor, measuresFor } from '../shared/units'
+import {
+  settle, statusFor, checkCredit, isPaymentMethod, dueDateFor, ageBucketOf,
+  daysBetween, UNSETTLED_STATUSES, type Tender
+} from '../shared/credit'
 
 declare global {
   namespace Express {
@@ -225,6 +229,8 @@ function serializeBill(b: any): any {
     cgstAmount: Number(b.cgstAmount ?? 0),
     sgstAmount: Number(b.sgstAmount ?? 0),
     igstAmount: Number(b.igstAmount ?? 0),
+    paidAmount: Number(b.paidAmount ?? 0),
+    balanceDue: Number(b.balanceDue ?? 0),
     amountReceived: b.amountReceived != null ? Number(b.amountReceived) : null,
     changeGiven: b.changeGiven != null ? Number(b.changeGiven) : null,
     ...(Array.isArray(b.items) ? { items: b.items.map(serializeBillItem) } : {})
@@ -288,6 +294,106 @@ function serializeBatch(b: any): any {
   }
 }
 /* eslint-enable @typescript-eslint/no-explicit-any */
+
+/**
+ * What a customer currently owes: the sum of balances on bills that are still
+ * part-paid or on credit. Never stored, so it cannot drift away from the bills
+ * it describes.
+ */
+async function outstandingFor(db: DbClient, customerId: string): Promise<number> {
+  const agg = await db.bill.aggregate({
+    where: { customerId, status: { in: [...UNSETTLED_STATUSES] } },
+    _sum: { balanceDue: true }
+  })
+  return round2(Number(agg._sum.balanceDue ?? 0))
+}
+
+/**
+ * Normalises whatever the client sent into a list of tenders.
+ *
+ * Older clients (and the terminal's offline outbox) send a single
+ * `paymentMethod` with an optional `amountReceived`; newer ones send a
+ * `payments` array so a bill can be split across cash and UPI. A bill with no
+ * tender at all is a pure credit sale.
+ */
+type TenderRead =
+  | { error: string }
+  | { tenders: Tender[]; settleInFull: boolean; method: string }
+
+function readTenders(body: Record<string, unknown>): TenderRead {
+  const raw = body.payments
+  if (Array.isArray(raw)) {
+    const tenders: Tender[] = []
+    for (const t of raw) {
+      const line = t as { method?: unknown; amount?: unknown; reference?: unknown }
+      if (!isPaymentMethod(line.method)) return { error: 'INVALID_PAYMENT_METHOD' }
+      const amount = round2(Number(line.amount))
+      if (!Number.isFinite(amount) || amount < 0) return { error: 'INVALID_PAYMENT_AMOUNT' }
+      if (amount === 0) continue
+      tenders.push({
+        method: line.method,
+        amount,
+        reference: typeof line.reference === 'string' ? line.reference.trim() || null : null
+      })
+    }
+    return { tenders, settleInFull: false, method: tenders[0]?.method ?? 'CASH' }
+  }
+
+  const method = body.paymentMethod
+  if (!isPaymentMethod(method)) return { error: 'INVALID_PAYMENT_METHOD' }
+
+  // Older clients send only a method, meaning "paid in full at the counter".
+  // The total is not known until the lines are priced, so that is expressed as
+  // a flag rather than a number invented here.
+  const received = body.amountReceived
+  if (received == null) return { tenders: [], settleInFull: true, method }
+
+  const amount = round2(Number(received))
+  if (!Number.isFinite(amount) || amount < 0) return { error: 'INVALID_PAYMENT_AMOUNT' }
+  return { tenders: amount === 0 ? [] : [{ method, amount, reference: null }], settleInFull: false, method }
+}
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+function serializePayment(p: any): any {
+  return {
+    ...p,
+    amount: Number(p.amount),
+    ...(p.bill ? { bill: { ...p.bill, totalAmount: Number(p.bill.totalAmount) } } : {})
+  }
+}
+/* eslint-enable @typescript-eslint/no-explicit-any */
+
+/**
+ * Recomputes a bill's settlement from the records that actually exist: what
+ * has been collected against it, less anything returned. Storing the result
+ * keeps queries cheap, but it is always derivable from payments and credit
+ * notes, so it cannot silently drift.
+ */
+async function recomputeBillSettlement(tx: TxClient, billId: string): Promise<void> {
+  const bill = await tx.bill.findUnique({
+    where: { id: billId },
+    select: {
+      id: true, totalAmount: true, status: true,
+      payments: { select: { amount: true } },
+      returns: { where: { status: 'RETURN' }, select: { totalAmount: true } }
+    }
+  })
+  if (!bill || bill.status === 'VOID' || bill.status === 'RETURN') return
+
+  const total = round2(Number(bill.totalAmount))
+  const paid = round2(bill.payments.reduce((s, p) => s + Number(p.amount), 0))
+  const returned = round2(bill.returns.reduce((s, r) => s + Number(r.totalAmount), 0))
+  const balanceDue = round2(Math.max(0, total - paid - returned))
+
+  await tx.bill.update({
+    where: { id: bill.id },
+    data: {
+      paidAmount: paid,
+      balanceDue,
+      status: balanceDue <= 0 ? 'PAID' : paid > 0 ? 'PARTIAL' : 'CREDIT'
+    }
+  })
+}
 
 /** Rejects a request with the shared validator's own error code and message. */
 function fieldError(res: Response, r: Extract<FieldResult<string>, { ok: false }>) {
@@ -1517,6 +1623,21 @@ app.put('/api/v1/batches/:batchId', requireAuth(['SUPER_ADMIN']), async (req, re
 
 // ─── Phase 3 — Customers ──────────────────────────────────────────────────────
 
+/** Sums outstanding for many customers in one query. */
+async function outstandingByCustomer(ids: string[]): Promise<Map<string, number>> {
+  if (ids.length === 0) return new Map()
+  const rows = await prisma.bill.groupBy({
+    by: ['customerId'],
+    where: { customerId: { in: ids }, status: { in: [...UNSETTLED_STATUSES] } },
+    _sum: { balanceDue: true }
+  })
+  return new Map(
+    rows
+      .filter((r) => r.customerId)
+      .map((r) => [r.customerId as string, round2(Number(r._sum.balanceDue ?? 0))])
+  )
+}
+
 app.get('/api/v1/customers', requireAuth(), async (req, res) => {
   try {
     const { search, limit, offset, autocomplete } = req.query
@@ -1536,7 +1657,17 @@ app.get('/api/v1/customers', requireAuth(), async (req, res) => {
         orderBy: { name: 'asc' },
         take: 20
       })
-      return res.json({ success: true, customers, total: customers.length })
+      // The terminal needs the balance to decide whether credit is available.
+      const owed = await outstandingByCustomer(customers.map((c) => c.id))
+      return res.json({
+        success: true,
+        customers: customers.map((c) => ({
+          ...c,
+          creditLimit: Number(c.creditLimit),
+          outstanding: owed.get(c.id) ?? 0
+        })),
+        total: customers.length
+      })
     }
 
     // Full list mode (customers screen): all customers, paginated, optional search
@@ -1558,7 +1689,16 @@ app.get('/api/v1/customers', requireAuth(), async (req, res) => {
       }),
       prisma.customer.count({ where })
     ])
-    return res.json({ success: true, customers, total })
+    const owed = await outstandingByCustomer(customers.map((c) => c.id))
+    return res.json({
+      success: true,
+      customers: customers.map((c) => ({
+        ...c,
+        creditLimit: Number(c.creditLimit),
+        outstanding: owed.get(c.id) ?? 0
+      })),
+      total
+    })
   } catch (err) {
     console.error(err)
     return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
@@ -1597,7 +1737,7 @@ app.get('/api/v1/customers/:id', requireAuth(), async (req, res) => {
 
 app.post('/api/v1/customers', requireAuth(), async (req, res) => {
   try {
-    const { name, phone, email, address, gstin } = req.body
+    const { name, phone, email, address, gstin, creditLimit, creditDays } = req.body
 
     const nameCheck = validateName(String(name ?? ''), 'Customer name')
     if (!nameCheck.ok) return fieldError(res, nameCheck)
@@ -1615,7 +1755,14 @@ app.post('/api/v1/customers', requireAuth(), async (req, res) => {
           phone: phoneCheck.value,
           email: emailCheck.value || null,
           address: address ? String(address).trim() : null,
-          gstin: gstCheck.value || null
+          gstin: gstCheck.value || null,
+          // Only a super-admin decides how much credit a customer gets.
+          ...(req.user!.role === 'SUPER_ADMIN'
+            ? {
+                creditLimit: Math.max(0, round2(Number(creditLimit) || 0)),
+                creditDays: Math.max(0, Math.floor(Number(creditDays) || 0))
+              }
+            : {})
         }
       })
       await emitCustomerUpsert(tx, created.id)
@@ -1633,7 +1780,7 @@ app.post('/api/v1/customers', requireAuth(), async (req, res) => {
 
 app.put('/api/v1/customers/:id', requireAuth(), async (req, res) => {
   try {
-    const { name, phone, email, address, gstin, isActive } = req.body
+    const { name, phone, email, address, gstin, isActive, creditLimit, creditDays } = req.body
     // Build data with only the fields that were explicitly sent
     const data: Record<string, unknown> = {}
     if (name !== undefined) {
@@ -1658,6 +1805,16 @@ app.put('/api/v1/customers/:id', requireAuth(), async (req, res) => {
     }
     if (address !== undefined) data.address = address ? String(address).trim() : null
     if (isActive !== undefined) data.isActive = isActive
+    // Credit terms are the shop owner's call, not a cashier's.
+    if (req.user!.role === 'SUPER_ADMIN') {
+      if (creditLimit !== undefined) data.creditLimit = Math.max(0, round2(Number(creditLimit) || 0))
+      if (creditDays !== undefined) data.creditDays = Math.max(0, Math.floor(Number(creditDays) || 0))
+    } else if (creditLimit !== undefined || creditDays !== undefined) {
+      return res.status(403).json({
+        success: false, error: 'CREDIT_TERMS_FORBIDDEN',
+        message: 'Only a super admin can change credit terms.'
+      })
+    }
     const customer = await prisma.$transaction(async (tx) => {
       const updated = await tx.customer.update({
         where: { id: String(req.params.id) },
@@ -1815,8 +1972,15 @@ type CreateBillArgs = {
   customerId: string | null
   originDeviceId: string
   cashierId: string
-  paymentMethod: 'CASH' | 'UPI' | 'CARD'
+  paymentMethod: string
   amountReceived: number | null
+  tenders: Tender[]
+  /// Treat the bill as settled in full whatever the total turns out to be.
+  /// Used for the replacement half of an exchange, which is paid for by the
+  /// refund rather than by a tender the cashier counts.
+  settleInFull?: boolean
+  /// Set by a SUPER_ADMIN to let a bill exceed the customer's credit limit.
+  allowCreditOverride: boolean
   discountAmount: number
   notes: string | null
   clientLocalId: string | null
@@ -1916,15 +2080,49 @@ async function createBillCore(tx: TxClient, args: CreateBillArgs, billNumber?: s
     l.igstAmount = t.igstAmount
   })
   const { subtotal, billDiscount, totalAmount, taxableValue, gstAmount, cgstAmount, sgstAmount, igstAmount } = totals
-  const changeGiven = args.paymentMethod === 'CASH' && args.amountReceived != null
-    ? round2(Math.max(0, args.amountReceived - totalAmount))
+  // What was actually handed over decides how much is still owed.
+  const tenders: Tender[] = args.settleInFull
+    ? [{ method: args.paymentMethod, amount: totalAmount }]
+    : args.tenders
+  const settlement = settle(totalAmount, tenders)
+
+  const customer = args.customerId
+    ? await tx.customer.findUnique({
+        where: { id: args.customerId },
+        select: { id: true, name: true, creditLimit: true, creditDays: true }
+      })
     : null
+  const creditDays = customer ? Number(customer.creditDays) : 0
+
+  if (settlement.balanceDue > 0) {
+    const currentOutstanding = customer ? await outstandingFor(tx, customer.id) : 0
+    const credit = checkCredit({
+      hasCustomer: Boolean(customer),
+      creditLimit: customer ? Number(customer.creditLimit) : 0,
+      currentOutstanding,
+      newBalance: settlement.balanceDue
+    })
+
+    // A super-admin may wave a customer past their limit, but nobody can put a
+    // balance on a walk-in — there would be nobody to chase for it.
+    const overridden = credit.needsOverride && args.allowCreditOverride
+    if (!credit.allowed && !overridden) {
+      throw Object.assign(new Error('CREDIT_NOT_ALLOWED'), {
+        code: 'CREDIT_NOT_ALLOWED',
+        reason: credit.reason,
+        customerName: customer?.name,
+        ...credit
+      })
+    }
+  }
+
+  const changeGiven = settlement.changeGiven > 0 ? settlement.changeGiven : null
 
   const created = await tx.bill.create({
     data: {
       billNumber: invoiceNumber,
       clientLocalId: args.clientLocalId,
-      status: 'PAID',
+      status: settlement.status,
       customerId: args.customerId,
       originDeviceId: args.originDeviceId,
       cashierId: args.cashierId,
@@ -1937,10 +2135,23 @@ async function createBillCore(tx: TxClient, args: CreateBillArgs, billNumber?: s
       sgstAmount,
       igstAmount,
       placeOfSupply,
-      paymentMethod: args.paymentMethod,
-      amountReceived: args.paymentMethod === 'CASH' && args.amountReceived != null ? args.amountReceived : null,
+      paymentMethod: tenders[0]?.method ?? args.paymentMethod,
+      amountReceived: settlement.tendered > 0 ? settlement.tendered : null,
       changeGiven,
+      paidAmount: settlement.paidAmount,
+      balanceDue: settlement.balanceDue,
+      dueDate: settlement.balanceDue > 0 ? dueDateFor(new Date(), creditDays) : null,
       notes: args.notes,
+      payments: {
+        create: tenders.map((t) => ({
+          customerId: args.customerId,
+          amount: t.amount,
+          method: t.method,
+          reference: t.reference ?? null,
+          isSettlement: false,
+          collectedById: args.cashierId
+        }))
+      },
       items: { create: lines }
     },
     include: { customer: { select: { name: true } }, items: true }
@@ -1971,7 +2182,9 @@ async function processReturnCore(tx: TxClient, args: ProcessReturnArgs) {
     include: { items: true }
   })
   if (!original) throw Object.assign(new Error('NOT_FOUND'), { code: 'NOT_FOUND' })
-  if (original.status !== 'PAID') {
+  // A part-paid or credit bill can be returned against too; the refund comes
+  // off what is still owed before any cash changes hands.
+  if (!['PAID', 'PARTIAL', 'CREDIT'].includes(original.status)) {
     throw Object.assign(new Error('ORIGINAL_NOT_PAID'), { code: 'ORIGINAL_NOT_PAID', currentStatus: original.status })
   }
 
@@ -2139,6 +2352,9 @@ async function processReturnCore(tx: TxClient, args: ProcessReturnArgs) {
     tx,
     returnLines.map((l) => l.originalItem.productId)
   )
+  // Returning goods against an unsettled bill reduces what the customer owes
+  // rather than handing back money they never paid.
+  await recomputeBillSettlement(tx, original.id)
   return created
 }
 
@@ -2146,14 +2362,11 @@ app.post('/api/v1/bills', requireActiveLicense(), requireAuth(), async (req, res
   try {
     const {
       customerId, originDeviceId, items, discountAmount = 0,
-      paymentMethod, amountReceived, notes, clientLocalId
+      amountReceived, notes, clientLocalId
     } = req.body
 
     if (!originDeviceId) {
       return res.status(400).json({ success: false, error: 'ORIGIN_DEVICE_REQUIRED' })
-    }
-    if (!paymentMethod || !['CASH', 'UPI', 'CARD'].includes(paymentMethod)) {
-      return res.status(400).json({ success: false, error: 'INVALID_PAYMENT_METHOD' })
     }
     if (!items || items.length === 0) {
       return res.status(400).json({ success: false, error: 'BILL_ITEMS_REQUIRED' })
@@ -2180,13 +2393,25 @@ app.post('/api/v1/bills', requireActiveLicense(), requireAuth(), async (req, res
         : undefined
     const cashierId = req.user!.userId
 
+    // The tender total is only known after the lines are priced, so the split
+    // is read here and validated against the computed total inside the tx.
+    const tender = readTenders(req.body)
+    if ('error' in tender) {
+      return res.status(400).json({ success: false, error: tender.error })
+    }
+
     const bill = await prisma.$transaction((tx) => createBillCore(tx, {
       items: items as IncomingSaleItem[],
       customerId: customerId || null,
       originDeviceId,
       cashierId,
-      paymentMethod,
+      paymentMethod: tender.method,
       amountReceived: amountReceived != null ? Number(amountReceived) : null,
+      tenders: tender.tenders,
+      settleInFull: tender.settleInFull,
+      // Only a super-admin can put a customer past their credit limit.
+      allowCreditOverride:
+        req.user!.role === 'SUPER_ADMIN' && Boolean(req.body.allowCreditOverride),
       discountAmount: Number(discountAmount),
       notes: notes || null,
       clientLocalId: clientLocalId ? String(clientLocalId) : null
@@ -2194,7 +2419,32 @@ app.post('/api/v1/bills', requireActiveLicense(), requireAuth(), async (req, res
 
     return res.status(201).json({ success: true, bill: serializeBill(bill) })
   } catch (err: unknown) {
-    const e = err as { code?: string; productName?: string; available?: number; requested?: number }
+    const e = err as {
+      code?: string; productName?: string; available?: number; requested?: number
+      reason?: string; customerName?: string; creditLimit?: number
+      currentOutstanding?: number; newBalance?: number; projectedOutstanding?: number
+      overBy?: number; needsOverride?: boolean
+    }
+    if (e.code === 'CREDIT_NOT_ALLOWED') {
+      const messages: Record<string, string> = {
+        NO_CUSTOMER: 'Select a customer before leaving a balance on a bill.',
+        NO_CREDIT_ALLOWED: 'This customer has no credit limit set.',
+        LIMIT_EXCEEDED: 'This would put the customer over their credit limit.'
+      }
+      return res.status(409).json({
+        success: false,
+        error: 'CREDIT_NOT_ALLOWED',
+        message: messages[String(e.reason)] ?? 'Credit is not available for this bill.',
+        reason: e.reason,
+        customerName: e.customerName,
+        creditLimit: e.creditLimit,
+        currentOutstanding: e.currentOutstanding,
+        newBalance: e.newBalance,
+        projectedOutstanding: e.projectedOutstanding,
+        overBy: e.overBy,
+        needsOverride: e.needsOverride
+      })
+    }
     if (e.code === 'INSUFFICIENT_STOCK') {
       return res.status(409).json({
         success: false,
@@ -2346,6 +2596,11 @@ app.post('/api/v1/bills/:id/exchange', requireActiveLicense(), requireAuth(['SUP
         cashierId,
         paymentMethod: pm,
         amountReceived: amountReceived != null ? Number(amountReceived) : null,
+        // The refund settles the replacement; only the difference changes
+        // hands, so the replacement is never left carrying a balance.
+        tenders: [],
+        settleInFull: true,
+        allowCreditOverride: true,
         discountAmount: 0,
         notes: `Exchange for ${original.billNumber} (refund ${refund.billNumber})`,
         clientLocalId: null
@@ -2366,7 +2621,13 @@ app.post('/api/v1/bills/:id/exchange', requireActiveLicense(), requireAuth(['SUP
       netDifference
     })
   } catch (err: unknown) {
-    const e = err as { code?: string; currentStatus?: string; billItemId?: string; requested?: number; remaining?: number; productName?: string; available?: number }
+    const e = err as {
+      code?: string; currentStatus?: string; billItemId?: string; requested?: number
+      remaining?: number; productName?: string; available?: number
+      reason?: string; customerName?: string; creditLimit?: number
+      currentOutstanding?: number; newBalance?: number; projectedOutstanding?: number
+      overBy?: number; needsOverride?: boolean
+    }
     if (e.code === 'NOT_FOUND') return res.status(404).json({ success: false, error: 'NOT_FOUND' })
     if (e.code === 'ORIGINAL_NOT_PAID') return res.status(409).json({ success: false, error: 'ORIGINAL_NOT_PAID', currentStatus: e.currentStatus })
     if (e.code === 'BILL_ITEM_NOT_IN_ORIGINAL') return res.status(400).json({ success: false, error: 'BILL_ITEM_NOT_IN_ORIGINAL', billItemId: e.billItemId })
@@ -2374,6 +2635,26 @@ app.post('/api/v1/bills/:id/exchange', requireActiveLicense(), requireAuth(['SUP
     if (e.code === 'NO_RETURN_LINES') return res.status(400).json({ success: false, error: 'RETURN_ITEMS_REQUIRED' })
     if (e.code === 'RETURN_QTY_EXCEEDS_REMAINING') {
       return res.status(409).json({ success: false, error: 'RETURN_QTY_EXCEEDS_REMAINING', billItemId: e.billItemId, requested: e.requested, remaining: e.remaining })
+    }
+    if (e.code === 'CREDIT_NOT_ALLOWED') {
+      const messages: Record<string, string> = {
+        NO_CUSTOMER: 'Select a customer before leaving a balance on a bill.',
+        NO_CREDIT_ALLOWED: 'This customer has no credit limit set.',
+        LIMIT_EXCEEDED: 'This would put the customer over their credit limit.'
+      }
+      return res.status(409).json({
+        success: false,
+        error: 'CREDIT_NOT_ALLOWED',
+        message: messages[String(e.reason)] ?? 'Credit is not available for this bill.',
+        reason: e.reason,
+        customerName: e.customerName,
+        creditLimit: e.creditLimit,
+        currentOutstanding: e.currentOutstanding,
+        newBalance: e.newBalance,
+        projectedOutstanding: e.projectedOutstanding,
+        overBy: e.overBy,
+        needsOverride: e.needsOverride
+      })
     }
     if (e.code === 'INSUFFICIENT_STOCK') {
       return res.status(409).json({ success: false, error: 'INSUFFICIENT_STOCK', productName: e.productName, available: e.available, requested: e.requested })
@@ -2399,6 +2680,19 @@ app.post('/api/v1/bills/:id/void', requireAuth(['SUPER_ADMIN']), async (req, res
       return res.status(409).json({ success: false, error: 'CANNOT_VOID_RETURN' })
     }
     // If any item has been returned, restocking on void would double-count.
+    // Money collected after the sale cannot be un-collected by voiding the
+    // bill it was paid against — that would leave the cash drawer unexplained.
+    const settlements = await prisma.payment.count({
+      where: { billId, isSettlement: true }
+    })
+    if (settlements > 0) {
+      return res.status(409).json({
+        success: false, error: 'BILL_HAS_SETTLEMENTS',
+        message: 'Payments have been collected against this bill. Refund them before voiding it.',
+        settlements
+      })
+    }
+
     const returnsExist = await prisma.bill.count({ where: { originalBillId: billId, status: 'RETURN' } })
     if (returnsExist > 0) {
       return res.status(409).json({ success: false, error: 'BILL_HAS_RETURNS' })
@@ -2421,7 +2715,7 @@ app.post('/api/v1/bills/:id/void', requireAuth(['SUPER_ADMIN']), async (req, res
       }
       const voided = await tx.bill.update({
         where: { id: billId },
-        data: { status: 'VOID' }
+        data: { status: 'VOID', balanceDue: 0 }
       })
       await emitBillUpsert(tx, voided)
       await emitProductUpsertBulk(tx, bill.items.map((it) => it.productId))
@@ -2435,6 +2729,377 @@ app.post('/api/v1/bills/:id/void', requireAuth(['SUPER_ADMIN']), async (req, res
 })
 
 // ─── Analytics Summary ─────────────────────────────────────────────────────────
+
+// ─── Phase 3B — Payments, receivables and follow-ups ──────────────────────────
+
+/**
+ * Records money collected against a customer's outstanding bills.
+ *
+ * Allocation defaults to oldest bill first, which is how a shop actually
+ * settles an account. Callers can override it by naming bills explicitly.
+ * It all runs in one transaction so a part-allocated payment can never be
+ * left stranded.
+ */
+app.post('/api/v1/payments', requireActiveLicense(), requireAuth(), async (req, res) => {
+  try {
+    const { customerId, amount, method, reference, note, allocations, clientLocalId } = req.body
+
+    if (!customerId) {
+      return res.status(400).json({ success: false, error: 'CUSTOMER_REQUIRED' })
+    }
+    if (!isPaymentMethod(method)) {
+      return res.status(400).json({ success: false, error: 'INVALID_PAYMENT_METHOD' })
+    }
+    const total = round2(Number(amount))
+    if (!Number.isFinite(total) || total <= 0) {
+      return res.status(400).json({
+        success: false, error: 'INVALID_PAYMENT_AMOUNT',
+        message: 'Enter an amount greater than zero.'
+      })
+    }
+
+    if (clientLocalId) {
+      const existing = await prisma.payment.findUnique({
+        where: { clientLocalId: String(clientLocalId) }
+      })
+      if (existing) {
+        return res.status(200).json({
+          success: true, payments: [serializePayment(existing)], replayed: true
+        })
+      }
+    }
+
+    const result = await prisma.$transaction(async (tx) => {
+      const customer = await tx.customer.findUnique({ where: { id: String(customerId) } })
+      if (!customer) throw Object.assign(new Error('CUSTOMER_NOT_FOUND'), { code: 'CUSTOMER_NOT_FOUND' })
+
+      const openBills = await tx.bill.findMany({
+        where: { customerId: customer.id, status: { in: [...UNSETTLED_STATUSES] } },
+        orderBy: { paidAt: 'asc' }
+      })
+      if (openBills.length === 0) {
+        throw Object.assign(new Error('NOTHING_OUTSTANDING'), { code: 'NOTHING_OUTSTANDING' })
+      }
+
+      // Either honour the caller's allocation, or work forward from the oldest
+      // bill taking as much as each one still needs.
+      const plan: { billId: string; amount: number }[] = []
+      if (Array.isArray(allocations) && allocations.length > 0) {
+        for (const a of allocations) {
+          const billId = String((a as { billId?: unknown }).billId ?? '')
+          const amt = round2(Number((a as { amount?: unknown }).amount))
+          const bill = openBills.find((b) => b.id === billId)
+          if (!bill) {
+            throw Object.assign(new Error('BILL_NOT_OUTSTANDING'), { code: 'BILL_NOT_OUTSTANDING', billId })
+          }
+          if (!Number.isFinite(amt) || amt <= 0) {
+            throw Object.assign(new Error('INVALID_ALLOCATION'), { code: 'INVALID_ALLOCATION', billId })
+          }
+          if (amt > round2(Number(bill.balanceDue))) {
+            throw Object.assign(new Error('ALLOCATION_EXCEEDS_BALANCE'), {
+              code: 'ALLOCATION_EXCEEDS_BALANCE', billId,
+              balanceDue: round2(Number(bill.balanceDue)), requested: amt
+            })
+          }
+          plan.push({ billId, amount: amt })
+        }
+        const planned = round2(plan.reduce((s, x) => s + x.amount, 0))
+        if (planned !== total) {
+          throw Object.assign(new Error('ALLOCATION_MISMATCH'), {
+            code: 'ALLOCATION_MISMATCH', allocated: planned, amount: total
+          })
+        }
+      } else {
+        let left = total
+        for (const bill of openBills) {
+          if (left <= 0) break
+          const due = round2(Number(bill.balanceDue))
+          const take = round2(Math.min(due, left))
+          if (take <= 0) continue
+          plan.push({ billId: bill.id, amount: take })
+          left = round2(left - take)
+        }
+        if (left > 0) {
+          // Refusing beats parking money the shop cannot account for.
+          throw Object.assign(new Error('AMOUNT_EXCEEDS_OUTSTANDING'), {
+            code: 'AMOUNT_EXCEEDS_OUTSTANDING',
+            outstanding: round2(total - left), amount: total, excess: left
+          })
+        }
+      }
+
+      const created: unknown[] = []
+      for (const [i, alloc] of plan.entries()) {
+        const bill = openBills.find((b) => b.id === alloc.billId)!
+        const nextPaid = round2(Number(bill.paidAmount) + alloc.amount)
+        const nextBalance = round2(Number(bill.totalAmount) - nextPaid)
+
+        const payment = await tx.payment.create({
+          data: {
+            billId: bill.id,
+            customerId: customer.id,
+            amount: alloc.amount,
+            method,
+            reference: reference ? String(reference).trim() : null,
+            isSettlement: true,
+            collectedById: req.user!.userId,
+            note: note ? String(note).trim() : null,
+            // Only the first row carries the key — the rest belong to the same
+            // collection and are covered by this transaction.
+            clientLocalId: i === 0 && clientLocalId ? String(clientLocalId) : null
+          },
+          include: { bill: { select: { billNumber: true, totalAmount: true } } }
+        })
+
+        const updated = await tx.bill.update({
+          where: { id: bill.id },
+          data: {
+            paidAmount: nextPaid,
+            balanceDue: Math.max(0, nextBalance),
+            status: statusFor(Number(bill.totalAmount), nextPaid)
+          },
+          include: { customer: { select: { name: true } }, items: true }
+        })
+        await emitBillUpsert(tx, updated)
+        created.push(payment)
+      }
+
+      const outstanding = await outstandingFor(tx, customer.id)
+      await emitCustomerUpsert(tx, customer.id)
+      return { payments: created, outstanding }
+    })
+
+    return res.status(201).json({
+      success: true,
+      payments: result.payments.map(serializePayment),
+      outstanding: result.outstanding
+    })
+  } catch (err: unknown) {
+    const e = err as { code?: string }
+    const map: Record<string, [number, string]> = {
+      CUSTOMER_NOT_FOUND: [404, 'No such customer.'],
+      NOTHING_OUTSTANDING: [409, 'This customer has nothing outstanding.'],
+      BILL_NOT_OUTSTANDING: [409, 'That bill has no balance left to settle.'],
+      INVALID_ALLOCATION: [400, 'Each allocation needs an amount greater than zero.'],
+      ALLOCATION_EXCEEDS_BALANCE: [409, 'That is more than the bill still owes.'],
+      ALLOCATION_MISMATCH: [400, 'The allocations do not add up to the amount collected.'],
+      AMOUNT_EXCEEDS_OUTSTANDING: [409, 'That is more than this customer owes.']
+    }
+    if (e.code && map[e.code]) {
+      const [status, message] = map[e.code]
+      return res.status(status).json({ success: false, message, ...e, error: e.code })
+    }
+    console.error(err)
+    return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
+  }
+})
+
+app.get('/api/v1/payments', requireAuth(), async (req, res) => {
+  try {
+    const { customerId, billId, limit = '50', offset = '0' } = req.query
+    const where = {
+      customerId: customerId ? String(customerId) : undefined,
+      billId: billId ? String(billId) : undefined
+    }
+    const [payments, total] = await Promise.all([
+      prisma.payment.findMany({
+        where,
+        include: {
+          bill: { select: { billNumber: true, totalAmount: true, status: true } },
+          customer: { select: { name: true, phone: true } },
+          collectedBy: { select: { username: true } }
+        },
+        orderBy: { receivedAt: 'desc' },
+        take: parseInt(String(limit)),
+        skip: parseInt(String(offset))
+      }),
+      prisma.payment.count({ where })
+    ])
+    return res.json({ success: true, payments: payments.map(serializePayment), total })
+  } catch (err) {
+    console.error(err)
+    return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
+  }
+})
+
+/** A customer's open bills with their ageing, plus their credit headroom. */
+app.get('/api/v1/customers/:id/outstanding', requireAuth(), async (req, res) => {
+  try {
+    const id = String(req.params.id)
+    const customer = await prisma.customer.findUnique({ where: { id } })
+    if (!customer) return res.status(404).json({ success: false, error: 'NOT_FOUND' })
+
+    const bills = await prisma.bill.findMany({
+      where: { customerId: id, status: { in: [...UNSETTLED_STATUSES] } },
+      orderBy: { paidAt: 'asc' },
+      select: {
+        id: true, billNumber: true, status: true, paidAt: true, dueDate: true,
+        totalAmount: true, paidAmount: true, balanceDue: true
+      }
+    })
+
+    const now = new Date()
+    const open = bills.map((b) => ({
+      ...b,
+      totalAmount: Number(b.totalAmount),
+      paidAmount: Number(b.paidAmount),
+      balanceDue: Number(b.balanceDue),
+      ageBucket: ageBucketOf(b.dueDate, b.paidAt, now),
+      daysOverdue: Math.max(0, daysBetween(b.dueDate ?? b.paidAt, now))
+    }))
+    const outstanding = round2(open.reduce((s, b) => s + b.balanceDue, 0))
+    const creditLimit = Number(customer.creditLimit)
+
+    return res.json({
+      success: true,
+      customer: {
+        id: customer.id, name: customer.name, phone: customer.phone,
+        creditLimit, creditDays: customer.creditDays
+      },
+      outstanding,
+      availableCredit: round2(Math.max(0, creditLimit - outstanding)),
+      overLimit: outstanding > creditLimit,
+      bills: open
+    })
+  } catch (err) {
+    console.error(err)
+    return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
+  }
+})
+
+/** Everyone who owes money, worst first, with ageing totals for the shop. */
+app.get('/api/v1/receivables', requireAuth(), async (_req, res) => {
+  try {
+    const bills = await prisma.bill.findMany({
+      where: { status: { in: [...UNSETTLED_STATUSES] }, customerId: { not: null } },
+      select: {
+        id: true, billNumber: true, customerId: true, paidAt: true, dueDate: true,
+        balanceDue: true, totalAmount: true,
+        customer: { select: { id: true, name: true, phone: true, creditLimit: true } }
+      }
+    })
+
+    const now = new Date()
+    type Row = {
+      customerId: string; name: string; phone: string; creditLimit: number
+      outstanding: number; billCount: number; oldestDays: number
+      buckets: Record<string, number>
+    }
+    const byCustomer = new Map<string, Row>()
+    const totals: Record<string, number> = { current: 0, '0-30': 0, '31-60': 0, '60+': 0 }
+
+    for (const b of bills) {
+      if (!b.customer) continue
+      const bucket = ageBucketOf(b.dueDate, b.paidAt, now)
+      const balance = Number(b.balanceDue)
+      const age = Math.max(0, daysBetween(b.dueDate ?? b.paidAt, now))
+
+      totals[bucket] = round2((totals[bucket] ?? 0) + balance)
+      const row: Row = byCustomer.get(b.customer.id) ?? {
+        customerId: b.customer.id, name: b.customer.name, phone: b.customer.phone,
+        creditLimit: Number(b.customer.creditLimit),
+        outstanding: 0, billCount: 0, oldestDays: 0,
+        buckets: { current: 0, '0-30': 0, '31-60': 0, '60+': 0 }
+      }
+      row.outstanding = round2(row.outstanding + balance)
+      row.billCount += 1
+      row.oldestDays = Math.max(row.oldestDays, age)
+      row.buckets[bucket] = round2((row.buckets[bucket] ?? 0) + balance)
+      byCustomer.set(b.customer.id, row)
+    }
+
+    const customers = [...byCustomer.values()].sort((a, b) => b.outstanding - a.outstanding)
+    return res.json({
+      success: true,
+      totalOutstanding: round2(customers.reduce((s, c) => s + c.outstanding, 0)),
+      buckets: totals,
+      customers
+    })
+  } catch (err) {
+    console.error(err)
+    return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
+  }
+})
+
+// ─── Follow-ups ───────────────────────────────────────────────────────────────
+
+app.get('/api/v1/followups', requireAuth(), async (req, res) => {
+  try {
+    const { customerId, open } = req.query
+    const followUps = await prisma.customerFollowUp.findMany({
+      where: {
+        customerId: customerId ? String(customerId) : undefined,
+        resolvedAt: open === '1' ? null : undefined
+      },
+      include: {
+        customer: { select: { id: true, name: true, phone: true } },
+        createdBy: { select: { username: true } }
+      },
+      orderBy: [{ dueAt: 'asc' }, { createdAt: 'desc' }]
+    })
+    return res.json({ success: true, followUps })
+  } catch (err) {
+    console.error(err)
+    return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
+  }
+})
+
+app.post('/api/v1/customers/:id/followups', requireAuth(), async (req, res) => {
+  try {
+    const customerId = String(req.params.id)
+    const note = String(req.body?.note ?? '').trim()
+    if (!note) {
+      return res.status(400).json({
+        success: false, error: 'NOTE_REQUIRED', message: 'Write what needs following up.'
+      })
+    }
+    const customer = await prisma.customer.findUnique({ where: { id: customerId } })
+    if (!customer) return res.status(404).json({ success: false, error: 'NOT_FOUND' })
+
+    const followUp = await prisma.customerFollowUp.create({
+      data: {
+        customerId,
+        note,
+        dueAt: req.body?.dueAt ? new Date(req.body.dueAt) : null,
+        createdById: req.user!.userId
+      },
+      include: { createdBy: { select: { username: true } } }
+    })
+    return res.status(201).json({ success: true, followUp })
+  } catch (err) {
+    console.error(err)
+    return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
+  }
+})
+
+app.put('/api/v1/followups/:id', requireAuth(), async (req, res) => {
+  try {
+    const data: Record<string, unknown> = {}
+    if (req.body?.note !== undefined) {
+      const note = String(req.body.note).trim()
+      if (!note) return res.status(400).json({ success: false, error: 'NOTE_REQUIRED' })
+      data.note = note
+    }
+    if (req.body?.dueAt !== undefined) {
+      data.dueAt = req.body.dueAt ? new Date(req.body.dueAt) : null
+    }
+    if (req.body?.resolved !== undefined) {
+      data.resolvedAt = req.body.resolved ? new Date() : null
+    }
+    const followUp = await prisma.customerFollowUp.update({
+      where: { id: String(req.params.id) },
+      data,
+      include: { createdBy: { select: { username: true } } }
+    })
+    return res.json({ success: true, followUp })
+  } catch (err: unknown) {
+    if ((err as { code?: string }).code === 'P2025') {
+      return res.status(404).json({ success: false, error: 'NOT_FOUND' })
+    }
+    console.error(err)
+    return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
+  }
+})
 
 app.get('/api/v1/analytics/summary', requireAuth(), async (req, res) => {
   try {

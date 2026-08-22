@@ -41,6 +41,14 @@ export type ReceiptBill = {
   placeOfSupply?: string | null
   amountReceived?: number | null
   changeGiven?: number | null
+  /** Settlement. Absent on bills written before credit billing existed. */
+  paidAmount?: number
+  balanceDue?: number
+  dueDate?: string | null
+  /** Every tender taken at the counter, so a split payment prints in full. */
+  tenders?: { method: string; amount: number; reference?: string | null }[]
+  /** What the customer owes in total after this bill, when they are on credit. */
+  customerOutstanding?: number | null
   customerName?: string | null
   cashierName?: string | null
   status?: string
@@ -132,6 +140,7 @@ export function buildReceiptHtml(
 
   // "Tax invoice" is only an accurate label when the shop is GST-registered.
   const docTitle = shop.gstin ? 'TAX INVOICE' : 'RECEIPT'
+  const balanceDue = bill.balanceDue ?? 0
 
   const itemsHtml = bill.items
     .map((it) => {
@@ -151,6 +160,8 @@ export function buildReceiptHtml(
   const banner =
     isVoid ? '<div class="banner void">** VOIDED **</div>' :
     isReturn ? '<div class="banner ret">** RETURN **</div>' :
+    bill.status === 'CREDIT' ? '<div class="banner ret">** CREDIT — UNPAID **</div>' :
+    bill.status === 'PARTIAL' ? '<div class="banner ret">** PART PAID **</div>' :
     opts.copyLabel ? `<div class="banner">** ${esc(opts.copyLabel)} **</div>` : ''
 
   const autoPrintScript = opts.autoPrint
@@ -194,6 +205,7 @@ export function buildReceiptHtml(
   .banner.ret  { color: #964; border-color: #964; }
   .footer { text-align: center; font-size: 9.5px; margin-top: 8px; }
   .doctype { letter-spacing: 2px; font-weight: 700; margin-top: 2px; }
+  .balance { font-size: 12px; font-weight: 700; border-top: 1px dashed #000; padding-top: 3px; margin-top: 3px; }
   table.gst td { padding: 1px 0; }
   table.gst thead td { border-bottom: 1px dashed #000; font-weight: 600; }
   @media print { body { width: auto; padding: 2mm; } }
@@ -232,8 +244,38 @@ export function buildReceiptHtml(
   }
   <div class="row grand"><span>TOTAL</span><span>₹${fmt(bill.totalAmount)}</span></div>
   <div class="row sm"><span class="lbl">Payment</span><span>${esc(bill.paymentMethod)}</span></div>
-  ${bill.amountReceived != null ? `<div class="row sm"><span class="lbl">Received</span><span>₹${fmt(bill.amountReceived)}</span></div>` : ''}
+  ${
+    // A split payment prints every tender; a single one keeps the old line.
+    bill.tenders && bill.tenders.length > 1
+      ? bill.tenders
+          .map(
+            (t) =>
+              `<div class="row sm"><span class="lbl">${esc(t.method)}${
+                t.reference ? ` · ${esc(t.reference)}` : ''
+              }</span><span>₹${fmt(t.amount)}</span></div>`
+          )
+          .join('')
+      : bill.amountReceived != null
+        ? `<div class="row sm"><span class="lbl">Received</span><span>₹${fmt(bill.amountReceived)}</span></div>`
+        : ''
+  }
   ${bill.changeGiven != null && bill.changeGiven > 0 ? `<div class="row sm"><span class="lbl">Change returned</span><span>₹${fmt(bill.changeGiven)}</span></div>` : ''}
+  ${
+    balanceDue > 0
+      ? `<div class="row balance"><span>BALANCE DUE</span><span>₹${fmt(balanceDue)}</span></div>${
+          bill.dueDate
+            ? `<div class="row sm"><span class="lbl">Payable by</span><span>${esc(
+                new Date(bill.dueDate).toLocaleDateString('en-IN')
+              )}</span></div>`
+            : ''
+        }`
+      : ''
+  }
+  ${
+    bill.customerOutstanding != null && bill.customerOutstanding > 0
+      ? `<div class="row sm"><span class="lbl">Total account balance</span><span>₹${fmt(bill.customerOutstanding)}</span></div>`
+      : ''
+  }
   ${gstSummaryHtml}
   <hr/>
   <div class="footer">Thank you for shopping with us!</div>

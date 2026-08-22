@@ -81,6 +81,8 @@ model User {
   role         String   @default("CASHIER")
   createdAt    DateTime @default(now())
   bills        Bill[]
+  payments     Payment[]
+  followUps    CustomerFollowUp[]
 }
 
 model Warehouse {
@@ -202,16 +204,67 @@ model Customer {
   address   String?
   gstin     String?
   isActive  Boolean  @default(true)
+  /// Most a customer may owe at once. 0 means no credit is allowed at all.
+  /// Outstanding is never stored — it is summed from unsettled bills, so it
+  /// cannot drift out of step with them.
+  creditLimit Decimal @default(0) @db.Decimal(10, 2)
+  /// Days from bill date before the balance is considered due.
+  creditDays  Int     @default(0)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
   bills     Bill[]
+  payments  Payment[]
+  followUps CustomerFollowUp[]
+}
+
+/// A collection against a bill. Bills carry one row per tender taken at the
+/// counter (so split payments are just several rows) plus one for every later
+/// settlement. Money is never edited in place; it is only ever added here.
+model Payment {
+  id            String   @id @default(uuid())
+  billId        String
+  bill          Bill     @relation(fields: [billId], references: [id], onDelete: Cascade)
+  customerId    String?
+  customer      Customer? @relation(fields: [customerId], references: [id])
+  amount        Decimal  @db.Decimal(10, 2)
+  method        String   // CASH | UPI | CARD | CHEQUE
+  reference     String?  // UPI ref, cheque number, card approval code
+  /// False for tender taken when the bill was raised, true for money collected
+  /// afterwards. Voiding a bill that has real collections against it is refused.
+  isSettlement  Boolean  @default(false)
+  receivedAt    DateTime @default(now())
+  collectedById String
+  collectedBy   User     @relation(fields: [collectedById], references: [id])
+  note          String?
+  /// Idempotency key so a terminal replaying its outbox cannot double-post.
+  clientLocalId String?  @unique
+  createdAt     DateTime @default(now())
+
+  @@index([customerId, receivedAt])
+  @@index([billId])
+}
+
+/// A note to chase a customer, usually about an overdue balance.
+model CustomerFollowUp {
+  id          String    @id @default(uuid())
+  customerId  String
+  customer    Customer  @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  note        String
+  dueAt       DateTime?
+  resolvedAt  DateTime?
+  createdById String
+  createdBy   User      @relation(fields: [createdById], references: [id])
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([customerId, resolvedAt])
 }
 
 model Bill {
   id             String           @id @default(uuid())
   billNumber     String           @unique
   clientLocalId  String?          @unique // idempotency key from billing client
-  status         String           @default("PAID") // PAID | VOID | RETURN
+  status         String           @default("PAID") // PAID | PARTIAL | CREDIT | VOID | RETURN
   customerId     String?
   originDeviceId String
   cashierId      String
@@ -227,9 +280,17 @@ model Bill {
   sgstAmount     Decimal          @default(0) @db.Decimal(10, 2)
   igstAmount     Decimal          @default(0) @db.Decimal(10, 2)
   placeOfSupply  String?          // 2-digit GST state code of the customer
+  /// Kept as the *primary* tender for display and for older clients. The full
+  /// breakdown, including split payments, lives in `payments`.
   paymentMethod  String
   amountReceived Decimal?         @db.Decimal(10, 2)
   changeGiven    Decimal?         @db.Decimal(10, 2)
+  /// Settlement. paidAmount + balanceDue == totalAmount at all times.
+  paidAmount     Decimal          @default(0) @db.Decimal(10, 2)
+  balanceDue     Decimal          @default(0) @db.Decimal(10, 2)
+  /// billDate + the customer's credit days, set when a balance is carried.
+  dueDate        DateTime?
+  payments       Payment[]
   notes          String?
   paidAt         DateTime         @default(now())
   createdAt      DateTime         @default(now())

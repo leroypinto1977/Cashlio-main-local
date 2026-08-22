@@ -42,6 +42,11 @@ export type CustomerSyncRow = {
   address: string | null
   gstin: string | null
   isActive: boolean
+  creditLimit: number
+  creditDays: number
+  /** What the customer owed at the moment this event was written. Terminals
+   *  show it as "as of last sync" — it is a hint, not an authority. */
+  outstanding: number
 }
 
 export type BillSyncRow = {
@@ -130,7 +135,9 @@ export function customerToSyncRow(c: {
   address: string | null
   gstin: string | null
   isActive: boolean
-}): CustomerSyncRow {
+  creditLimit?: unknown
+  creditDays?: number
+}, outstanding = 0): CustomerSyncRow {
   return {
     id: c.id,
     name: c.name,
@@ -138,7 +145,10 @@ export function customerToSyncRow(c: {
     email: c.email,
     address: c.address,
     gstin: c.gstin,
-    isActive: c.isActive
+    isActive: c.isActive,
+    creditLimit: Number(c.creditLimit ?? 0),
+    creditDays: Number(c.creditDays ?? 0),
+    outstanding
   }
 }
 
@@ -148,7 +158,14 @@ export async function emitCustomerUpsert(
 ): Promise<void> {
   const c = await tx.customer.findUnique({ where: { id: customerId } })
   if (!c) return
-  await recordSync(tx, 'customer', customerId, 'upsert', customerToSyncRow(c))
+  // Outstanding is derived from unsettled bills rather than stored, so it is
+  // summed here at the moment the event is written.
+  const agg = await tx.bill.aggregate({
+    where: { customerId, status: { in: ['PARTIAL', 'CREDIT'] } },
+    _sum: { balanceDue: true }
+  })
+  const outstanding = Math.round((Number(agg._sum.balanceDue ?? 0) + Number.EPSILON) * 100) / 100
+  await recordSync(tx, 'customer', customerId, 'upsert', customerToSyncRow(c, outstanding))
 }
 
 export async function emitBillUpsert(

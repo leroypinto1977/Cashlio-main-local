@@ -14,4 +14,5 @@ echo "▸ generating client"
 npx prisma generate >/dev/null
 echo "▸ backfilling data"
 node scripts/backfill-pass2.cjs
+node scripts/backfill-pass3.cjs
 echo "✓ database is up to date"

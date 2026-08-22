@@ -8,7 +8,7 @@ import { printReceipt, type ReceiptShop } from '../lib/receipt'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type BillStatus = 'PAID' | 'VOID' | 'RETURN'
+type BillStatus = 'PAID' | 'PARTIAL' | 'CREDIT' | 'VOID' | 'RETURN'
 
 type BillSummary = {
   id: string
@@ -17,6 +17,8 @@ type BillSummary = {
   paidAt: string
   paymentMethod: string
   totalAmount: number
+  paidAmount: number
+  balanceDue: number
   discountAmount: number
   customer: { name: string } | null
   cashier: { username: string }
@@ -32,6 +34,9 @@ type BillDetail = {
   paymentMethod: string
   subtotal: number
   gstAmount: number
+  paidAmount: number
+  balanceDue: number
+  dueDate: string | null
   discountAmount: number
   totalAmount: number
   amountReceived: number | null
@@ -61,10 +66,26 @@ type BillDetail = {
 }
 
 const STATUS_BADGE: Record<BillStatus, string> = {
-  PAID:   'bg-emerald-50 text-emerald-700 border border-emerald-200',
-  VOID:   'bg-red-50 text-red-600 border border-red-200',
-  RETURN: 'bg-amber-50 text-amber-700 border border-amber-200'
+  PAID:    'bg-emerald-50 text-emerald-700 border border-emerald-200',
+  PARTIAL: 'bg-sky-50 text-sky-700 border border-sky-200',
+  CREDIT:  'bg-orange-50 text-orange-700 border border-orange-200',
+  VOID:    'bg-red-50 text-red-600 border border-red-200',
+  RETURN:  'bg-amber-50 text-amber-700 border border-amber-200'
 }
+
+const STATUS_LABEL: Record<BillStatus | 'ALL', string> = {
+  ALL: 'All',
+  PAID: 'Paid',
+  PARTIAL: 'Part paid',
+  CREDIT: 'Credit',
+  RETURN: 'Return',
+  VOID: 'Void'
+}
+
+// A bill can be returned against while it still exists as a sale — that
+// now includes part-paid and credit bills, where the refund comes off
+// what is still owed.
+const RETURNABLE = ['PAID', 'PARTIAL', 'CREDIT']
 
 type Props = { token: string | null }
 
@@ -292,7 +313,7 @@ export function SalesScreen({ token }: Props) {
           />
         </div>
         <div className="flex rounded-lg border overflow-hidden text-sm">
-          {(['ALL', 'PAID', 'RETURN', 'VOID'] as const).map((s) => (
+          {(['ALL', 'PAID', 'PARTIAL', 'CREDIT', 'RETURN', 'VOID'] as const).map((s) => (
             <button
               key={s}
               type="button"
@@ -303,7 +324,7 @@ export function SalesScreen({ token }: Props) {
                   : 'bg-white text-zinc-600 hover:bg-zinc-50'
               }`}
             >
-              {s === 'ALL' ? 'All' : s === 'PAID' ? 'Paid' : s === 'RETURN' ? 'Return' : 'Void'}
+              {STATUS_LABEL[s]}
             </button>
           ))}
         </div>
@@ -370,6 +391,11 @@ export function SalesScreen({ token }: Props) {
                 </td>
                 <td className="px-4 py-3 text-right">
                   <p className="font-semibold text-zinc-900">₹{fmt(b.totalAmount)}</p>
+                  {b.balanceDue > 0 && (
+                    <p className="text-xs font-semibold text-orange-600 mt-0.5">
+                      ₹{fmt(b.balanceDue)} due
+                    </p>
+                  )}
                   {b.discountAmount > 0 && (
                     <p className="text-xs text-emerald-600 mt-0.5">−₹{fmt(b.discountAmount)} disc</p>
                   )}
@@ -473,7 +499,7 @@ export function SalesScreen({ token }: Props) {
                   <ExternalLink className="w-3 h-3" /> Original {detailBill.originalBill.billNumber}
                 </button>
               )}
-              {detailBill.status === 'PAID' && (() => {
+              {RETURNABLE.includes(detailBill.status) && (() => {
                 const totalReturned = detailBill.items.reduce((s, it) => s + (it.alreadyReturnedQty ?? 0), 0)
                 const totalQty = detailBill.items.reduce((s, it) => s + it.quantity, 0)
                 const fullyReturned = totalReturned >= totalQty
@@ -638,6 +664,24 @@ export function SalesScreen({ token }: Props) {
                         <span>Amount Received</span>
                         <span>₹{fmt(detailBill.amountReceived)}</span>
                       </div>
+                    )}
+                    {detailBill.balanceDue > 0 && (
+                      <>
+                        <div className="flex justify-between text-zinc-500 text-xs">
+                          <span>Paid so far</span>
+                          <span>₹{fmt(detailBill.paidAmount)}</span>
+                        </div>
+                        <div className="flex justify-between font-bold text-orange-600 text-sm pt-1 border-t">
+                          <span>Balance due</span>
+                          <span>₹{fmt(detailBill.balanceDue)}</span>
+                        </div>
+                        {detailBill.dueDate && (
+                          <div className="flex justify-between text-zinc-500 text-xs">
+                            <span>Payable by</span>
+                            <span>{new Date(detailBill.dueDate).toLocaleDateString('en-IN')}</span>
+                          </div>
+                        )}
+                      </>
                     )}
                     {detailBill.changeGiven != null && detailBill.changeGiven > 0 && (
                       <div className="flex justify-between text-zinc-500 text-xs">

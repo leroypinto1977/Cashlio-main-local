@@ -16,12 +16,14 @@ import {
   Receipt,
   BarChart3,
   TrendingUp,
+  Wallet
 } from 'lucide-react'
 import { Button } from './components/ui/button'
 import { Input } from './components/ui/input'
 import { ProductsScreen } from './screens/ProductsScreen'
 import { SuppliersScreen } from './screens/SuppliersScreen'
 import { CustomersScreen } from './screens/CustomersScreen'
+import { ReceivablesScreen } from './screens/ReceivablesScreen'
 import { BillingScreen } from './screens/BillingScreen'
 import { SalesScreen } from './screens/SalesScreen'
 import { AnalyticsScreen } from './screens/AnalyticsScreen'
@@ -554,6 +556,7 @@ function App(): React.JSX.Element {
               ['products',   <Package className="w-4 h-4" />,          'Products'],
               ['suppliers',  <Truck className="w-4 h-4" />,            'Suppliers'],
               ['customers',  <Users className="w-4 h-4" />,            'Customers'],
+              ['receivables', <Wallet className="w-4 h-4" />,           'Receivables'],
               ['devices',    <MonitorSmartphone className="w-4 h-4" />, 'Devices'],
               ['settings',   <Settings className="w-4 h-4" />,         'Settings'],
             ] as [string, React.ReactNode, string][]
@@ -587,6 +590,7 @@ function App(): React.JSX.Element {
         {activeTab === 'products' && <ProductsScreen token={authToken} />}
         {activeTab === 'suppliers' && <SuppliersScreen token={authToken} />}
         {activeTab === 'customers' && <CustomersScreen token={authToken} />}
+        {activeTab === 'receivables' && <ReceivablesScreen token={authToken} />}
 
         {/* Phase 3 billing screens */}
         {activeTab === 'billing' && (

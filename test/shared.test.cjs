@@ -3,6 +3,7 @@
 const { computeInvoiceTotals, splitGst, apportionDiscount, round2 } = require('../.test-build/money.js')
 const V = require('../.test-build/validation.js')
 const U = require('../.test-build/units.js')
+const C = require('../.test-build/credit.js')
 
 let pass = 0, fail = 0
 function check(name, cond, detail) {
@@ -146,6 +147,67 @@ for (const [rate, pct] of [[250, 12], [99.99, 5], [1234.56, 28], [7.5, 18]]) {
   const inc = U.computePurchaseCost(ex.rateInclGst, pct, true)
   check(`round-trip ex->incl->ex @${pct}%`, Math.abs(inc.rateExGst - ex.rateExGst) <= 0.01, { ex, inc })
 }
+
+
+console.log('— Settlement —')
+let st = C.settle(1000, [{ method: 'CASH', amount: 1000 }])
+check('exact cash is PAID', st.status === 'PAID' && st.balanceDue === 0 && st.changeGiven === 0)
+st = C.settle(1000, [{ method: 'CASH', amount: 1200 }])
+eq('cash overpay gives change', st.changeGiven, 200)
+eq('paid caps at total', st.paidAmount, 1000)
+eq('no balance', st.balanceDue, 0)
+st = C.settle(1000, [{ method: 'CARD', amount: 1200 }])
+eq('card overpay gives no change', st.changeGiven, 0)
+st = C.settle(3500, [{ method: 'UPI', amount: 2000 }])
+check('part payment is PARTIAL', st.status === 'PARTIAL')
+eq('balance carried', st.balanceDue, 1500)
+eq('paid recorded', st.paidAmount, 2000)
+st = C.settle(3500, [])
+check('no tender is CREDIT', st.status === 'CREDIT')
+eq('whole amount owed', st.balanceDue, 3500)
+st = C.settle(3500, [{ method: 'CASH', amount: 1000 }, { method: 'UPI', amount: 2500 }])
+check('split tender settles', st.status === 'PAID' && st.balanceDue === 0)
+eq('split total counted', st.paidAmount, 3500)
+check('statusFor PAID', C.statusFor(100, 100) === 'PAID')
+check('statusFor PARTIAL', C.statusFor(100, 40) === 'PARTIAL')
+check('statusFor CREDIT', C.statusFor(100, 0) === 'CREDIT')
+check('overpay still PAID', C.statusFor(100, 120) === 'PAID')
+// settlement must always balance
+for (let i = 0; i < 2000; i++) {
+  const total = C ? Math.round(((i * 97) % 500000)) / 100 : 0
+  const tendered = Math.round(((i * 53) % 600000)) / 100
+  const s2 = C.settle(total, tendered > 0 ? [{ method: i % 2 ? 'CASH' : 'CARD', amount: tendered }] : [])
+  check(`fuzz#${i} paid+balance == total`, Math.abs(s2.paidAmount + s2.balanceDue - Math.max(0, total)) < 0.005,
+    { total, tendered, s2 })
+}
+
+console.log('— Credit limits —')
+let cc = C.checkCredit({ hasCustomer: true, creditLimit: 10000, currentOutstanding: 0, newBalance: 1500 })
+check('within limit allowed', cc.allowed && !cc.needsOverride)
+cc = C.checkCredit({ hasCustomer: false, creditLimit: 0, currentOutstanding: 0, newBalance: 500 })
+check('walk-in refused', !cc.allowed && cc.reason === 'NO_CUSTOMER')
+check('walk-in cannot be overridden', !cc.needsOverride)
+cc = C.checkCredit({ hasCustomer: true, creditLimit: 0, currentOutstanding: 0, newBalance: 500 })
+check('no credit granted needs override', !cc.allowed && cc.needsOverride && cc.reason === 'NO_CREDIT_ALLOWED')
+cc = C.checkCredit({ hasCustomer: true, creditLimit: 1000, currentOutstanding: 800, newBalance: 500 })
+check('over limit needs override', !cc.allowed && cc.needsOverride && cc.reason === 'LIMIT_EXCEEDED')
+eq('over-by reported', cc.overBy, 300)
+eq('projected outstanding', cc.projectedOutstanding, 1300)
+cc = C.checkCredit({ hasCustomer: false, creditLimit: 0, currentOutstanding: 0, newBalance: 0 })
+check('fully paid never blocked', cc.allowed)
+cc = C.checkCredit({ hasCustomer: true, creditLimit: 1000, currentOutstanding: 1000, newBalance: 0 })
+check('at limit but paying in full is fine', cc.allowed)
+
+console.log('— Ageing —')
+const now = new Date('2026-08-22T12:00:00Z')
+check('inside credit period is current', C.ageBucketOf(new Date('2026-09-01'), new Date('2026-08-01'), now) === 'current')
+check('just overdue is 0-30', C.ageBucketOf(new Date('2026-08-20'), new Date('2026-07-20'), now) === '0-30')
+check('a month overdue is 31-60', C.ageBucketOf(new Date('2026-07-10'), new Date('2026-06-10'), now) === '31-60')
+check('long overdue is 60+', C.ageBucketOf(new Date('2026-05-01'), new Date('2026-04-01'), now) === '60+')
+check('no due date falls back to bill date', C.ageBucketOf(null, new Date('2026-08-10'), now) === '0-30')
+eq('daysBetween', C.daysBetween(new Date('2026-08-01'), new Date('2026-08-22')), 21)
+check('dueDateFor adds credit days', C.dueDateFor(new Date('2026-08-01'), 30).toISOString().startsWith('2026-08-31'))
+check('no credit days means no due date', C.dueDateFor(new Date('2026-08-01'), 0) === null)
 
 console.log(`\n${pass} passed, ${fail} failed\n`)
 process.exit(fail ? 1 : 0)

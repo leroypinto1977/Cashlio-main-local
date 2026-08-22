@@ -69,6 +69,11 @@ type ProductHit = {
   totalStock: number
 }
 
+// A bill can be returned against while it still exists as a sale — that
+// now includes part-paid and credit bills, where the refund comes off
+// what is still owed.
+const RETURNABLE = ['PAID', 'PARTIAL', 'CREDIT']
+
 type Props = {
   open: boolean
   billId: string | null
@@ -170,7 +175,7 @@ export function BillDetailViewer({ open, billId, token, shopInfo, onClose, onMut
                     <th className="text-right px-3 py-2 font-semibold text-zinc-500 text-xs">Qty</th>
                     <th className="text-right px-3 py-2 font-semibold text-zinc-500 text-xs">Rate</th>
                     <th className="text-right px-3 py-2 font-semibold text-zinc-500 text-xs">Total</th>
-                    {bill.status === 'PAID' && (
+                    {RETURNABLE.includes(bill.status) && (
                       <th className="text-right px-3 py-2 font-semibold text-zinc-500 text-xs">Actions</th>
                     )}
                   </tr>
@@ -193,7 +198,7 @@ export function BillDetailViewer({ open, billId, token, shopInfo, onClose, onMut
                         </td>
                         <td className="px-3 py-2.5 text-right font-mono text-xs text-zinc-600">₹{fmt(it.unitRate)}</td>
                         <td className="px-3 py-2.5 text-right font-mono font-semibold text-zinc-900">₹{fmt(it.lineTotal)}</td>
-                        {bill.status === 'PAID' && (
+                        {RETURNABLE.includes(bill.status) && (
                           <td className="px-3 py-2.5 text-right">
                             {fullyReturned ? (
                               <span className="text-xs text-zinc-400 italic">fully returned</span>
