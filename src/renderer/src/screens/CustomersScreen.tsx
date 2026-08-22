@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react'
+import React, { useState, useEffect, useCallback, useRef } from 'react'
 import {
   Users, Plus, Search, ChevronLeft, Edit2, RefreshCw,
   Phone, Mail, MapPin, Building2, Receipt, ChevronRight,
@@ -10,6 +10,10 @@ import { Modal } from '../components/Modal'
 import { apiFetch } from '../lib/api'
 import { BillDetailViewer } from '../components/BillDetailViewer'
 import type { ReceiptShop } from '../lib/receipt'
+import {
+  validateName, validateMobile, validateEmail, validateGstin,
+  formatPhone, normalizePhone, type FieldResult
+} from '@shared/validation'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -57,6 +61,37 @@ const fmt = (n: number) =>
 
 const PM_LABEL: Record<string, string> = { CASH: 'Cash', UPI: 'UPI', CARD: 'Card' }
 
+// ─── Validation ───────────────────────────────────────────────────────────────
+
+/** Fields we validate, in the order they appear in the form. */
+type ValidatedField = 'name' | 'phone' | 'email' | 'gstin'
+
+const FIELD_ORDER: ValidatedField[] = ['name', 'phone', 'email', 'gstin']
+
+const VALIDATORS: Record<ValidatedField, (v: string) => FieldResult> = {
+  name: (v) => validateName(v, 'Customer name'),
+  phone: (v) => validateMobile(v),
+  email: (v) => validateEmail(v),
+  gstin: (v) => validateGstin(v)
+}
+
+type FieldErrors = Partial<Record<ValidatedField, string>>
+
+/** Maps a server error code onto the field it belongs to, when that's obvious. */
+function fieldForCode(code: string | undefined): ValidatedField | null {
+  if (!code) return null
+  if (code.startsWith('PHONE_')) return 'phone'   // incl. PHONE_ALREADY_EXISTS
+  if (code.startsWith('GSTIN_')) return 'gstin'
+  if (code.startsWith('EMAIL_')) return 'email'
+  if (code.startsWith('NAME_')) return 'name'
+  return null
+}
+
+/** Fallbacks for server codes that predate the shared `message` field. */
+const CODE_FALLBACK: Record<string, string> = {
+  PHONE_ALREADY_EXISTS: 'A customer with this phone number already exists.'
+}
+
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export function CustomersScreen({ token }: Props) {
@@ -90,7 +125,9 @@ export function CustomersScreen({ token }: Props) {
   const [editingId, setEditingId] = useState<string | null>(null)
   const [form, setForm] = useState<CustomerForm>(emptyForm())
   const [formError, setFormError] = useState('')
+  const [fieldErrors, setFieldErrors] = useState<FieldErrors>({})
   const [saving, setSaving] = useState(false)
+  const fieldRefs = useRef<Partial<Record<ValidatedField, HTMLInputElement | null>>>({})
 
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
 
@@ -114,7 +151,10 @@ export function CustomersScreen({ token }: Props) {
         limit: String(PAGE_SIZE),
         offset: String((page - 1) * PAGE_SIZE)
       })
-      if (debouncedSearch.trim()) params.set('search', debouncedSearch.trim())
+      const q = debouncedSearch.trim()
+      // Phones are displayed grouped ("98765 43210"), so a pasted number has to
+      // be reduced back to bare digits before it will match server-side.
+      if (q) params.set('search', /^[+\d\s-]+$/.test(q) ? normalizePhone(q) : q)
       const data = await apiFetch<{ customers: Customer[]; total: number }>(
         `/api/v1/customers?${params}`,
         token
@@ -161,6 +201,7 @@ export function CustomersScreen({ token }: Props) {
     setEditingId(null)
     setForm(emptyForm())
     setFormError('')
+    setFieldErrors({})
     setShowModal(true)
   }
 
@@ -175,23 +216,70 @@ export function CustomersScreen({ token }: Props) {
       gstin: c.gstin ?? ''
     })
     setFormError('')
+    setFieldErrors({})
     setShowModal(true)
   }
 
+  // ─── Field-level validation ─────────────────────────────────────────────────
+
+  /** Typing never blocks, but a field already showing an error re-checks live. */
+  const setField = (key: keyof CustomerForm, value: string) => {
+    setForm((f) => ({ ...f, [key]: value }))
+    if (key === 'address') return
+    const field = key as ValidatedField
+    setFieldErrors((prev) => {
+      if (!prev[field]) return prev
+      const r = VALIDATORS[field](value)
+      if (!r.ok) return { ...prev, [field]: r.message }
+      const next = { ...prev }
+      delete next[field]
+      return next
+    })
+  }
+
+  const blurField = (field: ValidatedField) => {
+    const r = VALIDATORS[field](form[field])
+    setFieldErrors((prev) => {
+      const next = { ...prev }
+      if (r.ok) delete next[field]
+      else next[field] = r.message
+      return next
+    })
+  }
+
+  const focusField = (field: ValidatedField) => {
+    const el = fieldRefs.current[field]
+    el?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+    el?.focus()
+  }
+
   const handleSave = async () => {
-    if (!form.name.trim() || !form.phone.trim()) {
-      setFormError('Name and phone are required.')
+    // Re-validate everything on submit and jump to the first offending field.
+    const errors: FieldErrors = {}
+    const values = {} as Record<ValidatedField, string>
+    for (const field of FIELD_ORDER) {
+      const r = VALIDATORS[field](form[field])
+      if (r.ok) values[field] = r.value
+      else errors[field] = r.message
+    }
+    setFieldErrors(errors)
+    const firstBad = FIELD_ORDER.find((f) => errors[f])
+    if (firstBad) {
+      setFormError('')
+      focusField(firstBad)
       return
     }
+
     setSaving(true)
     setFormError('')
     try {
+      // Send the normalized values, not the raw input.
       const body = {
-        name: form.name.trim(),
-        phone: form.phone.trim(),
-        email: form.email.trim() || null,
+        name: values.name,
+        phone: values.phone,
+        email: values.email || null,
         address: form.address.trim() || null,
-        gstin: form.gstin.trim() || null
+        gstin: values.gstin || null
       }
       if (editingId) {
         await apiFetch(`/api/v1/customers/${editingId}`, token, {
@@ -211,11 +299,16 @@ export function CustomersScreen({ token }: Props) {
       setShowModal(false)
       fetchCustomers()
     } catch (err: unknown) {
-      const e = err as { data?: { error?: string } }
-      if (e.data?.error === 'PHONE_ALREADY_EXISTS') {
-        setFormError('A customer with this phone number already exists.')
+      const e = err as { data?: { error?: string; message?: string } }
+      const code = e.data?.error
+      const message = e.data?.message || (code ? CODE_FALLBACK[code] : '')
+      const field = fieldForCode(code)
+      if (field && message) {
+        setFieldErrors((prev) => ({ ...prev, [field]: message }))
+        setFormError('')
+        focusField(field)
       } else {
-        setFormError('Failed to save customer.')
+        setFormError(message || 'Failed to save customer.')
       }
     } finally {
       setSaving(false)
@@ -271,7 +364,7 @@ export function CustomersScreen({ token }: Props) {
             </div>
             <div>
               <h2 className="text-2xl font-bold text-zinc-900">{c.name}</h2>
-              <p className="text-sm text-zinc-500 font-mono mt-0.5">{c.phone}</p>
+              <p className="text-sm text-zinc-500 font-mono mt-0.5">{formatPhone(c.phone)}</p>
               {!c.isActive && (
                 <span className="inline-flex items-center gap-1 text-xs font-semibold text-red-600 bg-red-50 border border-red-200 px-2 py-0.5 rounded-full mt-1">
                   <UserX className="w-3 h-3" /> Inactive
@@ -297,7 +390,7 @@ export function CustomersScreen({ token }: Props) {
         {/* Info grid */}
         <div className="grid grid-cols-2 gap-4">
           {[
-            { icon: <Phone className="w-4 h-4" />, label: 'Phone', value: c.phone },
+            { icon: <Phone className="w-4 h-4" />, label: 'Phone', value: formatPhone(c.phone) },
             { icon: <Mail className="w-4 h-4" />, label: 'Email', value: c.email || '—' },
             { icon: <MapPin className="w-4 h-4" />, label: 'Address', value: c.address || '—' },
             { icon: <Building2 className="w-4 h-4" />, label: 'GSTIN', value: c.gstin || '—' },
@@ -378,10 +471,13 @@ export function CustomersScreen({ token }: Props) {
           editingId={editingId}
           form={form}
           formError={formError}
+          fieldErrors={fieldErrors}
+          fieldRefs={fieldRefs}
           saving={saving}
           onClose={() => setShowModal(false)}
           onSave={handleSave}
-          setForm={setForm}
+          onFieldChange={setField}
+          onBlurField={blurField}
         />
 
         {/* Bill drill-down: items + per-line refund / replace */}
@@ -491,7 +587,7 @@ export function CustomersScreen({ token }: Props) {
                     <span className="font-semibold text-zinc-900">{c.name}</span>
                   </div>
                 </td>
-                <td className="px-4 py-3 font-mono text-zinc-600 text-xs">{c.phone}</td>
+                <td className="px-4 py-3 font-mono text-zinc-600 text-xs">{formatPhone(c.phone)}</td>
                 <td className="px-4 py-3 text-zinc-500 text-xs">{c.email || <span className="text-zinc-300">—</span>}</td>
                 <td className="px-4 py-3 text-zinc-500 font-mono text-xs">{c.gstin || <span className="text-zinc-300">—</span>}</td>
                 <td className="px-4 py-3 text-center">
@@ -559,10 +655,13 @@ export function CustomersScreen({ token }: Props) {
         editingId={editingId}
         form={form}
         formError={formError}
+        fieldErrors={fieldErrors}
+        fieldRefs={fieldRefs}
         saving={saving}
         onClose={() => setShowModal(false)}
         onSave={handleSave}
-        setForm={setForm}
+        onFieldChange={setField}
+        onBlurField={blurField}
       />
     </div>
   )
@@ -571,19 +670,29 @@ export function CustomersScreen({ token }: Props) {
 // ─── CustomerFormModal ────────────────────────────────────────────────────────
 
 function CustomerFormModal({
-  open, editingId, form, formError, saving, onClose, onSave, setForm
+  open, editingId, form, formError, fieldErrors, fieldRefs, saving,
+  onClose, onSave, onFieldChange, onBlurField
 }: {
   open: boolean
   editingId: string | null
   form: CustomerForm
   formError: string
+  fieldErrors: FieldErrors
+  fieldRefs: React.MutableRefObject<Partial<Record<ValidatedField, HTMLInputElement | null>>>
   saving: boolean
   onClose: () => void
   onSave: () => void
-  setForm: React.Dispatch<React.SetStateAction<CustomerForm>>
+  onFieldChange: (field: keyof CustomerForm, value: string) => void
+  onBlurField: (field: ValidatedField) => void
 }) {
   const set = (field: keyof CustomerForm) => (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) =>
-    setForm((f) => ({ ...f, [field]: e.target.value }))
+    onFieldChange(field, e.target.value)
+
+  const hasErrors = Object.keys(fieldErrors).length > 0
+  const errorClass = (field: ValidatedField) =>
+    fieldErrors[field] ? ' border-red-300 focus-visible:ring-red-400' : ''
+  const FieldError = ({ field }: { field: ValidatedField }) =>
+    fieldErrors[field] ? <p className="mt-1 text-xs text-red-600">{fieldErrors[field]}</p> : null
 
   return (
     <Modal open={open} onClose={onClose} title={editingId ? 'Edit Customer' : 'Add Customer'} size="sm">
@@ -594,19 +703,53 @@ function CustomerFormModal({
         <div className="grid grid-cols-2 gap-3">
           <div className="col-span-2">
             <label className="block text-xs font-semibold mb-1">Name *</label>
-            <Input value={form.name} onChange={set('name')} placeholder="Customer name" className="h-9" autoFocus />
+            <Input
+              ref={(el) => { fieldRefs.current.name = el }}
+              value={form.name}
+              onChange={set('name')}
+              onBlur={() => onBlurField('name')}
+              placeholder="Customer name"
+              className={`h-9${errorClass('name')}`}
+              autoFocus
+            />
+            <FieldError field="name" />
           </div>
           <div className="col-span-2">
             <label className="block text-xs font-semibold mb-1">Phone *</label>
-            <Input value={form.phone} onChange={set('phone')} placeholder="+91 XXXXX XXXXX" className="h-9 font-mono" />
+            <Input
+              ref={(el) => { fieldRefs.current.phone = el }}
+              value={form.phone}
+              onChange={set('phone')}
+              onBlur={() => onBlurField('phone')}
+              placeholder="98765 43210"
+              className={`h-9 font-mono${errorClass('phone')}`}
+            />
+            <FieldError field="phone" />
           </div>
           <div>
             <label className="block text-xs font-semibold mb-1">Email</label>
-            <Input value={form.email} onChange={set('email')} placeholder="email@example.com" className="h-9" type="email" />
+            <Input
+              ref={(el) => { fieldRefs.current.email = el }}
+              value={form.email}
+              onChange={set('email')}
+              onBlur={() => onBlurField('email')}
+              placeholder="email@example.com"
+              className={`h-9${errorClass('email')}`}
+              type="email"
+            />
+            <FieldError field="email" />
           </div>
           <div>
             <label className="block text-xs font-semibold mb-1">GSTIN</label>
-            <Input value={form.gstin} onChange={set('gstin')} placeholder="22AAAAA0000A1Z5" className="h-9 font-mono uppercase" />
+            <Input
+              ref={(el) => { fieldRefs.current.gstin = el }}
+              value={form.gstin}
+              onChange={(e) => onFieldChange('gstin', e.target.value.toUpperCase())}
+              onBlur={() => onBlurField('gstin')}
+              placeholder="27ABCDE1234F1Z0"
+              className={`h-9 font-mono uppercase${errorClass('gstin')}`}
+            />
+            <FieldError field="gstin" />
           </div>
           <div className="col-span-2">
             <label className="block text-xs font-semibold mb-1">Address</label>
@@ -615,7 +758,7 @@ function CustomerFormModal({
         </div>
         <div className="flex gap-3 justify-end pt-1">
           <Button variant="outline" onClick={onClose} disabled={saving}>Cancel</Button>
-          <Button onClick={onSave} disabled={saving}>
+          <Button onClick={onSave} disabled={saving || hasErrors}>
             {saving ? (
               <span className="flex items-center gap-2">
                 <div className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />

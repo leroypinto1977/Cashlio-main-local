@@ -18,6 +18,12 @@ export type ReceiptItem = {
   unitRate: number
   lineTotal: number
   gstPercentage?: number
+  /** Tax-invoice fields. Absent on bills written before these were stored. */
+  taxableValue?: number
+  cgstAmount?: number
+  sgstAmount?: number
+  igstAmount?: number
+  billDiscountAmt?: number
 }
 
 export type ReceiptBill = {
@@ -28,6 +34,11 @@ export type ReceiptBill = {
   gstAmount?: number
   discountAmount?: number
   totalAmount: number
+  taxableValue?: number
+  cgstAmount?: number
+  sgstAmount?: number
+  igstAmount?: number
+  placeOfSupply?: string | null
   amountReceived?: number | null
   changeGiven?: number | null
   customerName?: string | null
@@ -67,6 +78,60 @@ export function buildReceiptHtml(
   const subtotal = bill.subtotal ?? bill.items.reduce((s, it) => s + it.lineTotal, 0)
   const gstAmount = bill.gstAmount ?? 0
   const discountAmount = bill.discountAmount ?? 0
+  const igstAmount = bill.igstAmount ?? 0
+  const interState = igstAmount > 0
+  // Older bills predate the stored breakdown; derive what we can so a reprint
+  // of an old receipt still balances instead of showing blanks.
+  const taxableValue = bill.taxableValue ?? Math.max(0, bill.totalAmount - gstAmount)
+  const cgstAmount = bill.cgstAmount ?? (interState ? 0 : gstAmount / 2)
+  const sgstAmount = bill.sgstAmount ?? (interState ? 0 : gstAmount - gstAmount / 2)
+
+  // Rate-wise summary. A GST invoice has to show tax grouped by rate, and it
+  // also makes a multi-rate basket readable at the counter.
+  const byRate = new Map<number, { taxable: number; cgst: number; sgst: number; igst: number }>()
+  for (const it of bill.items) {
+    const rate = Number(it.gstPercentage ?? 0)
+    const net = (it.lineTotal ?? 0) - (it.billDiscountAmt ?? 0)
+    const lineTaxable = it.taxableValue ?? net / (1 + rate / 100)
+    const lineGst = net - lineTaxable
+    const entry = byRate.get(rate) ?? { taxable: 0, cgst: 0, sgst: 0, igst: 0 }
+    entry.taxable += lineTaxable
+    if (interState) {
+      entry.igst += it.igstAmount ?? lineGst
+    } else {
+      entry.cgst += it.cgstAmount ?? lineGst / 2
+      entry.sgst += it.sgstAmount ?? lineGst - lineGst / 2
+    }
+    byRate.set(rate, entry)
+  }
+  const taxedRates = [...byRate.entries()].filter(([rate]) => rate > 0).sort((a, b) => a[0] - b[0])
+  const gstSummaryHtml =
+    gstAmount > 0 && taxedRates.length > 0
+      ? `<hr/>
+  <div class="sm bold">GST SUMMARY</div>
+  <table class="gst sm">
+    <thead>
+      <tr><td>Rate</td><td class="tot">Taxable</td>${
+        interState ? '<td class="tot">IGST</td>' : '<td class="tot">CGST</td><td class="tot">SGST</td>'
+      }</tr>
+    </thead>
+    <tbody>
+      ${taxedRates
+        .map(
+          ([rate, v]) =>
+            `<tr><td>${esc(rate)}%</td><td class="tot">${fmt(v.taxable)}</td>${
+              interState
+                ? `<td class="tot">${fmt(v.igst)}</td>`
+                : `<td class="tot">${fmt(v.cgst)}</td><td class="tot">${fmt(v.sgst)}</td>`
+            }</tr>`
+        )
+        .join('')}
+    </tbody>
+  </table>`
+      : ''
+
+  // "Tax invoice" is only an accurate label when the shop is GST-registered.
+  const docTitle = shop.gstin ? 'TAX INVOICE' : 'RECEIPT'
 
   const itemsHtml = bill.items
     .map((it) => {
@@ -128,6 +193,9 @@ export function buildReceiptHtml(
   .banner.void { color: #b00; border-color: #b00; }
   .banner.ret  { color: #964; border-color: #964; }
   .footer { text-align: center; font-size: 9.5px; margin-top: 8px; }
+  .doctype { letter-spacing: 2px; font-weight: 700; margin-top: 2px; }
+  table.gst td { padding: 1px 0; }
+  table.gst thead td { border-bottom: 1px dashed #000; font-weight: 600; }
   @media print { body { width: auto; padding: 2mm; } }
 </style>
 </head>
@@ -137,6 +205,7 @@ export function buildReceiptHtml(
   ${shop.address ? `<div class="center sm">${esc(shop.address)}</div>` : ''}
   ${shop.phone ? `<div class="center sm">Tel: ${esc(shop.phone)}</div>` : ''}
   ${shop.gstin ? `<div class="center sm">GSTIN: ${esc(shop.gstin)}</div>` : ''}
+  <div class="center sm doctype">${docTitle}</div>
   ${banner}
   <hr/>
   <div class="row sm"><span class="lbl">Bill</span><span class="bold">${esc(bill.billNumber)}</span></div>
@@ -150,13 +219,22 @@ export function buildReceiptHtml(
     </tbody>
   </table>
   <hr/>
-  <div class="row"><span class="lbl">Subtotal</span><span>₹${fmt(subtotal)}</span></div>
-  ${gstAmount > 0 ? `<div class="row sm"><span class="lbl">incl. GST</span><span>₹${fmt(gstAmount)}</span></div>` : ''}
+  <div class="row"><span class="lbl">Items total</span><span>₹${fmt(subtotal)}</span></div>
   ${discountAmount > 0 ? `<div class="row"><span class="lbl">Discount</span><span>−₹${fmt(discountAmount)}</span></div>` : ''}
+  <div class="row"><span class="lbl">Taxable value</span><span>₹${fmt(taxableValue)}</span></div>
+  ${
+    interState
+      ? `<div class="row sm"><span class="lbl">IGST</span><span>₹${fmt(igstAmount)}</span></div>`
+      : gstAmount > 0
+        ? `<div class="row sm"><span class="lbl">CGST</span><span>₹${fmt(cgstAmount)}</span></div>
+  <div class="row sm"><span class="lbl">SGST</span><span>₹${fmt(sgstAmount)}</span></div>`
+        : ''
+  }
   <div class="row grand"><span>TOTAL</span><span>₹${fmt(bill.totalAmount)}</span></div>
   <div class="row sm"><span class="lbl">Payment</span><span>${esc(bill.paymentMethod)}</span></div>
   ${bill.amountReceived != null ? `<div class="row sm"><span class="lbl">Received</span><span>₹${fmt(bill.amountReceived)}</span></div>` : ''}
-  ${bill.changeGiven != null && bill.changeGiven > 0 ? `<div class="row sm"><span class="lbl">Change</span><span>₹${fmt(bill.changeGiven)}</span></div>` : ''}
+  ${bill.changeGiven != null && bill.changeGiven > 0 ? `<div class="row sm"><span class="lbl">Change returned</span><span>₹${fmt(bill.changeGiven)}</span></div>` : ''}
+  ${gstSummaryHtml}
   <hr/>
   <div class="footer">Thank you for shopping with us!</div>
   ${autoPrintScript}

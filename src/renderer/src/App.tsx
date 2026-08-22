@@ -26,6 +26,7 @@ import { BillingScreen } from './screens/BillingScreen'
 import { SalesScreen } from './screens/SalesScreen'
 import { AnalyticsScreen } from './screens/AnalyticsScreen'
 import { BackupSettings } from './components/BackupSettings'
+import { ShopProfileSettings } from './components/ShopProfileSettings'
 import axios from 'axios'
 
 // Always fall back to the known local port so requests never go to "undefined/..."
@@ -85,8 +86,6 @@ function App(): React.JSX.Element {
   const [stats, setStats] = useState<Stats | null>(null)
   const [statsLoading, setStatsLoading] = useState(false)
 
-  type ShopInfo = { shopName: string; branchName: string }
-  const [shopInfo, setShopInfo] = useState<ShopInfo | null>(null)
 
   // ─── Splash: check setup status, then route ───────────────────────────────
   React.useEffect(() => {
@@ -148,15 +147,49 @@ function App(): React.JSX.Element {
         adminUsername: shopData.adminUsername,
         adminPassword: shopData.adminPassword
       })
-      setStep(4) // First-time setup complete → go directly to Dashboard
+      // Sign the freshly-created admin in straight away. Previously this
+      // jumped to the dashboard with authToken still null, so every panel
+      // failed to load until the user signed out and back in.
+      try {
+        const loginRes = await axios.post(`${LOCAL_API}/api/v1/auth/login`, {
+          username: shopData.adminUsername,
+          password: shopData.adminPassword
+        })
+        await establishSession(loginRes.data.token)
+        setStep(4)
+      } catch {
+        // Account exists but auto sign-in failed — send them to the login form
+        // rather than a dashboard that cannot load anything.
+        setStep(3)
+        setErrorMsg('Setup complete. Please sign in.')
+      }
     } catch (err: unknown) {
       if (axios.isAxiosError(err)) {
-        setErrorMsg(err.response?.data?.error || err.message || 'Profile Setup Failed')
+        setErrorMsg(err.response?.data?.message || err.response?.data?.error || err.message || 'Profile Setup Failed')
       } else {
         setErrorMsg('Profile Setup Failed')
       }
     } finally {
       setLoading(false)
+    }
+  }
+
+  /**
+   * Stores the session token and resolves this machine's device id. Used by
+   * both the login screen and the end of first-run setup — without it the
+   * dashboard renders with no token and every request 401s silently, which
+   * looks exactly like "the data isn't updating".
+   */
+  const establishSession = async (token: string): Promise<void> => {
+    setAuthToken(token)
+    localStorage.setItem('managerToken', token)
+    try {
+      const devRes = await axios.get(`${LOCAL_API}/api/v1/system/self-device-id`, {
+        headers: { Authorization: `Bearer ${token}` }
+      })
+      setDeviceId(devRes.data.deviceId)
+    } catch {
+      // non-fatal — billing will show an error if attempted without deviceId
     }
   }
 
@@ -170,18 +203,7 @@ function App(): React.JSX.Element {
         username: loginData.username,
         password: loginData.password
       })
-      const token: string = res.data.token
-      setAuthToken(token)
-      localStorage.setItem('managerToken', token)
-      // Fetch / auto-create manager device ID
-      try {
-        const devRes = await axios.get(`${LOCAL_API}/api/v1/system/self-device-id`, {
-          headers: { Authorization: `Bearer ${token}` }
-        })
-        setDeviceId(devRes.data.deviceId)
-      } catch {
-        // non-fatal — billing will show error if attempted without deviceId
-      }
+      await establishSession(res.data.token)
       setStep(4)
     } catch (err: unknown) {
       if (axios.isAxiosError(err)) {
@@ -230,19 +252,6 @@ function App(): React.JSX.Element {
       .catch(() => setStats(null))
       .finally(() => setStatsLoading(false))
   }, [activeTab, step, authToken])
-
-  // ─── Shop info: fetch when settings tab is active ─────────────────────────
-  React.useEffect(() => {
-    if (activeTab !== 'settings' || step !== 4) return
-    axios
-      .get(`${LOCAL_API}/api/v1/system/status`)
-      .then((res) => {
-        if (res.data.shopName) {
-          setShopInfo({ shopName: res.data.shopName, branchName: res.data.branchName })
-        }
-      })
-      .catch(() => {})
-  }, [activeTab, step])
 
   // ─── Step 0: Splash ───────────────────────────────────────────────────────
   if (step === 0) {
@@ -714,13 +723,8 @@ function App(): React.JSX.Element {
               <p className="text-muted-foreground mt-1 text-sm">Branch configuration and system information.</p>
             </header>
             <div className="grid grid-cols-2 gap-5 max-w-2xl">
-              <div className="p-5 rounded-xl border bg-card space-y-1">
-                <p className="text-xs font-semibold text-zinc-500 uppercase tracking-wide">Shop Name</p>
-                <p className="text-lg font-bold text-zinc-900">{shopInfo?.shopName ?? '—'}</p>
-              </div>
-              <div className="p-5 rounded-xl border bg-card space-y-1">
-                <p className="text-xs font-semibold text-zinc-500 uppercase tracking-wide">Branch Name</p>
-                <p className="text-lg font-bold text-zinc-900">{shopInfo?.branchName ?? '—'}</p>
+              <div className="col-span-2">
+                <ShopProfileSettings token={authToken} />
               </div>
               <div className="p-5 rounded-xl border bg-card space-y-1 col-span-2">
                 <p className="text-xs font-semibold text-zinc-500 uppercase tracking-wide">Server Address</p>

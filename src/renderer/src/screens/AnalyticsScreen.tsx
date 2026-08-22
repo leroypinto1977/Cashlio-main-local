@@ -62,6 +62,7 @@ export function AnalyticsScreen({ token }: { token: string | null }): React.JSX.
   const [summary, setSummary] = useState<AnalyticsSummary | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
 
   const fetchSummary = useCallback(
     async (p: Period) => {
@@ -73,8 +74,9 @@ export function AnalyticsScreen({ token }: { token: string | null }): React.JSX.
           headers: { Authorization: `Bearer ${token}` },
         })
         setSummary(res.data.summary)
+        setLastUpdated(new Date())
       } catch {
-        setError('Failed to load analytics data.')
+        setError('Could not reach the local server. Check that it is running, then refresh.')
       } finally {
         setLoading(false)
       }
@@ -110,6 +112,13 @@ export function AnalyticsScreen({ token }: { token: string | null }): React.JSX.
           <p className="text-muted-foreground mt-1 text-sm">
             Sales performance, revenue, discounts &amp; margins.
           </p>
+          {/* Figures are a snapshot, not live — say when they were taken so a
+              stale panel is never mistaken for "the sale didn't register". */}
+          <p className="text-xs text-zinc-400 mt-1">
+            {lastUpdated
+              ? `Updated ${lastUpdated.toLocaleTimeString('en-IN', { hour12: true })}`
+              : 'Not loaded yet'}
+          </p>
         </div>
         <button
           type="button"
@@ -118,7 +127,7 @@ export function AnalyticsScreen({ token }: { token: string | null }): React.JSX.
           className="flex items-center gap-2 px-4 py-2 rounded-lg border text-sm font-medium text-zinc-600 hover:bg-zinc-50 transition-colors disabled:opacity-50"
         >
           <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
-          Refresh
+          {loading ? 'Refreshing…' : 'Refresh'}
         </button>
       </div>
 
@@ -269,7 +278,7 @@ export function AnalyticsScreen({ token }: { token: string | null }): React.JSX.
                 </div>
               ) : (
                 <p className="text-sm text-zinc-400 italic">
-                  Add purchase batches with purchase rate to enable margin tracking.
+                  Add purchase batches with a purchase rate to enable margin tracking.
                 </p>
               )}
             </div>

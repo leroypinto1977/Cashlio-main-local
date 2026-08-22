@@ -5,6 +5,7 @@ import bcrypt from 'bcryptjs'
 import { PrismaClient } from '@prisma/client'
 import os from 'os'
 import {
+  recordSync,
   emitProductUpsert,
   emitProductUpsertBulk,
   emitCustomerUpsert,
@@ -27,6 +28,9 @@ declare global {
 
 const prisma = new PrismaClient()
 const app = express()
+
+type TxClient = Parameters<Parameters<typeof prisma.$transaction>[0]>[0]
+type DbClient = TxClient | typeof prisma
 
 app.use(cors())
 app.use(express.json())
@@ -130,7 +134,12 @@ app.get('/api/v1/system/status', async (_req, res) => {
     return res.status(200).json({
       setupDone: userCount > 0,
       shopName: config.shopName,
-      branchName: config.branchName
+      branchName: config.branchName,
+      // Terminals print these on every receipt, so they travel with status.
+      address: config.address,
+      phone: config.phone,
+      gstin: config.gstin,
+      stateCode: config.stateCode
     })
   } catch (err) {
     console.error('Error in /system/status:', err)
@@ -207,6 +216,33 @@ app.post('/api/v1/system/setup-profile', async (req, res) => {
       return res.status(400).json({ success: false, error: 'LICENSE_NOT_ACTIVATED' })
     }
 
+    // This route is unauthenticated because it runs before any account exists.
+    // Once one does, it must stop working — otherwise anyone on the LAN could
+    // call it and hand themselves a SUPER_ADMIN account.
+    const existingUsers = await prisma.user.count()
+    if (existingUsers > 0) {
+      return res.status(409).json({ success: false, error: 'SETUP_ALREADY_COMPLETED' })
+    }
+
+    const shopCheck = validateName(String(shopName ?? ''), 'Shop name')
+    if (!shopCheck.ok) return fieldError(res, shopCheck)
+    const branchCheck = validateName(String(branchName ?? ''), 'Branch name')
+    if (!branchCheck.ok) return fieldError(res, branchCheck)
+    if (!adminUsername || String(adminUsername).trim().length < 3) {
+      return res.status(400).json({
+        success: false, error: 'USERNAME_INVALID',
+        message: 'Username must be at least 3 characters.'
+      })
+    }
+    if (!adminPassword || String(adminPassword).length < 8) {
+      return res.status(400).json({
+        success: false, error: 'PASSWORD_TOO_SHORT',
+        message: 'Password must be at least 8 characters.'
+      })
+    }
+    const gstCheck = validateGstin(String(gst ?? ''))
+    if (!gstCheck.ok) return fieldError(res, gstCheck)
+
     try {
       await fetch(`${process.env.SAAS_API_URL}/api/v1/licenses/update-profile`, {
         method: 'POST',
@@ -219,12 +255,18 @@ app.post('/api/v1/system/setup-profile', async (req, res) => {
 
     await prisma.shopConfig.update({
       where: { id: config.id },
-      data: { shopName, branchName }
+      data: {
+        shopName: shopCheck.value,
+        branchName: branchCheck.value,
+        address: location ? String(location).trim() : null,
+        gstin: gstCheck.value || null,
+        stateCode: stateCodeOf(gstCheck.value)
+      }
     })
 
-    const passwordHash = await bcrypt.hash(adminPassword, 10)
+    const passwordHash = await bcrypt.hash(String(adminPassword), 10)
     await prisma.user.create({
-      data: { username: adminUsername, passwordHash, role: 'SUPER_ADMIN' }
+      data: { username: String(adminUsername).trim(), passwordHash, role: 'SUPER_ADMIN' }
     })
 
     return res.status(200).json({ success: true })
@@ -500,11 +542,27 @@ app.get('/api/v1/suppliers/:id', requireAuth(), async (req, res) => {
 app.post('/api/v1/suppliers', requireAuth(['SUPER_ADMIN']), async (req, res) => {
   try {
     const { name, contactPerson, phone, email, address, gstin } = req.body
-    if (!name || !phone) {
-      return res.status(400).json({ success: false, error: 'NAME_AND_PHONE_REQUIRED' })
-    }
+
+    const nameCheck = validateName(String(name ?? ''), 'Supplier name')
+    if (!nameCheck.ok) return fieldError(res, nameCheck)
+    const phoneCheck = validateContactNumber(String(phone ?? ''))
+    if (!phoneCheck.ok) return fieldError(res, phoneCheck)
+    const emailCheck = validateEmail(String(email ?? ''))
+    if (!emailCheck.ok) return fieldError(res, emailCheck)
+    const gstCheck = validateGstin(String(gstin ?? ''))
+    if (!gstCheck.ok) return fieldError(res, gstCheck)
+    const contactCheck = validateName(String(contactPerson ?? ''), 'Contact person', { required: false })
+    if (!contactCheck.ok) return fieldError(res, contactCheck)
+
     const supplier = await prisma.supplier.create({
-      data: { name, contactPerson, phone, email, address, gstin }
+      data: {
+        name: nameCheck.value,
+        contactPerson: contactCheck.value || null,
+        phone: phoneCheck.value,
+        email: emailCheck.value || null,
+        address: address ? String(address).trim() : null,
+        gstin: gstCheck.value || null
+      }
     })
     return res.status(201).json({ success: true, supplier })
   } catch (err) {
@@ -516,9 +574,39 @@ app.post('/api/v1/suppliers', requireAuth(['SUPER_ADMIN']), async (req, res) => 
 app.put('/api/v1/suppliers/:id', requireAuth(['SUPER_ADMIN']), async (req, res) => {
   try {
     const { name, contactPerson, phone, email, address, gstin, isActive } = req.body
+
+    const data: Record<string, unknown> = {}
+    if (name !== undefined) {
+      const c = validateName(String(name), 'Supplier name')
+      if (!c.ok) return fieldError(res, c)
+      data.name = c.value
+    }
+    if (contactPerson !== undefined) {
+      const c = validateName(String(contactPerson ?? ''), 'Contact person', { required: false })
+      if (!c.ok) return fieldError(res, c)
+      data.contactPerson = c.value || null
+    }
+    if (phone !== undefined) {
+      const c = validateContactNumber(String(phone))
+      if (!c.ok) return fieldError(res, c)
+      data.phone = c.value
+    }
+    if (email !== undefined) {
+      const c = validateEmail(String(email ?? ''))
+      if (!c.ok) return fieldError(res, c)
+      data.email = c.value || null
+    }
+    if (gstin !== undefined) {
+      const c = validateGstin(String(gstin ?? ''))
+      if (!c.ok) return fieldError(res, c)
+      data.gstin = c.value || null
+    }
+    if (address !== undefined) data.address = address ? String(address).trim() : null
+    if (isActive !== undefined) data.isActive = isActive
+
     const supplier = await prisma.supplier.update({
       where: { id: String(req.params.id) },
-      data: { name, contactPerson, phone, email, address, gstin, isActive }
+      data
     })
     return res.json({ success: true, supplier })
   } catch (err: unknown) {
@@ -721,13 +809,41 @@ app.put('/api/v1/products/:id', requireAuth(['SUPER_ADMIN']), async (req, res) =
 app.delete('/api/v1/products/:id', requireAuth(['SUPER_ADMIN']), async (req, res) => {
   try {
     const id = String(req.params.id)
+    const hard = req.query.hard === '1' || req.query.hard === 'true'
+
+    if (hard) {
+      // A product that never carried stock and never sold has no history worth
+      // keeping, so it can genuinely be removed — a mis-typed entry shouldn't
+      // sit in the list forever. Anything else stays soft-deleted.
+      const [batchCount, billItemCount] = await Promise.all([
+        prisma.productBatch.count({ where: { productId: id } }),
+        prisma.billItem.count({ where: { productId: id } })
+      ])
+      if (batchCount > 0 || billItemCount > 0) {
+        return res.status(409).json({
+          success: false,
+          error: 'PRODUCT_IN_USE',
+          message:
+            'This product has stock or sales history. It can be deactivated, but not deleted.',
+          batchCount,
+          billItemCount
+        })
+      }
+      await prisma.$transaction(async (tx) => {
+        await tx.productSupplier.deleteMany({ where: { productId: id } })
+        await tx.product.delete({ where: { id } })
+        await recordSync(tx, 'product', id, 'delete', null)
+      })
+      return res.json({ success: true, deleted: 'permanent' })
+    }
+
     // Soft delete — terminals see this as an upsert with isActive=false rather
     // than a true delete event so historical bills still resolve product names.
     await prisma.$transaction(async (tx) => {
       await tx.product.update({ where: { id }, data: { isActive: false } })
       await emitProductUpsert(tx, id)
     })
-    return res.json({ success: true })
+    return res.json({ success: true, deleted: 'deactivated' })
   } catch (err: unknown) {
     if ((err as { code?: string }).code === 'P2025') {
       return res.status(404).json({ success: false, error: 'NOT_FOUND' })
@@ -741,7 +857,7 @@ app.delete('/api/v1/products/:id', requireAuth(['SUPER_ADMIN']), async (req, res
 
 app.get('/api/v1/system/next-batch-code', requireAuth(['SUPER_ADMIN']), async (_req, res) => {
   try {
-    const code = await nextBatchCode()
+    const code = await peekNumber('BT')
     return res.json({ success: true, batchCode: code })
   } catch (err) {
     console.error(err)
@@ -934,11 +1050,26 @@ app.get('/api/v1/customers/:id', requireAuth(), async (req, res) => {
 app.post('/api/v1/customers', requireAuth(), async (req, res) => {
   try {
     const { name, phone, email, address, gstin } = req.body
-    if (!name || !phone) {
-      return res.status(400).json({ success: false, error: 'NAME_AND_PHONE_REQUIRED' })
-    }
+
+    const nameCheck = validateName(String(name ?? ''), 'Customer name')
+    if (!nameCheck.ok) return fieldError(res, nameCheck)
+    const phoneCheck = validateMobile(String(phone ?? ''))
+    if (!phoneCheck.ok) return fieldError(res, phoneCheck)
+    const emailCheck = validateEmail(String(email ?? ''))
+    if (!emailCheck.ok) return fieldError(res, emailCheck)
+    const gstCheck = validateGstin(String(gstin ?? ''))
+    if (!gstCheck.ok) return fieldError(res, gstCheck)
+
     const customer = await prisma.$transaction(async (tx) => {
-      const created = await tx.customer.create({ data: { name, phone, email, address, gstin } })
+      const created = await tx.customer.create({
+        data: {
+          name: nameCheck.value,
+          phone: phoneCheck.value,
+          email: emailCheck.value || null,
+          address: address ? String(address).trim() : null,
+          gstin: gstCheck.value || null
+        }
+      })
       await emitCustomerUpsert(tx, created.id)
       return created
     })
@@ -957,11 +1088,27 @@ app.put('/api/v1/customers/:id', requireAuth(), async (req, res) => {
     const { name, phone, email, address, gstin, isActive } = req.body
     // Build data with only the fields that were explicitly sent
     const data: Record<string, unknown> = {}
-    if (name !== undefined) data.name = name
-    if (phone !== undefined) data.phone = phone
-    if (email !== undefined) data.email = email
-    if (address !== undefined) data.address = address
-    if (gstin !== undefined) data.gstin = gstin
+    if (name !== undefined) {
+      const c = validateName(String(name), 'Customer name')
+      if (!c.ok) return fieldError(res, c)
+      data.name = c.value
+    }
+    if (phone !== undefined) {
+      const c = validateMobile(String(phone))
+      if (!c.ok) return fieldError(res, c)
+      data.phone = c.value
+    }
+    if (email !== undefined) {
+      const c = validateEmail(String(email ?? ''))
+      if (!c.ok) return fieldError(res, c)
+      data.email = c.value || null
+    }
+    if (gstin !== undefined) {
+      const c = validateGstin(String(gstin ?? ''))
+      if (!c.ok) return fieldError(res, c)
+      data.gstin = c.value || null
+    }
+    if (address !== undefined) data.address = address ? String(address).trim() : null
     if (isActive !== undefined) data.isActive = isActive
     const customer = await prisma.$transaction(async (tx) => {
       const updated = await tx.customer.update({
@@ -983,22 +1130,11 @@ app.put('/api/v1/customers/:id', requireAuth(), async (req, res) => {
 
 // ─── Phase 3 — Bills ──────────────────────────────────────────────────────────
 
-async function nextBillNumber(): Promise<string> {
-  const now = new Date()
-  const yyyy = now.getFullYear()
-  const mm = String(now.getMonth() + 1).padStart(2, '0')
-  const startOfMonth = new Date(yyyy, now.getMonth(), 1)
-  const endOfMonth = new Date(yyyy, now.getMonth() + 1, 0, 23, 59, 59, 999)
-  const count = await prisma.bill.count({
-    where: { createdAt: { gte: startOfMonth, lte: endOfMonth } }
-  })
-  const seq = String(count + 1).padStart(3, '0')
-  return `B-${yyyy}-${mm}-${seq}`
-}
+
 
 app.get('/api/v1/system/next-bill-number', requireAuth(), async (_req, res) => {
   try {
-    return res.json({ success: true, billNumber: await nextBillNumber() })
+    return res.json({ success: true, billNumber: await peekNumber('INV') })
   } catch (err) {
     console.error(err)
     return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
@@ -1008,16 +1144,19 @@ app.get('/api/v1/system/next-bill-number', requireAuth(), async (_req, res) => {
 app.get('/api/v1/bills', requireAuth(), async (req, res) => {
   try {
     const { status, search, limit = '50', offset = '0' } = req.query
+    // One filter object for both the page and the count — they previously
+    // diverged, so paging through search results ran off the end.
+    const where = {
+      status: status ? String(status) : undefined,
+      OR: search
+        ? [
+            { billNumber: { contains: String(search), mode: 'insensitive' as const } },
+            { customer: { name: { contains: String(search), mode: 'insensitive' as const } } }
+          ]
+        : undefined
+    }
     const bills = await prisma.bill.findMany({
-      where: {
-        status: status ? String(status) : undefined,
-        OR: search
-          ? [
-              { billNumber: { contains: String(search), mode: 'insensitive' } },
-              { customer: { name: { contains: String(search), mode: 'insensitive' } } }
-            ]
-          : undefined
-      },
+      where,
       include: {
         customer: { select: { name: true, phone: true } },
         cashier: { select: { username: true } },
@@ -1028,22 +1167,8 @@ app.get('/api/v1/bills', requireAuth(), async (req, res) => {
       take: parseInt(String(limit)),
       skip: parseInt(String(offset))
     })
-    const total = await prisma.bill.count({
-      where: { status: status ? String(status) : undefined }
-    })
-    return res.json({
-      success: true,
-      bills: bills.map((b) => ({
-        ...b,
-        subtotal: Number(b.subtotal),
-        gstAmount: Number(b.gstAmount),
-        discountAmount: Number(b.discountAmount),
-        totalAmount: Number(b.totalAmount),
-        amountReceived: b.amountReceived ? Number(b.amountReceived) : null,
-        changeGiven: b.changeGiven ? Number(b.changeGiven) : null
-      })),
-      total
-    })
+    const total = await prisma.bill.count({ where })
+    return res.json({ success: true, bills: bills.map(serializeBill), total })
   } catch (err) {
     console.error(err)
     return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
@@ -1115,13 +1240,7 @@ app.get('/api/v1/bills/:id', requireAuth(), async (req, res) => {
           returnReason: r.returnReason
         })),
         items: bill.items.map((it) => ({
-          ...it,
-          unitRate: Number(it.unitRate),
-          gstPercentage: Number(it.gstPercentage),
-          lineDiscountPct: Number(it.lineDiscountPct),
-          lineDiscountAmt: Number(it.lineDiscountAmt),
-          lineGstAmount: Number(it.lineGstAmount),
-          lineTotal: Number(it.lineTotal),
+          ...serializeBillItem(it),
           purchaseRate: it.product.batches[0] ? Number(it.product.batches[0].purchaseRate) : null,
           alreadyReturnedQty: returnedByLineId.get(it.id) ?? 0
         }))
@@ -1218,21 +1337,36 @@ async function createBillCore(tx: TxClient, args: CreateBillArgs, billNumber: st
       gstPercentage: item.gstPercentage,
       lineDiscountPct: item.lineDiscountPct,
       lineDiscountAmt: item.lineDiscountAmt,
-      lineGstAmount,
-      lineTotal
+      // Tax is derived below, once the bill-level discount has been shared out.
+      lineGstAmount: 0,
+      lineTotal,
+      billDiscountAmt: 0,
+      taxableValue: 0,
+      cgstAmount: 0,
+      sgstAmount: 0,
+      igstAmount: 0
     })
   }
 
-  const subtotal = lines.reduce((s, it) => s + it.lineTotal, 0)
-  const gstAmount = lines.reduce((s, it) => s + it.lineGstAmount, 0)
-  const totalAmount = Math.max(0, subtotal - args.discountAmount)
+  const { interState, placeOfSupply } = await resolveTaxContext(tx, args.customerId)
+  const totals = computeInvoiceTotals(lines, args.discountAmount, interState)
+  lines.forEach((l, i) => {
+    const t = totals.lines[i]
+    l.billDiscountAmt = t.billDiscountAmt
+    l.lineGstAmount = t.gstAmount
+    l.taxableValue = t.taxableValue
+    l.cgstAmount = t.cgstAmount
+    l.sgstAmount = t.sgstAmount
+    l.igstAmount = t.igstAmount
+  })
+  const { subtotal, billDiscount, totalAmount, taxableValue, gstAmount, cgstAmount, sgstAmount, igstAmount } = totals
   const changeGiven = args.paymentMethod === 'CASH' && args.amountReceived != null
-    ? Math.max(0, args.amountReceived - totalAmount)
+    ? round2(Math.max(0, args.amountReceived - totalAmount))
     : null
 
   const created = await tx.bill.create({
     data: {
-      billNumber,
+      billNumber: invoiceNumber,
       clientLocalId: args.clientLocalId,
       status: 'PAID',
       customerId: args.customerId,
@@ -1240,8 +1374,13 @@ async function createBillCore(tx: TxClient, args: CreateBillArgs, billNumber: st
       cashierId: args.cashierId,
       subtotal,
       gstAmount,
-      discountAmount: args.discountAmount,
+      discountAmount: billDiscount,
       totalAmount,
+      taxableValue,
+      cgstAmount,
+      sgstAmount,
+      igstAmount,
+      placeOfSupply,
       paymentMethod: args.paymentMethod,
       amountReceived: args.paymentMethod === 'CASH' && args.amountReceived != null ? args.amountReceived : null,
       changeGiven,
@@ -1264,7 +1403,7 @@ type ProcessReturnArgs = {
   reason: string | null
   cashierId: string
   originDeviceId: string
-  billNumber: string
+  billNumber?: string
 }
 
 // Performs the return half of a refund/exchange inside a tx. Validates against
@@ -1310,6 +1449,11 @@ async function processReturnCore(tx: TxClient, args: ProcessReturnArgs) {
     lineGstAmount: number
     lineDiscountPct: number
     lineDiscountAmt: number
+    billDiscountAmt: number
+    taxableValue: number
+    cgstAmount: number
+    sgstAmount: number
+    igstAmount: number
   }
   const returnLines: FinalReturnLine[] = []
 
@@ -1349,16 +1493,37 @@ async function processReturnCore(tx: TxClient, args: ProcessReturnArgs) {
     }
   }
 
-  const subtotal = returnLines.reduce((s, l) => s + l.lineTotal, 0)
-  const gstAmount = returnLines.reduce((s, l) => s + l.lineGstAmount, 0)
+  const subtotal = round2(returnLines.reduce((s, l) => s + l.lineTotal, 0))
   const origSubtotal = Number(original.subtotal) || 0
   const origDiscount = Number(original.discountAmount) || 0
-  const discountAmount = origSubtotal > 0 ? origDiscount * (subtotal / origSubtotal) : 0
-  const totalAmount = Math.max(0, subtotal - discountAmount)
+  const discountAmount = round2(origSubtotal > 0 ? origDiscount * (subtotal / origSubtotal) : 0)
+  const { interState, placeOfSupply } = await resolveTaxContext(tx, original.customerId)
+
+  // A credit note is calculated exactly like a sale, so it mirrors the invoice
+  // it refunds. Tax is re-derived rather than pro-rated from the original,
+  // which also fixes returns against bills written before these fields existed.
+  const refundTotals = computeInvoiceTotals(
+    returnLines.map((l) => ({
+      lineTotal: l.lineTotal,
+      gstPercentage: Number(l.originalItem.gstPercentage)
+    })),
+    discountAmount,
+    interState
+  )
+  returnLines.forEach((l, i) => {
+    const t = refundTotals.lines[i]
+    l.billDiscountAmt = t.billDiscountAmt
+    l.lineGstAmount = t.gstAmount
+    l.taxableValue = t.taxableValue
+    l.cgstAmount = t.cgstAmount
+    l.sgstAmount = t.sgstAmount
+    l.igstAmount = t.igstAmount
+  })
+  const { totalAmount, taxableValue, gstAmount, cgstAmount, sgstAmount, igstAmount } = refundTotals
 
   const created = await tx.bill.create({
     data: {
-      billNumber: args.billNumber,
+      billNumber: args.billNumber || (await allocateNumber(tx, 'CN')),
       status: 'RETURN',
       customerId: original.customerId,
       originDeviceId: args.originDeviceId,
@@ -1367,6 +1532,11 @@ async function processReturnCore(tx: TxClient, args: ProcessReturnArgs) {
       gstAmount,
       discountAmount,
       totalAmount,
+      taxableValue,
+      cgstAmount,
+      sgstAmount,
+      igstAmount,
+      placeOfSupply,
       paymentMethod: original.paymentMethod,
       amountReceived: null,
       changeGiven: null,
@@ -1386,6 +1556,11 @@ async function processReturnCore(tx: TxClient, args: ProcessReturnArgs) {
           lineDiscountAmt: l.lineDiscountAmt,
           lineGstAmount: l.lineGstAmount,
           lineTotal: l.lineTotal,
+          billDiscountAmt: l.billDiscountAmt,
+          taxableValue: l.taxableValue,
+          cgstAmount: l.cgstAmount,
+          sgstAmount: l.sgstAmount,
+          igstAmount: l.igstAmount,
           originalBillItemId: l.originalItem.id
         }))
       }
@@ -1424,27 +1599,7 @@ app.post('/api/v1/bills', requireActiveLicense(), requireAuth(), async (req, res
         include: { customer: { select: { name: true } }, items: true }
       })
       if (existing) {
-        return res.status(200).json({
-          success: true,
-          bill: {
-            ...existing,
-            subtotal: Number(existing.subtotal),
-            gstAmount: Number(existing.gstAmount),
-            discountAmount: Number(existing.discountAmount),
-            totalAmount: Number(existing.totalAmount),
-            amountReceived: existing.amountReceived ? Number(existing.amountReceived) : null,
-            changeGiven: existing.changeGiven ? Number(existing.changeGiven) : null,
-            items: existing.items.map((it) => ({
-              ...it,
-              unitRate: Number(it.unitRate),
-              gstPercentage: Number(it.gstPercentage),
-              lineDiscountPct: Number(it.lineDiscountPct),
-              lineDiscountAmt: Number(it.lineDiscountAmt),
-              lineGstAmount: Number(it.lineGstAmount),
-              lineTotal: Number(it.lineTotal)
-            }))
-          }
-        })
+        return res.status(200).json({ success: true, bill: serializeBill(existing) })
       }
     }
 
@@ -1455,7 +1610,7 @@ app.post('/api/v1/bills', requireActiveLicense(), requireAuth(), async (req, res
     const billNumber =
       typeof clientBillNumber === 'string' && clientBillNumber.trim()
         ? clientBillNumber.trim()
-        : await nextBillNumber()
+        : undefined
     const cashierId = req.user!.userId
 
     const bill = await prisma.$transaction((tx) => createBillCore(tx, {
@@ -1470,27 +1625,7 @@ app.post('/api/v1/bills', requireActiveLicense(), requireAuth(), async (req, res
       clientLocalId: clientLocalId ? String(clientLocalId) : null
     }, billNumber))
 
-    return res.status(201).json({
-      success: true,
-      bill: {
-        ...bill,
-        subtotal: Number(bill.subtotal),
-        gstAmount: Number(bill.gstAmount),
-        discountAmount: Number(bill.discountAmount),
-        totalAmount: Number(bill.totalAmount),
-        amountReceived: bill.amountReceived ? Number(bill.amountReceived) : null,
-        changeGiven: bill.changeGiven ? Number(bill.changeGiven) : null,
-        items: bill.items.map((it) => ({
-          ...it,
-          unitRate: Number(it.unitRate),
-          gstPercentage: Number(it.gstPercentage),
-          lineDiscountPct: Number(it.lineDiscountPct),
-          lineDiscountAmt: Number(it.lineDiscountAmt),
-          lineGstAmount: Number(it.lineGstAmount),
-          lineTotal: Number(it.lineTotal)
-        }))
-      }
-    })
+    return res.status(201).json({ success: true, bill: serializeBill(bill) })
   } catch (err: unknown) {
     const e = err as { code?: string; productName?: string; available?: number; requested?: number }
     if (e.code === 'INSUFFICIENT_STOCK') {
@@ -1537,37 +1672,15 @@ app.post('/api/v1/bills/:id/return', requireActiveLicense(), requireAuth(['SUPER
     const original = await prisma.bill.findUnique({ where: { id: billId } })
     if (!original) return res.status(404).json({ success: false, error: 'NOT_FOUND' })
 
-    const billNumber = await nextBillNumber()
     const result = await prisma.$transaction((tx) => processReturnCore(tx, {
       originalBillId: billId,
       returnItems: items,
       reason: reason || null,
       cashierId: req.user!.userId,
-      originDeviceId: originDeviceId || original.originDeviceId,
-      billNumber
+      originDeviceId: originDeviceId || original.originDeviceId
     }))
 
-    return res.status(201).json({
-      success: true,
-      bill: {
-        ...result,
-        subtotal: Number(result.subtotal),
-        gstAmount: Number(result.gstAmount),
-        discountAmount: Number(result.discountAmount),
-        totalAmount: Number(result.totalAmount),
-        amountReceived: result.amountReceived ? Number(result.amountReceived) : null,
-        changeGiven: result.changeGiven ? Number(result.changeGiven) : null,
-        items: result.items.map((it) => ({
-          ...it,
-          unitRate: Number(it.unitRate),
-          gstPercentage: Number(it.gstPercentage),
-          lineDiscountPct: Number(it.lineDiscountPct),
-          lineDiscountAmt: Number(it.lineDiscountAmt),
-          lineGstAmount: Number(it.lineGstAmount),
-          lineTotal: Number(it.lineTotal)
-        }))
-      }
-    })
+    return res.status(201).json({ success: true, bill: serializeBill(result) })
   } catch (err: unknown) {
     const e = err as { code?: string; currentStatus?: string; billItemId?: string; requested?: number; remaining?: number }
     if (e.code === 'NOT_FOUND') return res.status(404).json({ success: false, error: 'NOT_FOUND' })
@@ -1646,8 +1759,6 @@ app.post('/api/v1/bills/:id/exchange', requireActiveLicense(), requireAuth(['SUP
       }
     })
 
-    const refundBillNumber = await nextBillNumber()
-    const replacementBillNumber = await nextBillNumber()
     const cashierId = req.user!.userId
     const deviceId = originDeviceId || original.originDeviceId
     const pm = paymentMethod || (original.paymentMethod as 'CASH' | 'UPI' | 'CARD')
@@ -1658,8 +1769,7 @@ app.post('/api/v1/bills/:id/exchange', requireActiveLicense(), requireAuth(['SUP
         returnItems,
         reason: reason ? `Exchange: ${reason}` : 'Exchange',
         cashierId,
-        originDeviceId: deviceId,
-        billNumber: refundBillNumber
+        originDeviceId: deviceId
       })
 
       const replacement = await createBillCore(tx, {
@@ -1672,7 +1782,7 @@ app.post('/api/v1/bills/:id/exchange', requireActiveLicense(), requireAuth(['SUP
         discountAmount: 0,
         notes: `Exchange for ${original.billNumber} (refund ${refund.billNumber})`,
         clientLocalId: null
-      }, replacementBillNumber)
+      })
 
       return { refundBill: refund, replacementBill: replacement }
     })
@@ -1681,25 +1791,6 @@ app.post('/api/v1/bills/:id/exchange', requireActiveLicense(), requireAuth(['SUP
     const replacementTotal = Number(replacementBill.totalAmount)
     // Positive = customer pays the difference; negative = customer receives it.
     const netDifference = replacementTotal - refundTotal
-
-    const serializeBill = (b: typeof refundBill | typeof replacementBill) => ({
-      ...b,
-      subtotal: Number(b.subtotal),
-      gstAmount: Number(b.gstAmount),
-      discountAmount: Number(b.discountAmount),
-      totalAmount: Number(b.totalAmount),
-      amountReceived: b.amountReceived ? Number(b.amountReceived) : null,
-      changeGiven: b.changeGiven ? Number(b.changeGiven) : null,
-      items: b.items.map((it) => ({
-        ...it,
-        unitRate: Number(it.unitRate),
-        gstPercentage: Number(it.gstPercentage),
-        lineDiscountPct: Number(it.lineDiscountPct),
-        lineDiscountAmt: Number(it.lineDiscountAmt),
-        lineGstAmount: Number(it.lineGstAmount),
-        lineTotal: Number(it.lineTotal)
-      }))
-    })
 
     return res.status(201).json({
       success: true,

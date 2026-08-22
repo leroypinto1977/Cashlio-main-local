@@ -25,6 +25,27 @@ model ShopConfig {
   lastRefreshError      String?   // Last refresh failure reason (for the manager UI)
   licenseLocked         Boolean   @default(false) // True after grace period expires; blocks new bills
   gracePeriodDays       Int       @default(30)
+
+  // Shop identity — printed on every tax invoice. `stateCode` is the 2-digit
+  // GST state code (first two chars of the shop GSTIN) and decides whether a
+  // sale is intra-state (CGST+SGST) or inter-state (IGST).
+  gstin      String?
+  stateCode  String?
+  address    String?
+  phone      String?
+}
+
+// Monotonic per-series counters for human-facing document numbers.
+// Allocation is a single atomic INSERT ... ON CONFLICT DO UPDATE RETURNING, so
+// concurrent bills can never receive the same number (the old count()-based
+// scheme could, and did after a void).
+model NumberSeries {
+  series    String   // 'INV' (sale) | 'CN' (credit note) | 'BT' (batch)
+  period    String   // 'YYMM' — series resets each calendar month (IST)
+  lastValue Int      @default(0)
+  updatedAt DateTime @updatedAt
+
+  @@id([series, period])
 }
 
 model AuthorizedClient {
@@ -173,6 +194,14 @@ model Bill {
   gstAmount      Decimal          @db.Decimal(10, 2)
   discountAmount Decimal          @default(0) @db.Decimal(10, 2)
   totalAmount    Decimal          @db.Decimal(10, 2)
+  // Tax-invoice breakdown. `taxableValue` is the ex-GST value of the sale
+  // after both line and bill-level discounts; taxableValue + gstAmount ==
+  // totalAmount. Exactly one of (cgst+sgst) or igst is non-zero.
+  taxableValue   Decimal          @default(0) @db.Decimal(10, 2)
+  cgstAmount     Decimal          @default(0) @db.Decimal(10, 2)
+  sgstAmount     Decimal          @default(0) @db.Decimal(10, 2)
+  igstAmount     Decimal          @default(0) @db.Decimal(10, 2)
+  placeOfSupply  String?          // 2-digit GST state code of the customer
   paymentMethod  String
   amountReceived Decimal?         @db.Decimal(10, 2)
   changeGiven    Decimal?         @db.Decimal(10, 2)
@@ -200,13 +229,21 @@ model BillItem {
   itemCode           String
   productName        String
   unitOfMeasure      String
-  quantity           Int
+  quantity           Decimal    @db.Decimal(12, 3)
   unitRate           Decimal    @db.Decimal(10, 2)
   gstPercentage      Decimal    @db.Decimal(5, 2)
   lineDiscountPct    Decimal    @default(0) @db.Decimal(5, 2)
   lineDiscountAmt    Decimal    @default(0) @db.Decimal(10, 2)
   lineGstAmount      Decimal    @db.Decimal(10, 2)
   lineTotal          Decimal    @db.Decimal(10, 2)
+  // Share of the bill-level discount apportioned to this line, and the
+  // resulting ex-GST value. taxableValue + lineGstAmount == lineTotal -
+  // billDiscountAmt, so the invoice foots exactly.
+  billDiscountAmt    Decimal    @default(0) @db.Decimal(10, 2)
+  taxableValue       Decimal    @default(0) @db.Decimal(10, 2)
+  cgstAmount         Decimal    @default(0) @db.Decimal(10, 2)
+  sgstAmount         Decimal    @default(0) @db.Decimal(10, 2)
+  igstAmount         Decimal    @default(0) @db.Decimal(10, 2)
   createdAt          DateTime   @default(now())
   // For return-bill items: pointer to the original BillItem being refunded.
   // Lets us validate cumulative-returned-qty per original line without

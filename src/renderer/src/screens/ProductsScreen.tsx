@@ -125,14 +125,24 @@ export function ProductsScreen({ token }: { token: string | null }) {
   // Product list state
   const [search, setSearch] = useState('')
   const [selectedCategoryFilter, setSelectedCategoryFilter] = useState('')
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>('active')
   const [detailProduct, setDetailProduct] = useState<Product | null>(null)
 
   // Product form modal
   const [showProductForm, setShowProductForm] = useState(false)
   const [editingProductId, setEditingProductId] = useState<string | null>(null)
+  const [itemCodeLocked, setItemCodeLocked] = useState(false)
   const [productForm, setProductForm] = useState<ProductForm>(emptyProductForm())
   const [productFormError, setProductFormError] = useState('')
   const [productFormLoading, setProductFormLoading] = useState(false)
+  const [suggestingCode, setSuggestingCode] = useState(false)
+
+  // Deactivate / delete confirmation modal
+  const [confirmTarget, setConfirmTarget] = useState<Product | null>(null)
+  const [confirmMode, setConfirmMode] = useState<'deactivate' | 'hard'>('deactivate')
+  const [confirmError, setConfirmError] = useState('')
+  const [confirmLoading, setConfirmLoading] = useState(false)
+  const [confirmOfferDeactivate, setConfirmOfferDeactivate] = useState(false)
 
   // Category form modal
   const [showCatForm, setShowCatForm] = useState(false)
@@ -192,8 +202,12 @@ export function ProductsScreen({ token }: { token: string | null }) {
 
   // ─── Product CRUD ──────────────────────────────────────────────────────────
 
+  /** A product that already has stock history can never change its item code. */
+  const isProductUsed = (p: Product) => p.batchCount > 0 || p.totalStock > 0
+
   const openAddProduct = () => {
     setEditingProductId(null)
+    setItemCodeLocked(false)
     setProductForm(emptyProductForm())
     setProductFormError('')
     setShowProductForm(true)
@@ -425,13 +439,34 @@ export function ProductsScreen({ token }: { token: string | null }) {
             <ArrowLeft className="w-5 h-5" />
           </button>
           <div>
-            <h1 className="text-xl font-bold">{p.name}</h1>
+            <h1 className="text-xl font-bold flex items-center gap-2">
+              {p.name}
+              {!p.isActive && <InactiveBadge />}
+            </h1>
             <p className="text-sm text-muted-foreground font-mono">{p.itemCode}</p>
           </div>
           <div className="ml-auto flex items-center gap-2">
             <Button variant="outline" onClick={(e) => openEditProduct(p, e)} className="gap-2">
               <Edit2 className="w-3.5 h-3.5" /> Edit
             </Button>
+            {p.isActive ? (
+              <Button variant="outline" onClick={(e) => askDeactivate(p, e)} className="gap-2">
+                <Archive className="w-3.5 h-3.5" /> Deactivate
+              </Button>
+            ) : (
+              <Button variant="outline" onClick={(e) => handleReactivate(p, e)} className="gap-2">
+                <RotateCcw className="w-3.5 h-3.5" /> Reactivate
+              </Button>
+            )}
+            {!isProductUsed(p) && (
+              <Button
+                variant="outline"
+                onClick={(e) => askHardDelete(p, e)}
+                className="gap-2 text-red-600 hover:text-red-700 hover:bg-red-50"
+              >
+                <Trash2 className="w-3.5 h-3.5" /> Delete permanently
+              </Button>
+            )}
             <Button onClick={() => openAddBatch(p)} className="gap-2">
               <Plus className="w-4 h-4" /> Add Batch / Restock
             </Button>
@@ -485,7 +520,8 @@ export function ProductsScreen({ token }: { token: string | null }) {
                 <tr>
                   <th className="text-left px-4 py-3 font-semibold text-zinc-600">Batch</th>
                   <th className="text-left px-4 py-3 font-semibold text-zinc-600">Supplier / Warehouse</th>
-                  <th className="text-right px-4 py-3 font-semibold text-zinc-600">Purchase</th>
+                  <th className="text-right px-4 py-3 font-semibold text-zinc-600">Cost (ex-GST)</th>
+                  <th className="text-right px-4 py-3 font-semibold text-zinc-600">Landed</th>
                   <th className="text-right px-4 py-3 font-semibold text-zinc-600">Qty</th>
                   <th className="text-left px-4 py-3 font-semibold text-zinc-600">Date</th>
                   <th className="px-4 py-3"></th>
@@ -635,6 +671,15 @@ export function ProductsScreen({ token }: { token: string | null }) {
               <option value="">All Categories</option>
               {categories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
             </select>
+            <select
+              value={statusFilter}
+              onChange={(e) => setStatusFilter(e.target.value as StatusFilter)}
+              className="h-10 rounded-md border border-input bg-background px-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+            >
+              <option value="active">Active</option>
+              <option value="inactive">Inactive</option>
+              <option value="all">All Statuses</option>
+            </select>
           </div>
 
           {loading ? (
@@ -657,7 +702,9 @@ export function ProductsScreen({ token }: { token: string | null }) {
                   {filtered.length === 0 ? (
                     <tr>
                       <td colSpan={5} className="px-4 py-12 text-center text-muted-foreground text-sm">
-                        No products found.
+                        {statusFilter === 'active'
+                          ? 'No active products found. Switch the status filter to see inactive ones.'
+                          : 'No products found.'}
                       </td>
                     </tr>
                   ) : (
@@ -665,10 +712,13 @@ export function ProductsScreen({ token }: { token: string | null }) {
                       <tr
                         key={p.id}
                         onClick={() => setDetailProduct(p)}
-                        className="hover:bg-zinc-50/70 transition-colors cursor-pointer"
+                        className={`hover:bg-zinc-50/70 transition-colors cursor-pointer ${p.isActive ? '' : 'bg-zinc-50/60'}`}
                       >
                         <td className="px-4 py-3">
-                          <p className="font-medium text-zinc-900">{p.name}</p>
+                          <p className="font-medium text-zinc-900 flex items-center gap-2">
+                            {p.name}
+                            {!p.isActive && <InactiveBadge />}
+                          </p>
                           <p className="text-xs text-muted-foreground font-mono mt-0.5">
                             {p.itemCode}{p.brand ? ` · ${p.brand}` : ''}
                           </p>
@@ -677,12 +727,13 @@ export function ProductsScreen({ token }: { token: string | null }) {
                         <td className="px-4 py-3 text-zinc-600">{p.category.name}</td>
                         <td className="px-4 py-3 text-right font-medium text-zinc-900">
                           ₹{p.sellingRate.toFixed(2)}
+                          <span className="text-xs font-normal text-muted-foreground"> / {p.unitOfMeasure}</span>
                           {p.batchCount > 1 && (
                             <span className="block text-xs text-muted-foreground">{p.batchCount} batches</span>
                           )}
                         </td>
                         <td className="px-4 py-3 text-center">
-                          <StockBadge qty={p.totalStock} min={p.minStockLevel} />
+                          <StockBadge qty={p.totalStock} min={p.minStockLevel} uom={p.unitOfMeasure} />
                         </td>
                         <td className="px-4 py-3">
                           <div className="flex items-center gap-1 justify-end">
@@ -694,14 +745,35 @@ export function ProductsScreen({ token }: { token: string | null }) {
                             >
                               <Edit2 className="w-3.5 h-3.5" />
                             </button>
-                            <button
-                              type="button"
-                              onClick={(e) => handleDeleteProduct(p.id, e)}
-                              className="p-1.5 rounded-md hover:bg-red-50 hover:text-red-600 transition-colors text-zinc-400"
-                              title="Deactivate"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                            </button>
+                            {p.isActive ? (
+                              <button
+                                type="button"
+                                onClick={(e) => askDeactivate(p, e)}
+                                className="p-1.5 rounded-md hover:bg-amber-50 hover:text-amber-600 transition-colors text-zinc-400"
+                                title="Deactivate"
+                              >
+                                <Archive className="w-3.5 h-3.5" />
+                              </button>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={(e) => handleReactivate(p, e)}
+                                className="p-1.5 rounded-md hover:bg-emerald-50 hover:text-emerald-600 transition-colors text-zinc-400"
+                                title="Reactivate"
+                              >
+                                <RotateCcw className="w-3.5 h-3.5" />
+                              </button>
+                            )}
+                            {!isProductUsed(p) && (
+                              <button
+                                type="button"
+                                onClick={(e) => askHardDelete(p, e)}
+                                className="p-1.5 rounded-md hover:bg-red-50 hover:text-red-600 transition-colors text-zinc-400"
+                                title="Delete permanently"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            )}
                             <ChevronRight className="w-4 h-4 text-zinc-300 ml-1" />
                           </div>
                         </td>
@@ -714,7 +786,7 @@ export function ProductsScreen({ token }: { token: string | null }) {
           )}
 
           <p className="text-xs text-muted-foreground mt-3">
-            {filtered.length} product{filtered.length !== 1 ? 's' : ''}
+            {filtered.length} {statusFilter === 'all' ? '' : `${statusFilter} `}product{filtered.length !== 1 ? 's' : ''}
             {search || selectedCategoryFilter ? ` (filtered from ${products.length})` : ''}
           </p>
         </>

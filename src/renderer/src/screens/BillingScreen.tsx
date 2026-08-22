@@ -51,10 +51,18 @@ type SavedBill = {
   subtotal?: number
   gstAmount?: number
   discountAmount?: number
+  taxableValue?: number
+  cgstAmount?: number
+  sgstAmount?: number
+  igstAmount?: number
   amountReceived?: number | null
   changeGiven: number | null
   paymentMethod: string
-  items: { productName: string; itemCode?: string; quantity: number; unitRate?: number; lineTotal: number }[]
+  items: {
+    productName: string; itemCode?: string; quantity: number; unitRate?: number; lineTotal: number
+    gstPercentage?: number; taxableValue?: number; cgstAmount?: number; sgstAmount?: number
+    igstAmount?: number; billDiscountAmt?: number
+  }[]
   customer?: { name: string } | null
 }
 
@@ -142,8 +150,19 @@ export function BillingScreen({
     apiFetch<{ billNumber: string }>('/api/v1/system/next-bill-number', token)
       .then((d) => setBillNumber(d.billNumber))
       .catch(() => {})
-    apiFetch<{ shopName?: string; branchName?: string }>('/api/v1/system/status', token)
-      .then((d) => setShopInfo({ name: d.shopName || 'My Shop', branch: d.branchName || null }))
+    apiFetch<{
+      shopName?: string; branchName?: string
+      address?: string | null; phone?: string | null; gstin?: string | null
+    }>('/api/v1/system/status', token)
+      .then((d) =>
+        setShopInfo({
+          name: d.shopName || 'My Shop',
+          branch: d.branchName || null,
+          address: d.address ?? null,
+          phone: d.phone ?? null,
+          gstin: d.gstin ?? null
+        })
+      )
       .catch(() => {})
   }, [token])
 
@@ -155,6 +174,10 @@ export function BillingScreen({
     gstAmount: b.gstAmount,
     discountAmount: b.discountAmount,
     totalAmount: b.totalAmount,
+    taxableValue: b.taxableValue,
+    cgstAmount: b.cgstAmount,
+    sgstAmount: b.sgstAmount,
+    igstAmount: b.igstAmount,
     amountReceived: b.amountReceived ?? null,
     changeGiven: b.changeGiven,
     customerName: b.customer?.name ?? null,
@@ -163,7 +186,13 @@ export function BillingScreen({
       productName: it.productName,
       quantity: it.quantity,
       unitRate: it.unitRate ?? (it.quantity > 0 ? it.lineTotal / it.quantity : 0),
-      lineTotal: it.lineTotal
+      lineTotal: it.lineTotal,
+      gstPercentage: it.gstPercentage,
+      taxableValue: it.taxableValue,
+      cgstAmount: it.cgstAmount,
+      sgstAmount: it.sgstAmount,
+      igstAmount: it.igstAmount,
+      billDiscountAmt: it.billDiscountAmt
     }))
   })
 
@@ -282,7 +311,6 @@ export function BillingScreen({
       setSearchResults(data.products)
       const exact = data.products.find((p) => p.itemCode.toLowerCase() === ql)
       if (exact) { addProductDirect(exact); return }
-      if (data.products.length === 1) { selectProduct(data.products[0]); return }
       setShowDropdown(true)
     } catch { /* keep current dropdown */ }
     finally { setSearchLoading(false) }
@@ -339,13 +367,26 @@ export function BillingScreen({
 
   // ─── Totals ──────────────────────────────────────────────────────────────
 
-  const subtotal = cartItems.reduce((s, it) => s + it.lineTotal, 0)
-  const totalGst = cartItems.reduce((s, it) => s + it.lineGstAmount, 0)
+  const rawSubtotal = cartItems.reduce((s, it) => s + it.lineTotal, 0)
   const billDiscFlat = parseFloat(billDiscountFlat) || 0
   const billDiscPct = parseFloat(billDiscountPct) || 0
-  const billDiscAmt = subtotal * billDiscPct / 100 + billDiscFlat
-  const grandTotal = Math.max(0, subtotal - billDiscAmt)
+  // Same calculator the server uses, so the counter preview and the stored
+  // invoice agree to the paisa — including how the bill discount is shared
+  // across lines before tax is extracted.
+  const totals = computeInvoiceTotals(
+    cartItems.map((it) => ({ lineTotal: it.lineTotal, gstPercentage: it.gstPercentage })),
+    rawSubtotal * billDiscPct / 100 + billDiscFlat,
+    false
+  )
+  const subtotal = totals.subtotal
+  const billDiscAmt = totals.billDiscount
+  const grandTotal = totals.totalAmount
+  const totalGst = totals.gstAmount
+  const taxableValue = totals.taxableValue
+  const cgstAmount = totals.cgstAmount
+  const sgstAmount = totals.sgstAmount
   const cashRec = parseFloat(cashReceived) || 0
+  const shortBy = paymentMethod === 'CASH' ? Math.max(0, grandTotal - cashRec) : 0
   const change = paymentMethod === 'CASH' ? Math.max(0, cashRec - grandTotal) : 0
   const canPay = grandTotal > 0 && (paymentMethod !== 'CASH' || cashRec >= grandTotal)
 
@@ -627,8 +668,9 @@ export function BillingScreen({
                       if (e.key === 'Enter') confirmAddToCart()
                       if (e.key === 'Escape') setPendingProduct(null)
                     }}
-                    className="w-20 h-9 px-3 text-sm font-semibold text-center rounded-lg border-2 border-zinc-300 focus:border-zinc-900 focus:outline-none bg-white tabular-nums"
+                    className="w-24 h-9 px-3 text-sm font-semibold text-center rounded-lg border-2 border-zinc-300 focus:border-zinc-900 focus:outline-none bg-white tabular-nums"
                   />
+                  <span className="text-xs font-medium text-zinc-500 -ml-1">{pendingProduct.unitOfMeasure}</span>
                   <Button
                     onClick={confirmAddToCart}
                     className="h-9 px-4 text-sm font-semibold bg-zinc-900 hover:bg-zinc-800 text-white"
@@ -770,11 +812,30 @@ export function BillingScreen({
                 <span>{cartItems.length} item{cartItems.length !== 1 ? 's' : ''}</span>
                 <span>₹{fmt(subtotal)}</span>
               </div>
-              {totalGst > 0 && (
-                <div className="flex justify-between text-muted-foreground text-xs">
-                  <span>Incl. GST</span>
-                  <span>₹{fmt(totalGst)}</span>
+              {billDiscAmt > 0 && (
+                <div className="flex justify-between text-emerald-600">
+                  <span>Discount</span>
+                  <span>−₹{fmt(billDiscAmt)}</span>
                 </div>
+              )}
+              {/* Rates are GST-inclusive, so tax is extracted from the total
+                  rather than added to it. Showing the taxable value makes the
+                  split legible instead of subtotal simply repeating the total. */}
+              <div className="flex justify-between text-muted-foreground">
+                <span>Taxable value</span>
+                <span>₹{fmt(taxableValue)}</span>
+              </div>
+              {totalGst > 0 && (
+                <>
+                  <div className="flex justify-between text-muted-foreground text-xs">
+                    <span>CGST</span>
+                    <span>₹{fmt(cgstAmount)}</span>
+                  </div>
+                  <div className="flex justify-between text-muted-foreground text-xs">
+                    <span>SGST</span>
+                    <span>₹{fmt(sgstAmount)}</span>
+                  </div>
+                </>
               )}
             </div>
 
@@ -806,8 +867,8 @@ export function BillingScreen({
                   <span className="absolute right-2.5 top-1/2 -translate-y-1/2 text-xs text-muted-foreground">%</span>
                 </div>
               </div>
-              {billDiscAmt > 0 && (
-                <p className="text-xs text-emerald-600 mt-1.5">−₹{fmt(billDiscAmt)} discount applied</p>
+              {billDiscAmt > 0 && billDiscPct > 0 && (
+                <p className="text-xs text-emerald-600 mt-1.5">{billDiscPct}% → −₹{fmt(billDiscAmt)}</p>
               )}
             </div>
 
@@ -863,10 +924,15 @@ export function BillingScreen({
                   </div>
                 </div>
                 {cashRec > 0 && (
-                  <div className={`flex items-center justify-between p-3 rounded-lg text-sm font-semibold ${change >= 0 ? 'bg-emerald-50 text-emerald-800' : 'bg-red-50 text-red-700'}`}>
-                    <span>{change >= 0 ? 'Change to Return' : 'Amount Short'}</span>
-                    <span className="text-base">₹{fmt(Math.abs(cashRec < grandTotal ? cashRec - grandTotal : change))}</span>
+                  <div className={`flex items-center justify-between p-3 rounded-lg text-sm font-semibold ${shortBy > 0 ? 'bg-amber-50 text-amber-800' : 'bg-emerald-50 text-emerald-800'}`}>
+                    <span>{shortBy > 0 ? 'Short by' : 'Change to return'}</span>
+                    <span className="text-base">₹{fmt(shortBy > 0 ? shortBy : change)}</span>
                   </div>
+                )}
+                {shortBy > 0 && (
+                  <p className="text-xs text-muted-foreground">
+                    Part payment isn't available yet — collect the full amount to continue.
+                  </p>
                 )}
                 {/* Quick amount buttons */}
                 {grandTotal > 0 && (
