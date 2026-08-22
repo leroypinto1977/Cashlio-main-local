@@ -17,6 +17,20 @@ import {
   checkClockTamper,
   refreshLicenseOnce
 } from './licenseGuard'
+import {
+  validateMobile,
+  validateContactNumber,
+  validateEmail,
+  validateGstin,
+  validateName,
+  validateItemCode,
+  normalizeItemCode,
+  stateCodeOf,
+  codeStub,
+  type FieldResult
+} from '../shared/validation'
+import { round2, computeInvoiceTotals } from '../shared/money'
+import { parseQty, roundQty, computePurchaseCost, defaultMeasureFor, measuresFor } from '../shared/units'
 
 declare global {
   namespace Express {
@@ -105,21 +119,179 @@ function istMidnight(base: Date = new Date(), offset = 0): Date {
   return new Date(midnightUTC - IST_OFFSET_MS)
 }
 
-async function nextBatchCode(): Promise<string> {
-  const now = new Date()
-  const yyyy = now.getFullYear()
-  const mm = String(now.getMonth() + 1).padStart(2, '0')
-  const prefix = `B${yyyy}-${mm}-`
+/**
+ * Document-number series. `INV` for sales, `CN` for credit notes (returns),
+ * `BT` for stock batches — deliberately distinct prefixes so a bill number can
+ * never be mistaken for a batch code. Series reset each IST calendar month.
+ */
+type Series = 'INV' | 'CN' | 'BT'
 
-  // Count batches already created this month
-  const startOfMonth = new Date(yyyy, now.getMonth(), 1)
-  const endOfMonth = new Date(yyyy, now.getMonth() + 1, 0, 23, 59, 59, 999)
-  const count = await prisma.productBatch.count({
-    where: { createdAt: { gte: startOfMonth, lte: endOfMonth } }
+function currentPeriod(now: Date = new Date()): string {
+  const ist = new Date(now.getTime() + IST_OFFSET_MS)
+  const yy = String(ist.getUTCFullYear()).slice(2)
+  const mm = String(ist.getUTCMonth() + 1).padStart(2, '0')
+  return `${yy}${mm}`
+}
+
+/**
+ * Atomically claims the next number in a series.
+ *
+ * This is a single INSERT ... ON CONFLICT DO UPDATE ... RETURNING, so two
+ * concurrent bills can never be handed the same value. (The previous scheme
+ * counted existing rows for the month, which collided as soon as a bill was
+ * voided or a second terminal billed at the same moment.)
+ *
+ * Call it inside the same transaction as the row it numbers: if the write
+ * rolls back, the number is released with it.
+ */
+async function allocateNumber(db: DbClient, series: Series, width = 4): Promise<string> {
+  const period = currentPeriod()
+  const rows = await db.$queryRaw<Array<{ lastValue: number }>>`
+    INSERT INTO "NumberSeries" ("series", "period", "lastValue", "updatedAt")
+    VALUES (${series}, ${period}, 1, NOW())
+    ON CONFLICT ("series", "period")
+    DO UPDATE SET "lastValue" = "NumberSeries"."lastValue" + 1, "updatedAt" = NOW()
+    RETURNING "lastValue"
+  `
+  const seq = Number(rows[0].lastValue)
+  return `${series}-${period}-${String(seq).padStart(width, '0')}`
+}
+
+/** Read-only preview of the next number. Does NOT consume it. */
+async function peekNumber(series: Series, width = 4): Promise<string> {
+  const period = currentPeriod()
+  const row = await prisma.numberSeries.findUnique({
+    where: { series_period: { series, period } }
   })
+  const next = (row?.lastValue ?? 0) + 1
+  return `${series}-${period}-${String(next).padStart(width, '0')}`
+}
 
-  const seq = String(count + 1).padStart(3, '0')
-  return `${prefix}${seq}`
+// ─── GST ──────────────────────────────────────────────────────────────────────
+
+/**
+ * A sale is inter-state only when we know both the shop's and the customer's
+ * state and they differ. A walk-in customer with no GSTIN is treated as local,
+ * which is the correct default for over-the-counter retail.
+ */
+async function resolveTaxContext(
+  db: DbClient,
+  customerId: string | null
+): Promise<{ interState: boolean; placeOfSupply: string | null }> {
+  const config = await db.shopConfig.findFirst({ select: { stateCode: true, gstin: true } })
+  const shopState = config?.stateCode || stateCodeOf(config?.gstin) || null
+  let customerState: string | null = null
+  if (customerId) {
+    const customer = await db.customer.findUnique({
+      where: { id: customerId },
+      select: { gstin: true }
+    })
+    customerState = stateCodeOf(customer?.gstin)
+  }
+  return {
+    interState: Boolean(shopState && customerState && shopState !== customerState),
+    placeOfSupply: customerState || shopState
+  }
+}
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+function serializeBillItem(it: any): any {
+  return {
+    ...it,
+    quantity: Number(it.quantity),
+    unitRate: Number(it.unitRate),
+    gstPercentage: Number(it.gstPercentage),
+    lineDiscountPct: Number(it.lineDiscountPct),
+    lineDiscountAmt: Number(it.lineDiscountAmt),
+    lineGstAmount: Number(it.lineGstAmount),
+    lineTotal: Number(it.lineTotal),
+    billDiscountAmt: Number(it.billDiscountAmt ?? 0),
+    taxableValue: Number(it.taxableValue ?? 0),
+    cgstAmount: Number(it.cgstAmount ?? 0),
+    sgstAmount: Number(it.sgstAmount ?? 0),
+    igstAmount: Number(it.igstAmount ?? 0)
+  }
+}
+
+/** Single place that turns Prisma Decimals into JSON numbers for a bill. */
+function serializeBill(b: any): any {
+  return {
+    ...b,
+    subtotal: Number(b.subtotal),
+    gstAmount: Number(b.gstAmount),
+    discountAmount: Number(b.discountAmount),
+    totalAmount: Number(b.totalAmount),
+    taxableValue: Number(b.taxableValue ?? 0),
+    cgstAmount: Number(b.cgstAmount ?? 0),
+    sgstAmount: Number(b.sgstAmount ?? 0),
+    igstAmount: Number(b.igstAmount ?? 0),
+    amountReceived: b.amountReceived != null ? Number(b.amountReceived) : null,
+    changeGiven: b.changeGiven != null ? Number(b.changeGiven) : null,
+    ...(Array.isArray(b.items) ? { items: b.items.map(serializeBillItem) } : {})
+  }
+}
+/* eslint-enable @typescript-eslint/no-explicit-any */
+
+/**
+ * Resolves the brand for a product write. Accepts a `brandId` from the picker,
+ * or a bare name (find-or-create) so an inline "+ Add brand" and older clients
+ * both work. Returns both the id and the denormalised name to store.
+ */
+type BrandResolution =
+  | { kind: 'unchanged' }
+  | { kind: 'cleared' }
+  | { kind: 'resolved'; brandId: string; brand: string }
+  | { kind: 'not-found' }
+
+async function resolveBrand(
+  tx: TxClient,
+  input: { brandId?: unknown; brand?: unknown }
+): Promise<BrandResolution> {
+  if (input.brandId === null || input.brand === null) return { kind: 'cleared' }
+
+  if (typeof input.brandId === 'string' && input.brandId.trim()) {
+    const found = await tx.brand.findUnique({ where: { id: input.brandId.trim() } })
+    return found
+      ? { kind: 'resolved', brandId: found.id, brand: found.name }
+      : { kind: 'not-found' }
+  }
+
+  if (typeof input.brand === 'string') {
+    const name = input.brand.trim()
+    if (!name) return { kind: 'cleared' }
+    const existing = await tx.brand.findUnique({ where: { name } })
+    const brand = existing ?? (await tx.brand.create({ data: { name } }))
+    return { kind: 'resolved', brandId: brand.id, brand: brand.name }
+  }
+
+  return { kind: 'unchanged' }
+}
+
+/** Turns a resolution into the fields to write, or null when nothing changes. */
+function brandFields(r: BrandResolution): { brandId: string | null; brand: string | null } | null {
+  if (r.kind === 'cleared') return { brandId: null, brand: null }
+  if (r.kind === 'resolved') return { brandId: r.brandId, brand: r.brand }
+  return null
+}
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+/** Batch rows carry three Decimal money columns and two Decimal quantities. */
+function serializeBatch(b: any): any {
+  return {
+    ...b,
+    purchaseRate: Number(b.purchaseRate),
+    purchaseGstPct: Number(b.purchaseGstPct ?? 0),
+    purchaseGstAmount: Number(b.purchaseGstAmount ?? 0),
+    purchaseRateInclGst: Number(b.purchaseRateInclGst ?? 0),
+    receivedQty: Number(b.receivedQty),
+    currentQty: Number(b.currentQty)
+  }
+}
+/* eslint-enable @typescript-eslint/no-explicit-any */
+
+/** Rejects a request with the shared validator's own error code and message. */
+function fieldError(res: Response, r: Extract<FieldResult<string>, { ok: false }>) {
+  return res.status(400).json({ success: false, error: r.error, message: r.message })
 }
 
 // ─── Phase 1 — System & Auth ──────────────────────────────────────────────────
@@ -395,6 +567,126 @@ app.get('/api/v1/system/authorized-clients', async (_req, res) => {
   }
 })
 
+// ─── Shop profile ─────────────────────────────────────────────────────────────
+
+app.get('/api/v1/system/shop-profile', requireAuth(), async (_req, res) => {
+  try {
+    const config = await prisma.shopConfig.findFirst()
+    if (!config) return res.status(404).json({ success: false, error: 'NOT_CONFIGURED' })
+    return res.json({
+      success: true,
+      profile: {
+        shopName: config.shopName,
+        branchName: config.branchName,
+        address: config.address,
+        phone: config.phone,
+        gstin: config.gstin,
+        stateCode: config.stateCode
+      }
+    })
+  } catch (err) {
+    console.error(err)
+    return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
+  }
+})
+
+/**
+ * The shop's own details. These are printed on every invoice, and the GSTIN
+ * decides whether a sale is taxed as CGST+SGST or IGST, so the state code is
+ * always kept in step with the GSTIN rather than entered separately.
+ */
+app.put('/api/v1/system/shop-profile', requireAuth(['SUPER_ADMIN']), async (req, res) => {
+  try {
+    const { shopName, branchName, address, phone, gstin } = req.body
+    const config = await prisma.shopConfig.findFirst()
+    if (!config) return res.status(404).json({ success: false, error: 'NOT_CONFIGURED' })
+
+    const data: Record<string, unknown> = {}
+    if (shopName !== undefined) {
+      const c = validateName(String(shopName), 'Shop name')
+      if (!c.ok) return fieldError(res, c)
+      data.shopName = c.value
+    }
+    if (branchName !== undefined) {
+      const c = validateName(String(branchName), 'Branch name')
+      if (!c.ok) return fieldError(res, c)
+      data.branchName = c.value
+    }
+    if (phone !== undefined) {
+      const c = validateContactNumber(String(phone ?? ''), { required: false })
+      if (!c.ok) return fieldError(res, c)
+      data.phone = c.value || null
+    }
+    if (gstin !== undefined) {
+      const c = validateGstin(String(gstin ?? ''))
+      if (!c.ok) return fieldError(res, c)
+      data.gstin = c.value || null
+      data.stateCode = stateCodeOf(c.value)
+    }
+    if (address !== undefined) data.address = address ? String(address).trim() : null
+
+    const updated = await prisma.shopConfig.update({ where: { id: config.id }, data })
+    return res.json({
+      success: true,
+      profile: {
+        shopName: updated.shopName,
+        branchName: updated.branchName,
+        address: updated.address,
+        phone: updated.phone,
+        gstin: updated.gstin,
+        stateCode: updated.stateCode
+      }
+    })
+  } catch (err) {
+    console.error(err)
+    return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
+  }
+})
+
+/**
+ * Suggests the next free item code for a category/brand pair, e.g. PVC-FIN-003.
+ * Purely advisory — the operator can overwrite it before saving.
+ */
+app.get('/api/v1/system/suggest-item-code', requireAuth(['SUPER_ADMIN']), async (req, res) => {
+  try {
+    const { categoryId, brand } = req.query
+    let categoryStub = 'GEN'
+    if (categoryId) {
+      const category = await prisma.category.findUnique({
+        where: { id: String(categoryId) },
+        select: { name: true }
+      })
+      if (category) categoryStub = codeStub(category.name) || 'GEN'
+    }
+    let brandName = brand ? String(brand) : ''
+    if (!brandName && req.query.brandId) {
+      const b = await prisma.brand.findUnique({
+        where: { id: String(req.query.brandId) }, select: { name: true }
+      })
+      brandName = b?.name ?? ''
+    }
+    const brandStub = brandName ? codeStub(brandName) : ''
+    const prefix = [categoryStub, brandStub].filter(Boolean).join('-')
+
+    const existing = await prisma.product.findMany({
+      where: { itemCode: { startsWith: `${prefix}-` } },
+      select: { itemCode: true }
+    })
+    const used = new Set<number>()
+    for (const p of existing) {
+      const tail = p.itemCode.slice(prefix.length + 1)
+      if (/^\d+$/.test(tail)) used.add(parseInt(tail, 10))
+    }
+    let next = 1
+    while (used.has(next)) next++
+
+    return res.json({ success: true, itemCode: `${prefix}-${String(next).padStart(3, '0')}` })
+  } catch (err) {
+    console.error(err)
+    return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
+  }
+})
+
 // ─── Phase 2A — Warehouses ────────────────────────────────────────────────────
 
 app.get('/api/v1/warehouses', requireAuth(), async (_req, res) => {
@@ -442,6 +734,110 @@ app.put('/api/v1/warehouses/:id', requireAuth(['SUPER_ADMIN']), async (req, res)
 app.delete('/api/v1/warehouses/:id', requireAuth(['SUPER_ADMIN']), async (req, res) => {
   try {
     await prisma.warehouse.delete({ where: { id: String(req.params.id) } })
+    return res.json({ success: true })
+  } catch (err: unknown) {
+    if ((err as { code?: string }).code === 'P2025') {
+      return res.status(404).json({ success: false, error: 'NOT_FOUND' })
+    }
+    console.error(err)
+    return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
+  }
+})
+
+// ─── Brands ───────────────────────────────────────────────────────────────────
+
+app.get('/api/v1/brands', requireAuth(), async (req, res) => {
+  try {
+    const includeInactive = req.query.includeInactive === '1'
+    const brands = await prisma.brand.findMany({
+      where: includeInactive ? undefined : { isActive: true },
+      include: { _count: { select: { products: true } } },
+      orderBy: { name: 'asc' }
+    })
+    return res.json({
+      success: true,
+      brands: brands.map((b) => ({
+        id: b.id, name: b.name, isActive: b.isActive, productCount: b._count.products
+      }))
+    })
+  } catch (err) {
+    console.error(err)
+    return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
+  }
+})
+
+app.post('/api/v1/brands', requireAuth(['SUPER_ADMIN']), async (req, res) => {
+  try {
+    const check = validateName(String(req.body?.name ?? ''), 'Brand name')
+    if (!check.ok) return fieldError(res, check)
+    const brand = await prisma.brand.create({ data: { name: check.value } })
+    return res.status(201).json({ success: true, brand })
+  } catch (err: unknown) {
+    if ((err as { code?: string }).code === 'P2002') {
+      return res.status(409).json({
+        success: false, error: 'BRAND_NAME_EXISTS',
+        message: 'A brand with this name already exists.'
+      })
+    }
+    console.error(err)
+    return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
+  }
+})
+
+app.put('/api/v1/brands/:id', requireAuth(['SUPER_ADMIN']), async (req, res) => {
+  try {
+    const id = String(req.params.id)
+    const { name, isActive } = req.body
+    const data: Record<string, unknown> = {}
+    if (name !== undefined) {
+      const check = validateName(String(name), 'Brand name')
+      if (!check.ok) return fieldError(res, check)
+      data.name = check.value
+    }
+    if (isActive !== undefined) data.isActive = Boolean(isActive)
+
+    const brand = await prisma.$transaction(async (tx) => {
+      const updated = await tx.brand.update({ where: { id }, data })
+      if (data.name) {
+        // Product.brand is a denormalised copy of the brand name, so a rename
+        // has to travel to every product (and out to the terminals with it).
+        const affected = await tx.product.findMany({
+          where: { brandId: id }, select: { id: true }
+        })
+        if (affected.length > 0) {
+          await tx.product.updateMany({ where: { brandId: id }, data: { brand: updated.name } })
+          await emitProductUpsertBulk(tx, affected.map((p) => p.id))
+        }
+      }
+      return updated
+    })
+    return res.json({ success: true, brand })
+  } catch (err: unknown) {
+    const code = (err as { code?: string }).code
+    if (code === 'P2025') return res.status(404).json({ success: false, error: 'NOT_FOUND' })
+    if (code === 'P2002') {
+      return res.status(409).json({
+        success: false, error: 'BRAND_NAME_EXISTS',
+        message: 'A brand with this name already exists.'
+      })
+    }
+    console.error(err)
+    return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
+  }
+})
+
+app.delete('/api/v1/brands/:id', requireAuth(['SUPER_ADMIN']), async (req, res) => {
+  try {
+    const id = String(req.params.id)
+    const productCount = await prisma.product.count({ where: { brandId: id } })
+    if (productCount > 0) {
+      return res.status(409).json({
+        success: false, error: 'BRAND_IN_USE',
+        message: `${productCount} product${productCount === 1 ? '' : 's'} still use this brand. Deactivate it instead.`,
+        productCount
+      })
+    }
+    await prisma.brand.delete({ where: { id } })
     return res.json({ success: true })
   } catch (err: unknown) {
     if ((err as { code?: string }).code === 'P2025') {
@@ -675,18 +1071,16 @@ app.get('/api/v1/products', requireAuth(), async (req, res) => {
     })
 
     const result = products.map((p) => {
-      const mappedBatches = p.batches.map((b) => ({
-        ...b,
-        purchaseRate: Number(b.purchaseRate)
-      }))
+      const mappedBatches = p.batches.map(serializeBatch)
       return {
         ...p,
-        totalStock: p.batches.reduce((sum, b) => sum + b.currentQty, 0),
+        totalStock: roundQty(mappedBatches.reduce((sum, b) => sum + b.currentQty, 0)),
         batchCount: mappedBatches.length,
         latestBatch: mappedBatches[0] ?? null,
         batches: mappedBatches,
         sellingRate: Number(p.sellingRate),
-        gstPercentage: Number(p.gstPercentage)
+        gstPercentage: Number(p.gstPercentage),
+        minStockLevel: Number(p.minStockLevel)
       }
     })
 
@@ -713,14 +1107,15 @@ app.get('/api/v1/products/:id', requireAuth(), async (req, res) => {
     })
     if (!product) return res.status(404).json({ success: false, error: 'NOT_FOUND' })
 
-    const mappedBatches = product.batches.map((b) => ({ ...b, purchaseRate: Number(b.purchaseRate) }))
+    const mappedBatches = product.batches.map(serializeBatch)
     return res.json({
       success: true,
       product: {
         ...product,
-        totalStock: product.batches.reduce((sum, b) => sum + b.currentQty, 0),
+        totalStock: roundQty(product.batches.reduce((sum, b) => sum + Number(b.currentQty), 0)),
         sellingRate: Number(product.sellingRate),
         gstPercentage: Number(product.gstPercentage),
+        minStockLevel: Number(product.minStockLevel),
         batches: mappedBatches,
         latestBatch: mappedBatches[0] ?? null
       }
@@ -734,28 +1129,46 @@ app.get('/api/v1/products/:id', requireAuth(), async (req, res) => {
 app.post('/api/v1/products', requireAuth(['SUPER_ADMIN']), async (req, res) => {
   try {
     const {
-      itemCode, brand, name, specification, categoryId, productType,
-      unitOfMeasure, sellingRate, gstPercentage, warrantyPeriodDays, minStockLevel, supplierIds
+      itemCode, brand, brandId, name, specification, categoryId, productType,
+      unitOfMeasure, sellMode, sellingRate, gstPercentage, warrantyPeriodDays,
+      minStockLevel, supplierIds
     } = req.body
 
     if (!itemCode || !name || !categoryId) {
       return res.status(400).json({ success: false, error: 'ITEM_CODE_NAME_CATEGORY_REQUIRED' })
     }
 
+    const codeCheck = validateItemCode(String(itemCode))
+    if (!codeCheck.ok) return fieldError(res, codeCheck)
+    const nameCheck = validateName(String(name), 'Product name')
+    if (!nameCheck.ok) return fieldError(res, nameCheck)
+
+    const mode = sellMode === 'LENGTH' ? 'LENGTH' : 'UNIT'
+    const uom = measuresFor(mode).includes(String(unitOfMeasure))
+      ? String(unitOfMeasure)
+      : defaultMeasureFor(mode)
+
     const product = await prisma.$transaction(async (tx) => {
+      const resolved = await resolveBrand(tx, { brandId, brand })
+      if (resolved.kind === 'not-found') {
+        throw Object.assign(new Error('BRAND_NOT_FOUND'), { code: 'BRAND_NOT_FOUND' })
+      }
+      const brandData = brandFields(resolved) ?? { brandId: null, brand: null }
+
       const created = await tx.product.create({
         data: {
-          itemCode,
-          brand,
-          name,
+          itemCode: codeCheck.value,
+          ...brandData,
+          name: nameCheck.value,
           specification,
           categoryId,
           productType,
-          unitOfMeasure: unitOfMeasure || 'pcs',
+          unitOfMeasure: uom,
+          sellMode: mode,
           sellingRate: sellingRate ?? 0,
           gstPercentage: gstPercentage ?? 0,
           warrantyPeriodDays: warrantyPeriodDays ?? 0,
-          minStockLevel: minStockLevel ?? 0,
+          minStockLevel: parseQty(minStockLevel ?? 0, mode),
           suppliers: supplierIds?.length
             ? { create: supplierIds.map((sid: string, i: number) => ({ supplierId: sid, isDefault: i === 0 })) }
             : undefined
@@ -766,9 +1179,21 @@ app.post('/api/v1/products', requireAuth(['SUPER_ADMIN']), async (req, res) => {
       return created
     })
 
-    return res.status(201).json({ success: true, product: { ...product, sellingRate: Number(product.sellingRate), gstPercentage: Number(product.gstPercentage) } })
+    return res.status(201).json({
+      success: true,
+      product: {
+        ...product,
+        sellingRate: Number(product.sellingRate),
+        gstPercentage: Number(product.gstPercentage),
+        minStockLevel: Number(product.minStockLevel)
+      }
+    })
   } catch (err: unknown) {
-    if ((err as { code?: string }).code === 'P2002') {
+    const code = (err as { code?: string }).code
+    if (code === 'BRAND_NOT_FOUND') {
+      return res.status(400).json({ success: false, error: 'BRAND_NOT_FOUND', message: 'That brand no longer exists.' })
+    }
+    if (code === 'P2002') {
       return res.status(409).json({ success: false, error: 'ITEM_CODE_EXISTS' })
     }
     console.error(err)
@@ -778,17 +1203,83 @@ app.post('/api/v1/products', requireAuth(['SUPER_ADMIN']), async (req, res) => {
 
 app.put('/api/v1/products/:id', requireAuth(['SUPER_ADMIN']), async (req, res) => {
   try {
+    const id = String(req.params.id)
     const {
-      brand, name, specification, categoryId, productType,
-      unitOfMeasure, sellingRate, gstPercentage, warrantyPeriodDays, minStockLevel, isActive
+      itemCode, brand, brandId, name, specification, categoryId, productType,
+      unitOfMeasure, sellMode, sellingRate, gstPercentage, warrantyPeriodDays,
+      minStockLevel, isActive
     } = req.body
 
+    if (name != null) {
+      const nameCheck = validateName(String(name), 'Product name')
+      if (!nameCheck.ok) return fieldError(res, nameCheck)
+    }
+
+    // The item code is printed on receipts and referenced by stock records, so
+    // it freezes once the product has been used. Until then — no batches ever
+    // received and no bill lines — it stays editable, which is what you want
+    // right after a typo at creation time.
+    let nextItemCode: string | undefined
+    if (itemCode != null) {
+      const current = await prisma.product.findUnique({
+        where: { id },
+        select: { itemCode: true }
+      })
+      if (!current) return res.status(404).json({ success: false, error: 'NOT_FOUND' })
+
+      if (normalizeItemCode(String(itemCode)) !== current.itemCode) {
+        const codeCheck = validateItemCode(String(itemCode))
+        if (!codeCheck.ok) return fieldError(res, codeCheck)
+
+        const [batchCount, billItemCount] = await Promise.all([
+          prisma.productBatch.count({ where: { productId: id } }),
+          prisma.billItem.count({ where: { productId: id } })
+        ])
+        if (batchCount > 0 || billItemCount > 0) {
+          return res.status(409).json({
+            success: false,
+            error: 'ITEM_CODE_LOCKED',
+            message:
+              'This product already has stock or sales history, so its item code can no longer be changed.',
+            batchCount,
+            billItemCount
+          })
+        }
+        nextItemCode = codeCheck.value
+      }
+    }
+
+    const mode = sellMode === undefined ? undefined : sellMode === 'LENGTH' ? 'LENGTH' : 'UNIT'
+
     const product = await prisma.$transaction(async (tx) => {
+      const resolved = await resolveBrand(tx, { brandId, brand })
+      if (resolved.kind === 'not-found') {
+        throw Object.assign(new Error('BRAND_NOT_FOUND'), { code: 'BRAND_NOT_FOUND' })
+      }
+      const brandData = brandFields(resolved)
+
+      // The mode decides which units are valid, so a switch to LENGTH also
+      // moves the unit of measure onto a length unit rather than leaving "pcs".
+      const effectiveMode =
+        mode ?? (await tx.product.findUnique({ where: { id }, select: { sellMode: true } }))?.sellMode
+      const uom =
+        unitOfMeasure === undefined
+          ? undefined
+          : measuresFor(effectiveMode).includes(String(unitOfMeasure))
+            ? String(unitOfMeasure)
+            : defaultMeasureFor(effectiveMode)
+
       const updated = await tx.product.update({
-        where: { id: String(req.params.id) },
+        where: { id },
         data: {
-          brand, name, specification, categoryId, productType,
-          unitOfMeasure, sellingRate, gstPercentage, warrantyPeriodDays, minStockLevel, isActive
+          itemCode: nextItemCode,
+          ...(brandData ?? {}),
+          name, specification, categoryId, productType,
+          unitOfMeasure: uom,
+          sellMode: mode,
+          sellingRate, gstPercentage, warrantyPeriodDays, isActive,
+          minStockLevel:
+            minStockLevel === undefined ? undefined : parseQty(minStockLevel, effectiveMode)
         },
         include: { category: true }
       })
@@ -796,9 +1287,24 @@ app.put('/api/v1/products/:id', requireAuth(['SUPER_ADMIN']), async (req, res) =
       return updated
     })
 
-    return res.json({ success: true, product: { ...product, sellingRate: Number(product.sellingRate), gstPercentage: Number(product.gstPercentage) } })
+    return res.json({
+      success: true,
+      product: {
+        ...product,
+        sellingRate: Number(product.sellingRate),
+        gstPercentage: Number(product.gstPercentage),
+        minStockLevel: Number(product.minStockLevel)
+      }
+    })
   } catch (err: unknown) {
-    if ((err as { code?: string }).code === 'P2025') {
+    const code = (err as { code?: string }).code
+    if (code === 'BRAND_NOT_FOUND') {
+      return res.status(400).json({ success: false, error: 'BRAND_NOT_FOUND', message: 'That brand no longer exists.' })
+    }
+    if (code === 'P2002') {
+      return res.status(409).json({ success: false, error: 'ITEM_CODE_EXISTS' })
+    }
+    if (code === 'P2025') {
       return res.status(404).json({ success: false, error: 'NOT_FOUND' })
     }
     console.error(err)
@@ -874,10 +1380,7 @@ app.get('/api/v1/products/:id/batches', requireAuth(), async (req, res) => {
     })
     return res.json({
       success: true,
-      batches: batches.map((b) => ({
-        ...b,
-        purchaseRate: Number(b.purchaseRate)
-      }))
+      batches: batches.map(serializeBatch)
     })
   } catch (err) {
     console.error(err)
@@ -892,25 +1395,38 @@ app.post('/api/v1/products/:id/batches', requireAuth(['SUPER_ADMIN']), async (re
 
     const {
       batchCode: rawBatchCode, purchaseRate, receivedQty,
+      purchaseGstPct, rateIncludesGst,
       supplierId, warehouseId, receivedDate, notes
     } = req.body
 
-    if (!purchaseRate || !receivedQty) {
+    const qty = parseQty(receivedQty ?? 0, product.sellMode)
+    if (!purchaseRate || qty <= 0) {
       return res.status(400).json({ success: false, error: 'PURCHASE_RATE_AND_QTY_REQUIRED' })
     }
 
-    const batchCode = rawBatchCode?.trim() || (await nextBatchCode())
-    const uniqueStockCode = `${product.itemCode}/${batchCode}`
+    // Supplier invoices quote the rate either before or after tax. Both forms
+    // are stored so margin can use the ex-GST cost while the landed cost stays
+    // available for stock valuation.
+    const cost = computePurchaseCost(
+      Number(purchaseRate),
+      purchaseGstPct !== undefined ? Number(purchaseGstPct) : Number(product.gstPercentage),
+      Boolean(rateIncludesGst)
+    )
 
     const batch = await prisma.$transaction(async (tx) => {
+      const batchCode = rawBatchCode?.trim() || (await allocateNumber(tx, 'BT'))
+      const uniqueStockCode = `${product.itemCode}/${batchCode}`
       const created = await tx.productBatch.create({
         data: {
           productId: String(req.params.id),
           batchCode,
           uniqueStockCode,
-          purchaseRate,
-          receivedQty: Number(receivedQty),
-          currentQty: Number(receivedQty),
+          purchaseRate: cost.rateExGst,
+          purchaseGstPct: cost.gstPct,
+          purchaseGstAmount: cost.gstAmount,
+          purchaseRateInclGst: cost.rateInclGst,
+          receivedQty: qty,
+          currentQty: qty,
           supplierId: supplierId || null,
           warehouseId: warehouseId || null,
           receivedDate: receivedDate ? new Date(receivedDate) : new Date(),
@@ -923,10 +1439,7 @@ app.post('/api/v1/products/:id/batches', requireAuth(['SUPER_ADMIN']), async (re
       return created
     })
 
-    return res.status(201).json({
-      success: true,
-      batch: { ...batch, purchaseRate: Number(batch.purchaseRate) }
-    })
+    return res.status(201).json({ success: true, batch: serializeBatch(batch) })
   } catch (err: unknown) {
     if ((err as { code?: string }).code === 'P2002') {
       return res.status(409).json({ success: false, error: 'BATCH_CODE_EXISTS_FOR_PRODUCT' })
@@ -938,26 +1451,61 @@ app.post('/api/v1/products/:id/batches', requireAuth(['SUPER_ADMIN']), async (re
 
 app.put('/api/v1/batches/:batchId', requireAuth(['SUPER_ADMIN']), async (req, res) => {
   try {
-    const { purchaseRate, notes, isActive, warehouseId, supplierId, receivedDate, receivedQty } = req.body
+    const {
+      purchaseRate, purchaseGstPct, rateIncludesGst,
+      notes, isActive, warehouseId, supplierId, receivedDate, receivedQty
+    } = req.body
+
     const batch = await prisma.$transaction(async (tx) => {
+      const existing = await tx.productBatch.findUnique({
+        where: { id: String(req.params.batchId) },
+        include: { product: { select: { gstPercentage: true, sellMode: true } } }
+      })
+      if (!existing) {
+        throw Object.assign(new Error('NOT_FOUND'), { code: 'P2025' })
+      }
+
+      const data: Record<string, unknown> = {
+        notes,
+        isActive,
+        warehouseId,
+        supplierId: supplierId || null,
+        receivedDate: receivedDate ? new Date(receivedDate) : undefined
+      }
+
+      if (purchaseRate !== undefined) {
+        const cost = computePurchaseCost(
+          Number(purchaseRate),
+          purchaseGstPct !== undefined
+            ? Number(purchaseGstPct)
+            : Number(existing.purchaseGstPct) || Number(existing.product.gstPercentage),
+          Boolean(rateIncludesGst)
+        )
+        data.purchaseRate = cost.rateExGst
+        data.purchaseGstPct = cost.gstPct
+        data.purchaseGstAmount = cost.gstAmount
+        data.purchaseRateInclGst = cost.rateInclGst
+      }
+
+      if (receivedQty !== undefined) {
+        // Correcting the received quantity must not silently rewrite how much
+        // has already been sold, so shift what's left by the same delta.
+        const nextReceived = parseQty(receivedQty, existing.product.sellMode)
+        const delta = roundQty(nextReceived - Number(existing.receivedQty))
+        data.receivedQty = nextReceived
+        data.currentQty = Math.max(0, roundQty(Number(existing.currentQty) + delta))
+      }
+
       const updated = await tx.productBatch.update({
         where: { id: String(req.params.batchId) },
-        data: {
-          purchaseRate, notes, isActive, warehouseId,
-          supplierId: supplierId || null,
-          receivedDate: receivedDate ? new Date(receivedDate) : undefined,
-          receivedQty: receivedQty !== undefined ? Number(receivedQty) : undefined
-        },
+        data,
         include: { warehouse: true, supplier: true }
       })
       // isActive or receivedQty changes affect totalStock the terminal sees.
       await emitProductUpsert(tx, updated.productId)
       return updated
     })
-    return res.json({
-      success: true,
-      batch: { ...batch, purchaseRate: Number(batch.purchaseRate) }
-    })
+    return res.json({ success: true, batch: serializeBatch(batch) })
   } catch (err: unknown) {
     if ((err as { code?: string }).code === 'P2025') {
       return res.status(404).json({ success: false, error: 'NOT_FOUND' })
@@ -1217,20 +1765,17 @@ app.get('/api/v1/bills/:id', requireAuth(), async (req, res) => {
     for (const r of bill.returns) {
       for (const it of r.items) {
         if (!it.originalBillItemId) continue
-        returnedByLineId.set(it.originalBillItemId, (returnedByLineId.get(it.originalBillItemId) ?? 0) + it.quantity)
+        returnedByLineId.set(
+          it.originalBillItemId,
+          roundQty((returnedByLineId.get(it.originalBillItemId) ?? 0) + Number(it.quantity))
+        )
       }
     }
 
     return res.json({
       success: true,
       bill: {
-        ...bill,
-        subtotal: Number(bill.subtotal),
-        gstAmount: Number(bill.gstAmount),
-        discountAmount: Number(bill.discountAmount),
-        totalAmount: Number(bill.totalAmount),
-        amountReceived: bill.amountReceived ? Number(bill.amountReceived) : null,
-        changeGiven: bill.changeGiven ? Number(bill.changeGiven) : null,
+        ...serializeBill(bill),
         returns: bill.returns.map((r) => ({
           id: r.id,
           billNumber: r.billNumber,
@@ -1277,28 +1822,39 @@ type CreateBillArgs = {
   clientLocalId: string | null
 }
 
-type TxClient = Parameters<Parameters<typeof prisma.$transaction>[0]>[0]
-
 // Performs FIFO stock deduction and creates a PAID Bill row inside a tx.
 // Throws { code: 'INSUFFICIENT_STOCK' | 'PRODUCT_NOT_FOUND', ... } on failure.
-async function createBillCore(tx: TxClient, args: CreateBillArgs, billNumber: string) {
+async function createBillCore(tx: TxClient, args: CreateBillArgs, billNumber?: string) {
+  // Allocated inside the tx: if the sale rolls back, the number is released.
+  const invoiceNumber = billNumber || (await allocateNumber(tx, 'INV'))
   type FinalLine = {
     productId: string; itemCode: string; productName: string; unitOfMeasure: string
     quantity: number; unitRate: number; gstPercentage: number
     lineDiscountPct: number; lineDiscountAmt: number
     lineGstAmount: number; lineTotal: number
+    billDiscountAmt: number; taxableValue: number
+    cgstAmount: number; sgstAmount: number; igstAmount: number
   }
   const lines: FinalLine[] = []
 
-  for (const item of args.items) {
-    const product = await tx.product.findUnique({ where: { id: item.productId } })
+  for (const rawItem of args.items) {
+    const product = await tx.product.findUnique({ where: { id: rawItem.productId } })
     if (!product) throw Object.assign(new Error('PRODUCT_NOT_FOUND'), { code: 'PRODUCT_NOT_FOUND' })
+
+    // Cut-length products bill in fractions of their unit; everything else is
+    // floored to whole pieces regardless of what the client sent.
+    const item = { ...rawItem, quantity: parseQty(rawItem.quantity, product.sellMode) }
+    if (item.quantity <= 0) {
+      throw Object.assign(new Error('INVALID_QUANTITY'), {
+        code: 'INVALID_QUANTITY', productName: product.name
+      })
+    }
 
     const stockAgg = await tx.productBatch.aggregate({
       where: { productId: item.productId, isActive: true, currentQty: { gt: 0 } },
       _sum: { currentQty: true }
     })
-    const available = stockAgg._sum.currentQty ?? 0
+    const available = roundQty(Number(stockAgg._sum.currentQty ?? 0))
     if (available < item.quantity) {
       throw Object.assign(
         new Error('INSUFFICIENT_STOCK'),
@@ -1313,19 +1869,19 @@ async function createBillCore(tx: TxClient, args: CreateBillArgs, billNumber: st
     let remaining = item.quantity
     for (const batch of batches) {
       if (remaining <= 0) break
-      const deduct = Math.min(batch.currentQty, remaining)
+      const batchQty = Number(batch.currentQty)
+      const deduct = roundQty(Math.min(batchQty, remaining))
       await tx.productBatch.update({
         where: { id: batch.id },
-        data: { currentQty: batch.currentQty - deduct }
+        data: { currentQty: roundQty(batchQty - deduct) }
       })
-      remaining -= deduct
+      remaining = roundQty(remaining - deduct)
     }
 
     const base = item.quantity * item.unitRate
     const pctDisc = base * (item.lineDiscountPct / 100)
     const flatDisc = item.lineDiscountAmt
-    const lineTotal = Math.max(0, base - pctDisc - flatDisc)
-    const lineGstAmount = lineTotal * item.gstPercentage / (100 + item.gstPercentage)
+    const lineTotal = round2(Math.max(0, base - pctDisc - flatDisc))
 
     lines.push({
       productId: item.productId,
@@ -1429,12 +1985,15 @@ async function processReturnCore(tx: TxClient, args: ProcessReturnArgs) {
   const alreadyReturned = new Map<string, number>()
   for (const r of priorReturnLines) {
     if (!r.originalBillItemId) continue
-    alreadyReturned.set(r.originalBillItemId, (alreadyReturned.get(r.originalBillItemId) ?? 0) + r.quantity)
+    alreadyReturned.set(
+      r.originalBillItemId,
+      roundQty((alreadyReturned.get(r.originalBillItemId) ?? 0) + Number(r.quantity))
+    )
   }
 
   const reqByItem = new Map<string, number>()
   for (const r of args.returnItems) {
-    const qty = Math.floor(Number(r.quantity))
+    const qty = roundQty(Number(r.quantity))
     if (!r.billItemId || !Number.isFinite(qty) || qty <= 0) {
       throw Object.assign(new Error('INVALID_RETURN_LINE'), { code: 'INVALID_RETURN_LINE' })
     }
@@ -1462,20 +2021,28 @@ async function processReturnCore(tx: TxClient, args: ProcessReturnArgs) {
     if (!orig) {
       throw Object.assign(new Error('BILL_ITEM_NOT_IN_ORIGINAL'), { code: 'BILL_ITEM_NOT_IN_ORIGINAL', billItemId })
     }
-    const remaining = orig.quantity - (alreadyReturned.get(orig.id) ?? 0)
+    const remaining = roundQty(Number(orig.quantity) - (alreadyReturned.get(orig.id) ?? 0))
     if (qty > remaining) {
       throw Object.assign(new Error('RETURN_QTY_EXCEEDS_REMAINING'),
         { code: 'RETURN_QTY_EXCEEDS_REMAINING', billItemId, requested: qty, remaining })
     }
 
-    const ratio = qty / orig.quantity
+    const ratio = qty / Number(orig.quantity)
     returnLines.push({
       originalItem: orig,
       quantity: qty,
-      lineTotal: Number(orig.lineTotal) * ratio,
-      lineGstAmount: Number(orig.lineGstAmount) * ratio,
+      lineTotal: round2(Number(orig.lineTotal) * ratio),
       lineDiscountPct: Number(orig.lineDiscountPct),
-      lineDiscountAmt: Number(orig.lineDiscountAmt) * ratio
+      lineDiscountAmt: round2(Number(orig.lineDiscountAmt) * ratio),
+      // Tax is re-derived below from the refunded amount rather than pro-rated
+      // from the original, so credit notes for bills written before the
+      // tax-invoice fields existed still come out correct.
+      lineGstAmount: 0,
+      billDiscountAmt: 0,
+      taxableValue: 0,
+      cgstAmount: 0,
+      sgstAmount: 0,
+      igstAmount: 0
     })
   }
 
@@ -1740,7 +2307,7 @@ app.post('/api/v1/bills/:id/exchange', requireActiveLicense(), requireAuth(['SUP
     const productIds = replacementItems.map((r) => String(r.productId))
     const products = await prisma.product.findMany({
       where: { id: { in: productIds } },
-      select: { id: true, sellingRate: true, gstPercentage: true }
+      select: { id: true, sellingRate: true, gstPercentage: true, sellMode: true }
     })
     const productMap = new Map(products.map((p) => [p.id, p]))
 
@@ -1751,7 +2318,7 @@ app.post('/api/v1/bills/:id/exchange', requireActiveLicense(), requireAuth(['SUP
       }
       return {
         productId: String(r.productId),
-        quantity: Math.max(1, Math.floor(Number(r.quantity) || 0)),
+        quantity: parseQty(Number(r.quantity) || 0, p.sellMode),
         unitRate: r.unitRate != null ? Number(r.unitRate) : Number(p.sellingRate),
         gstPercentage: r.gstPercentage != null ? Number(r.gstPercentage) : Number(p.gstPercentage),
         lineDiscountPct: r.lineDiscountPct != null ? Number(r.lineDiscountPct) : 0,
@@ -1926,41 +2493,55 @@ app.get('/api/v1/analytics/summary', requireAuth(), async (req, res) => {
     })
 
     let totalRevenue = 0
+    let totalTaxableValue = 0
     let totalBillDiscounts = 0
     let totalLineDiscounts = 0
     let estimatedCOGS = 0
     let cogsItemCount = 0
     const payBreakdownAmt: Record<string, number> = { CASH: 0, UPI: 0, CARD: 0 }
     const payBreakdownCount: Record<string, number> = { CASH: 0, UPI: 0, CARD: 0 }
-    const productMap: Record<string, { productName: string; itemCode: string; revenue: number; qty: number; cost: number }> = {}
+    const productMap: Record<
+      string,
+      { productName: string; itemCode: string; revenue: number; taxableValue: number; qty: number; cost: number }
+    > = {}
 
     for (const bill of bills) {
       totalRevenue += Number(bill.totalAmount)
+      totalTaxableValue += Number(bill.taxableValue ?? 0)
       totalBillDiscounts += Number(bill.discountAmount)
       payBreakdownAmt[bill.paymentMethod] = (payBreakdownAmt[bill.paymentMethod] || 0) + Number(bill.totalAmount)
       payBreakdownCount[bill.paymentMethod] = (payBreakdownCount[bill.paymentMethod] || 0) + 1
 
       for (const item of bill.items) {
-        const gross = item.quantity * Number(item.unitRate)
+        const qty = Number(item.quantity)
+        const gross = qty * Number(item.unitRate)
         totalLineDiscounts += gross - Number(item.lineTotal)
 
+        // Cost basis is the ex-GST purchase rate, compared against taxable
+        // value below, so margin is not inflated by tax on either side.
         const pr = item.product.batches[0]?.purchaseRate
-        const cost = pr ? item.quantity * Number(pr) : 0
+        const cost = pr ? qty * Number(pr) : 0
         if (pr) { estimatedCOGS += cost; cogsItemCount++ }
 
         if (!productMap[item.productId]) {
-          productMap[item.productId] = { productName: item.productName, itemCode: item.itemCode, revenue: 0, qty: 0, cost: 0 }
+          productMap[item.productId] = { productName: item.productName, itemCode: item.itemCode, revenue: 0, taxableValue: 0, qty: 0, cost: 0 }
         }
         productMap[item.productId].revenue += Number(item.lineTotal)
-        productMap[item.productId].qty += item.quantity
+        productMap[item.productId].taxableValue += Number(item.taxableValue ?? 0)
+        productMap[item.productId].qty += qty
         productMap[item.productId].cost += cost
       }
     }
 
     const totalDiscounts = totalLineDiscounts + totalBillDiscounts
     const grossRevenuePlusDics = totalRevenue + totalDiscounts
-    const estimatedGrossProfit = totalRevenue - estimatedCOGS
-    const estimatedMarginPct = totalRevenue > 0 ? (estimatedGrossProfit / totalRevenue) * 100 : 0
+    // Margin compares ex-GST revenue with ex-GST cost. Using the GST-inclusive
+    // total against an ex-GST purchase rate overstated every margin by the tax.
+    // Bills written before the tax breakdown existed have taxableValue 0, so
+    // fall back to the gross total for those rather than reporting 100% margin.
+    const revenueExGst = totalTaxableValue > 0 ? totalTaxableValue : totalRevenue
+    const estimatedGrossProfit = revenueExGst - estimatedCOGS
+    const estimatedMarginPct = revenueExGst > 0 ? (estimatedGrossProfit / revenueExGst) * 100 : 0
     const topProducts = Object.values(productMap).sort((a, b) => b.revenue - a.revenue).slice(0, 8)
 
     return res.json({
@@ -1977,6 +2558,8 @@ app.get('/api/v1/analytics/summary', requireAuth(), async (req, res) => {
         estimatedCOGS,
         estimatedGrossProfit,
         estimatedMarginPct,
+        revenueExGst,
+        totalTaxableValue,
         hasCOGSData: cogsItemCount > 0,
         paymentBreakdown: { CASH: payBreakdownAmt.CASH, UPI: payBreakdownAmt.UPI, CARD: payBreakdownAmt.CARD },
         paymentCounts: { CASH: payBreakdownCount.CASH, UPI: payBreakdownCount.UPI, CARD: payBreakdownCount.CARD },

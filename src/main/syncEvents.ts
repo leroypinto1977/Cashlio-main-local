@@ -5,6 +5,7 @@
 // consistent stream of changes.
 
 import { Prisma } from '@prisma/client'
+import { roundQty } from '../shared/units'
 
 type TxClient = Omit<
   Prisma.TransactionClient,
@@ -23,6 +24,8 @@ export type ProductSyncRow = {
   categoryId: string
   productType: string | null
   unitOfMeasure: string
+  /** 'UNIT' | 'LENGTH' — terminals use it to decide fractional quantity entry. */
+  sellMode: string
   sellingRate: number
   gstPercentage: number
   warrantyPeriodDays: number
@@ -91,12 +94,13 @@ export async function buildProductSyncPayload(
     categoryId: p.categoryId,
     productType: p.productType,
     unitOfMeasure: p.unitOfMeasure,
+    sellMode: p.sellMode,
     sellingRate: Number(p.sellingRate),
     gstPercentage: Number(p.gstPercentage),
     warrantyPeriodDays: p.warrantyPeriodDays,
-    minStockLevel: p.minStockLevel,
+    minStockLevel: Number(p.minStockLevel),
     isActive: p.isActive,
-    totalStock: agg._sum.currentQty ?? 0
+    totalStock: roundQty(Number(agg._sum.currentQty ?? 0))
   }
 }
 

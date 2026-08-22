@@ -38,6 +38,8 @@ type AnalyticsSummary = {
   estimatedCOGS: number
   estimatedGrossProfit: number
   estimatedMarginPct: number
+  revenueExGst: number
+  totalTaxableValue: number
   hasCOGSData: boolean
   paymentBreakdown: { CASH: number; UPI: number; CARD: number }
   paymentCounts: { CASH: number; UPI: number; CARD: number }
@@ -257,10 +259,19 @@ export function AnalyticsScreen({ token }: { token: string | null }): React.JSX.
                   )}
                 </div>
               </div>
+              {summary.hasCOGSData && (
+                <p className="text-xs text-zinc-400 mb-3">
+                  Margin compares revenue and cost both excluding GST, so tax doesn&apos;t inflate it.
+                </p>
+              )}
               {summary.hasCOGSData ? (
-                <div className="grid grid-cols-3 gap-3">
+                <div className="grid grid-cols-4 gap-3">
                   <div className="p-3 rounded-lg bg-zinc-50 border">
-                    <p className="text-xs text-zinc-500 mb-1">Est. COGS</p>
+                    <p className="text-xs text-zinc-500 mb-1">Revenue (ex-GST)</p>
+                    <p className="text-base font-bold text-zinc-700">₹{fmt(summary.revenueExGst)}</p>
+                  </div>
+                  <div className="p-3 rounded-lg bg-zinc-50 border">
+                    <p className="text-xs text-zinc-500 mb-1">Est. COGS (ex-GST)</p>
                     <p className="text-base font-bold text-zinc-700">₹{fmt(summary.estimatedCOGS)}</p>
                   </div>
                   <div className="p-3 rounded-lg bg-emerald-50 border border-emerald-100">

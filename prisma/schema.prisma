@@ -92,6 +92,17 @@ model Warehouse {
   batches   ProductBatch[]
 }
 
+/// Brand names are a controlled list rather than free text so that filtering
+/// and brand-wise reporting stay reliable (no "Finolex" / "FINOLEX" drift).
+model Brand {
+  id        String    @id @default(uuid())
+  name      String    @unique
+  isActive  Boolean   @default(true)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  products  Product[]
+}
+
 model Category {
   id        String    @id @default(uuid())
   name      String    @unique
@@ -128,15 +139,23 @@ model ProductSupplier {
 model Product {
   id                 String            @id @default(uuid())
   itemCode           String            @unique
+  /// Denormalised copy of `brandRef.name`. `brandId` is authoritative; this is
+  /// kept in step on rename so product search and the terminal sync payload
+  /// don't need a join or a mirrored Brand table.
   brand              String?
+  brandId            String?
+  brandRef           Brand?            @relation(fields: [brandId], references: [id])
   name               String
   specification      String?
   categoryId         String
   productType        String?
   unitOfMeasure      String            @default("pcs")
+  /// UNIT = sold in whole pieces. LENGTH = cut to size (pipe, wire, tube), so
+  /// stock and bill quantities carry three decimal places.
+  sellMode           String            @default("UNIT")
   gstPercentage      Decimal           @default(0) @db.Decimal(5, 2)
   warrantyPeriodDays Int               @default(0)
-  minStockLevel      Int               @default(0)
+  minStockLevel      Decimal           @default(0) @db.Decimal(12, 3)
   isActive           Boolean           @default(true)
   createdAt          DateTime          @default(now())
   updatedAt          DateTime          @updatedAt
@@ -153,10 +172,16 @@ model ProductBatch {
   batchCode       String
   uniqueStockCode String     @unique
   supplierId      String?
-  purchaseRate    Decimal    @db.Decimal(10, 2)
+  /// Cost basis, ALWAYS excluding GST — margin and COGS are computed against
+  /// the ex-GST cost so they compare like with like against taxable value.
+  purchaseRate        Decimal @db.Decimal(10, 2)
+  purchaseGstPct      Decimal @default(0) @db.Decimal(5, 2)
+  purchaseGstAmount   Decimal @default(0) @db.Decimal(10, 2)
+  /// Landed per-unit cost including tax. Derived, stored for display/reporting.
+  purchaseRateInclGst Decimal @default(0) @db.Decimal(10, 2)
   warehouseId     String?
-  receivedQty     Int        @default(0)
-  currentQty      Int        @default(0)
+  receivedQty     Decimal    @default(0) @db.Decimal(12, 3)
+  currentQty      Decimal    @default(0) @db.Decimal(12, 3)
   receivedDate    DateTime   @default(now())
   notes           String?
   isActive        Boolean    @default(true)

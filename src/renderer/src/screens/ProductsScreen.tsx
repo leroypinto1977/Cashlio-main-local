@@ -1,24 +1,35 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import {
   Package, Plus, Search, Edit2, Trash2, ArrowLeft,
-  ChevronRight, Tag, Layers, AlertCircle, Box, RefreshCw
+  ChevronRight, Tag, Layers, AlertCircle, Box, RefreshCw,
+  Archive, RotateCcw, Wand2, EyeOff, Bookmark
 } from 'lucide-react'
 import { Button } from '../components/ui/button'
 import { Input } from '../components/ui/input'
 import { Modal } from '../components/Modal'
 import { apiFetch } from '../lib/api'
+import { validateItemCode, normalizeItemCode, ITEM_CODE_HINT, validateName } from '@shared/validation'
+import {
+  type SellMode, measuresFor, defaultMeasureFor, isLengthMode,
+  qtyStep, parseQty, formatQty, formatQtyWithUnit, computePurchaseCost
+} from '@shared/units'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 type Category = { id: string; name: string }
 type Supplier = { id: string; name: string }
 type Warehouse = { id: string; name: string }
+type Brand = { id: string; name: string; isActive: boolean; productCount: number }
 
 type Batch = {
   id: string
   batchCode: string
   uniqueStockCode: string
+  /** Always ex-GST — this is the cost basis margin is computed against. */
   purchaseRate: number
+  purchaseGstPct: number
+  purchaseGstAmount: number
+  purchaseRateInclGst: number
   currentQty: number
   receivedQty: number
   receivedDate: string
@@ -33,6 +44,8 @@ type Batch = {
 type Product = {
   id: string
   itemCode: string
+  brandId: string | null
+  /** Denormalised copy of the brand's name, kept in sync by the server. */
   brand: string | null
   name: string
   specification: string | null
@@ -40,6 +53,7 @@ type Product = {
   category: { id: string; name: string }
   productType: string | null
   unitOfMeasure: string
+  sellMode: SellMode
   sellingRate: number
   gstPercentage: number
   warrantyPeriodDays: number
@@ -51,23 +65,31 @@ type Product = {
   batches: Batch[]
 }
 
+type WarrantyUnit = 'days' | 'months' | 'years'
+
 type ProductForm = {
   itemCode: string
-  brand: string
+  brandId: string
   name: string
   specification: string
   categoryId: string
   productType: string
   unitOfMeasure: string
+  sellMode: SellMode
   sellingRate: string
   gstPercentage: string
-  warrantyPeriodDays: string
+  warrantyValue: string
+  warrantyUnit: WarrantyUnit
   minStockLevel: string
 }
+
+type StatusFilter = 'active' | 'inactive' | 'all'
 
 type BatchForm = {
   batchCode: string
   purchaseRate: string
+  purchaseGstPct: string
+  rateIncludesGst: boolean
   receivedQty: string
   supplierId: string
   warehouseId: string
@@ -76,20 +98,77 @@ type BatchForm = {
 }
 
 const emptyProductForm = (): ProductForm => ({
-  itemCode: '', brand: '', name: '', specification: '',
-  categoryId: '', productType: '', unitOfMeasure: 'pcs',
-  sellingRate: '0', gstPercentage: '0', warrantyPeriodDays: '0', minStockLevel: '0'
+  itemCode: '', brandId: '', name: '', specification: '',
+  categoryId: '', productType: '', unitOfMeasure: defaultMeasureFor('UNIT'),
+  sellMode: 'UNIT', sellingRate: '0', gstPercentage: '0',
+  warrantyValue: '0', warrantyUnit: 'days', minStockLevel: '0'
 })
 
-const emptyBatchForm = (): BatchForm => ({
-  batchCode: '', purchaseRate: '', receivedQty: '',
-  supplierId: '', warehouseId: '',
+const emptyBatchForm = (gstPct: number = 0): BatchForm => ({
+  batchCode: '', purchaseRate: '', purchaseGstPct: String(gstPct), rateIncludesGst: false,
+  receivedQty: '', supplierId: '', warehouseId: '',
   receivedDate: new Date().toISOString().slice(0, 10), notes: ''
 })
 
+// ─── Warranty helpers ─────────────────────────────────────────────────────────
+
+const WARRANTY_UNIT_DAYS: Record<WarrantyUnit, number> = { days: 1, months: 30, years: 365 }
+
+/** Picks the largest unit that divides evenly — 730 → 2 years, 90 → 3 months, 45 → 45 days. */
+function splitWarranty(days: number): { value: string; unit: WarrantyUnit } {
+  const d = Math.max(0, Math.round(days || 0))
+  if (d > 0 && d % WARRANTY_UNIT_DAYS.years === 0) return { value: String(d / WARRANTY_UNIT_DAYS.years), unit: 'years' }
+  if (d > 0 && d % WARRANTY_UNIT_DAYS.months === 0) return { value: String(d / WARRANTY_UNIT_DAYS.months), unit: 'months' }
+  return { value: String(d), unit: 'days' }
+}
+
+function warrantyToDays(value: string, unit: WarrantyUnit): number {
+  const n = parseInt(value, 10)
+  if (!n || n < 0) return 0
+  return n * WARRANTY_UNIT_DAYS[unit]
+}
+
+/** "730" → "2 years", "0" → "None". */
+function formatWarranty(days: number): string {
+  if (!days) return 'None'
+  const { value, unit } = splitWarranty(days)
+  const n = parseInt(value, 10)
+  const noun = unit === 'days' ? 'day' : unit === 'months' ? 'month' : 'year'
+  return `${n} ${noun}${n === 1 ? '' : 's'}`
+}
+
+// ─── Segmented toggle ─────────────────────────────────────────────────────────
+
+/** Two-or-more-way pill switch — used for sell mode and the batch GST basis. */
+function Segmented<T extends string>({
+  value, onChange, options, className = ''
+}: {
+  value: T
+  onChange: (v: T) => void
+  options: { value: T; label: string }[]
+  className?: string
+}) {
+  return (
+    <div className={`inline-flex items-center rounded-md border border-input bg-background p-0.5 ${className}`}>
+      {options.map((o) => (
+        <button
+          key={o.value}
+          type="button"
+          onClick={() => onChange(o.value)}
+          className={`px-3 h-9 rounded text-sm font-medium transition-colors ${
+            value === o.value ? 'bg-zinc-900 text-white' : 'text-zinc-600 hover:bg-zinc-100'
+          }`}
+        >
+          {o.label}
+        </button>
+      ))}
+    </div>
+  )
+}
+
 // ─── Stock Badge ──────────────────────────────────────────────────────────────
 
-function StockBadge({ qty, min }: { qty: number; min: number }) {
+function StockBadge({ qty, min, uom }: { qty: number; min: number; uom: string }) {
   if (qty === 0) {
     return (
       <span className="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-red-50 text-red-600 border border-red-200">
@@ -100,13 +179,56 @@ function StockBadge({ qty, min }: { qty: number; min: number }) {
   if (qty <= min) {
     return (
       <span className="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-amber-50 text-amber-700 border border-amber-200">
-        <AlertCircle className="w-3 h-3" /> Low ({qty})
+        <AlertCircle className="w-3 h-3" /> Low ({formatQtyWithUnit(qty, uom)})
       </span>
     )
   }
   return (
     <span className="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200">
-      <Box className="w-3 h-3" /> {qty}
+      <Box className="w-3 h-3" /> {formatQtyWithUnit(qty, uom)}
+    </span>
+  )
+}
+
+// ─── Purchase cost readout ────────────────────────────────────────────────────
+
+/** Live "Base · GST · Landed" breakdown shown under the batch rate inputs. */
+function PurchaseCostReadout({
+  rate, gstPct, includesGst, qty, uom
+}: {
+  rate: string
+  gstPct: string
+  includesGst: boolean
+  qty: number
+  uom: string
+}) {
+  const cost = computePurchaseCost(parseFloat(rate) || 0, parseFloat(gstPct) || 0, includesGst)
+  const lineEx = cost.rateExGst * qty
+  const lineLanded = cost.rateInclGst * qty
+
+  return (
+    <div className="rounded-lg bg-zinc-50 border px-3 py-2 text-xs text-zinc-600 space-y-0.5">
+      <p>
+        Base <span className="font-semibold text-zinc-900">₹{cost.rateExGst.toFixed(2)}</span>
+        {' · '}GST <span className="font-semibold text-zinc-900">₹{cost.gstAmount.toFixed(2)}</span>
+        {' · '}Landed <span className="font-semibold text-zinc-900">₹{cost.rateInclGst.toFixed(2)}</span>
+        {' '}per {uom}
+      </p>
+      <p>
+        {qty > 0
+          ? <>Line total for {formatQtyWithUnit(qty, uom)}: <span className="font-semibold text-zinc-900">₹{lineLanded.toFixed(2)}</span> landed (₹{lineEx.toFixed(2)} ex-GST)</>
+          : 'Enter a received quantity to see the line total.'}
+      </p>
+    </div>
+  )
+}
+
+// ─── Inactive Badge ───────────────────────────────────────────────────────────
+
+function InactiveBadge() {
+  return (
+    <span className="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full bg-zinc-100 text-zinc-600 border border-zinc-200">
+      <EyeOff className="w-3 h-3" /> Inactive
     </span>
   )
 }
@@ -114,9 +236,10 @@ function StockBadge({ qty, min }: { qty: number; min: number }) {
 // ─── ProductsScreen ───────────────────────────────────────────────────────────
 
 export function ProductsScreen({ token }: { token: string | null }) {
-  const [tab, setTab] = useState<'products' | 'categories'>('products')
+  const [tab, setTab] = useState<'products' | 'categories' | 'brands'>('products')
   const [products, setProducts] = useState<Product[]>([])
   const [categories, setCategories] = useState<Category[]>([])
+  const [brands, setBrands] = useState<Brand[]>([])
   const [suppliers, setSuppliers] = useState<Supplier[]>([])
   const [warehouses, setWarehouses] = useState<Warehouse[]>([])
   const [loading, setLoading] = useState(false)
@@ -150,6 +273,19 @@ export function ProductsScreen({ token }: { token: string | null }) {
   const [catName, setCatName] = useState('')
   const [catFormLoading, setCatFormLoading] = useState(false)
 
+  // Brand form modal
+  const [showBrandForm, setShowBrandForm] = useState(false)
+  const [editingBrandId, setEditingBrandId] = useState<string | null>(null)
+  const [brandName, setBrandName] = useState('')
+  const [brandFormError, setBrandFormError] = useState('')
+  const [brandFormLoading, setBrandFormLoading] = useState(false)
+
+  // Brand delete confirmation modal
+  const [brandConfirmTarget, setBrandConfirmTarget] = useState<Brand | null>(null)
+  const [brandConfirmError, setBrandConfirmError] = useState('')
+  const [brandConfirmLoading, setBrandConfirmLoading] = useState(false)
+  const [brandOfferDeactivate, setBrandOfferDeactivate] = useState(false)
+
   // Batch/restock modal
   const [showBatchForm, setShowBatchForm] = useState(false)
   const [batchTargetProduct, setBatchTargetProduct] = useState<Product | null>(null)
@@ -160,8 +296,9 @@ export function ProductsScreen({ token }: { token: string | null }) {
   // Edit batch modal
   const [showEditBatchForm, setShowEditBatchForm] = useState(false)
   const [editingBatch, setEditingBatch] = useState<Batch | null>(null)
-  const [editBatchForm, setEditBatchForm] = useState({
-    purchaseRate: '', warehouseId: '', supplierId: '',
+  const [editBatchForm, setEditBatchForm] = useState<EditBatchForm>({
+    purchaseRate: '', purchaseGstPct: '', rateIncludesGst: false,
+    warehouseId: '', supplierId: '',
     receivedDate: '', receivedQty: '', notes: '', isActive: true
   })
   const [editBatchFormError, setEditBatchFormError] = useState('')
@@ -173,13 +310,22 @@ export function ProductsScreen({ token }: { token: string | null }) {
     setLoading(true)
     setError('')
     try {
-      const data = await apiFetch<{ products: Product[] }>('/api/v1/products', token)
+      const qs = statusFilter === 'all' ? '' : `?isActive=${statusFilter === 'active'}`
+      const data = await apiFetch<{ products: Product[] }>(`/api/v1/products${qs}`, token)
       setProducts(data.products)
     } catch {
       setError('Failed to load products.')
     } finally {
       setLoading(false)
     }
+  }, [token, statusFilter])
+
+  /** Brands are reloaded on their own after inline creation from the product form. */
+  const loadBrands = useCallback(async () => {
+    try {
+      const data = await apiFetch<{ brands: Brand[] }>('/api/v1/brands?includeInactive=1', token)
+      setBrands(data.brands)
+    } catch { /* non-fatal */ }
   }, [token])
 
   const loadMeta = useCallback(async () => {
@@ -193,7 +339,8 @@ export function ProductsScreen({ token }: { token: string | null }) {
       setSuppliers(suppData.suppliers)
       setWarehouses(whData.warehouses)
     } catch { /* non-fatal */ }
-  }, [token])
+    await loadBrands()
+  }, [token, loadBrands])
 
   useEffect(() => {
     loadProducts()
@@ -216,33 +363,78 @@ export function ProductsScreen({ token }: { token: string | null }) {
   const openEditProduct = (p: Product, e: React.MouseEvent) => {
     e.stopPropagation()
     setEditingProductId(p.id)
+    setItemCodeLocked(isProductUsed(p))
+    const warranty = splitWarranty(p.warrantyPeriodDays)
+    const mode: SellMode = p.sellMode === 'LENGTH' ? 'LENGTH' : 'UNIT'
     setProductForm({
-      itemCode: p.itemCode, brand: p.brand || '', name: p.name,
+      itemCode: p.itemCode, brandId: p.brandId || '', name: p.name,
       specification: p.specification || '', categoryId: p.categoryId,
-      productType: p.productType || '', unitOfMeasure: p.unitOfMeasure,
+      productType: p.productType || '',
+      unitOfMeasure: measuresFor(mode).includes(p.unitOfMeasure)
+        ? p.unitOfMeasure
+        : defaultMeasureFor(mode),
+      sellMode: mode,
       sellingRate: String(p.sellingRate),
       gstPercentage: String(p.gstPercentage),
-      warrantyPeriodDays: String(p.warrantyPeriodDays),
-      minStockLevel: String(p.minStockLevel)
+      warrantyValue: warranty.value,
+      warrantyUnit: warranty.unit,
+      minStockLevel: formatQty(p.minStockLevel)
     })
     setProductFormError('')
     setShowProductForm(true)
   }
 
+  const handleSuggestItemCode = async () => {
+    setSuggestingCode(true)
+    setProductFormError('')
+    try {
+      const qs = new URLSearchParams()
+      if (productForm.categoryId) qs.set('categoryId', productForm.categoryId)
+      if (productForm.brandId) qs.set('brandId', productForm.brandId)
+      const data = await apiFetch<{ itemCode: string }>(
+        `/api/v1/system/suggest-item-code?${qs.toString()}`, token
+      )
+      setProductForm((f) => ({ ...f, itemCode: normalizeItemCode(data.itemCode) }))
+    } catch (err: unknown) {
+      const e = err as { data?: { message?: string } }
+      setProductFormError(e.data?.message || 'Could not suggest an item code.')
+    } finally {
+      setSuggestingCode(false)
+    }
+  }
+
   const handleSaveProduct = async () => {
-    if (!productForm.itemCode || !productForm.name || !productForm.categoryId) {
-      setProductFormError('Item code, name and category are required.')
+    const codeCheck = validateItemCode(productForm.itemCode)
+    if (!codeCheck.ok) {
+      setProductFormError(codeCheck.message)
+      return
+    }
+    const nameCheck = validateName(productForm.name, 'Product name')
+    if (!nameCheck.ok) {
+      setProductFormError(nameCheck.message)
+      return
+    }
+    if (!productForm.categoryId) {
+      setProductFormError('Category is required.')
       return
     }
     setProductFormLoading(true)
     setProductFormError('')
     try {
       const body = {
-        ...productForm,
+        itemCode: codeCheck.value,
+        // null clears the brand server-side; an id is resolved to the master row.
+        brandId: productForm.brandId || null,
+        name: nameCheck.value,
+        specification: productForm.specification,
+        categoryId: productForm.categoryId,
+        productType: productForm.productType,
+        unitOfMeasure: productForm.unitOfMeasure,
+        sellMode: productForm.sellMode,
         sellingRate: parseFloat(productForm.sellingRate) || 0,
         gstPercentage: parseFloat(productForm.gstPercentage) || 0,
-        warrantyPeriodDays: parseInt(productForm.warrantyPeriodDays) || 0,
-        minStockLevel: parseInt(productForm.minStockLevel) || 0
+        warrantyPeriodDays: warrantyToDays(productForm.warrantyValue, productForm.warrantyUnit),
+        minStockLevel: parseQty(productForm.minStockLevel, productForm.sellMode)
       }
       if (!editingProductId) {
         await apiFetch('/api/v1/products', token, { method: 'POST', body: JSON.stringify(body) })
@@ -256,22 +448,102 @@ export function ProductsScreen({ token }: { token: string | null }) {
         setDetailProduct(fresh.product)
       }
     } catch (err: unknown) {
-      const e = err as { data?: { error?: string } }
-      setProductFormError(e.data?.error === 'ITEM_CODE_EXISTS' ? 'Item code already exists.' : 'Failed to save product.')
+      const e = err as { data?: { error?: string; message?: string } }
+      if (e.data?.error === 'ITEM_CODE_LOCKED') {
+        // The server is the authority — lock the field and restore the saved code.
+        setItemCodeLocked(true)
+        setProductFormError(e.data.message || 'Item code can no longer be changed for this product.')
+      } else if (e.data?.error === 'ITEM_CODE_EXISTS') {
+        setProductFormError(e.data.message || 'Item code already exists.')
+      } else if (e.data?.error === 'BRAND_NOT_FOUND') {
+        // The brand list is stale — refresh it so the picker matches the server.
+        await loadBrands()
+        setProductFormError(e.data.message || 'That brand no longer exists. Pick another one.')
+      } else {
+        setProductFormError(e.data?.message || 'Failed to save product.')
+      }
     } finally {
       setProductFormLoading(false)
     }
   }
 
-  const handleDeleteProduct = async (id: string, e: React.MouseEvent) => {
-    e.stopPropagation()
-    if (!confirm('Deactivate this product?')) return
+  // ─── Deactivate / Reactivate / Hard delete ─────────────────────────────────
+
+  const askDeactivate = (p: Product, e?: React.MouseEvent) => {
+    e?.stopPropagation()
+    setConfirmTarget(p)
+    setConfirmMode('deactivate')
+    setConfirmError('')
+    setConfirmOfferDeactivate(false)
+  }
+
+  const askHardDelete = (p: Product, e?: React.MouseEvent) => {
+    e?.stopPropagation()
+    setConfirmTarget(p)
+    setConfirmMode('hard')
+    setConfirmError('')
+    setConfirmOfferDeactivate(false)
+  }
+
+  const closeConfirm = () => {
+    setConfirmTarget(null)
+    setConfirmError('')
+    setConfirmOfferDeactivate(false)
+  }
+
+  const runDeactivate = async (p: Product) => {
+    setConfirmLoading(true)
+    setConfirmError('')
     try {
-      await apiFetch(`/api/v1/products/${id}`, token, { method: 'DELETE' })
-      setDetailProduct(null)
+      await apiFetch(`/api/v1/products/${p.id}`, token, { method: 'DELETE' })
+      closeConfirm()
+      if (detailProduct?.id === p.id) setDetailProduct(null)
       await loadProducts()
-    } catch {
-      alert('Failed to deactivate product.')
+    } catch (err: unknown) {
+      const e = err as { data?: { message?: string } }
+      setConfirmError(e.data?.message || 'Failed to deactivate product.')
+    } finally {
+      setConfirmLoading(false)
+    }
+  }
+
+  const runHardDelete = async (p: Product) => {
+    setConfirmLoading(true)
+    setConfirmError('')
+    try {
+      await apiFetch(`/api/v1/products/${p.id}?hard=1`, token, { method: 'DELETE' })
+      closeConfirm()
+      if (detailProduct?.id === p.id) setDetailProduct(null)
+      await loadProducts()
+    } catch (err: unknown) {
+      const e = err as { data?: { error?: string; message?: string } }
+      if (e.data?.error === 'PRODUCT_IN_USE') {
+        setConfirmError(e.data.message || 'This product has stock or sales history and cannot be deleted.')
+        setConfirmOfferDeactivate(true)
+      } else {
+        setConfirmError(e.data?.message || 'Failed to delete product.')
+      }
+    } finally {
+      setConfirmLoading(false)
+    }
+  }
+
+  const handleReactivate = async (p: Product, e?: React.MouseEvent) => {
+    e?.stopPropagation()
+    setError('')
+    try {
+      await apiFetch(`/api/v1/products/${p.id}`, token, {
+        method: 'PUT',
+        body: JSON.stringify({ isActive: true })
+      })
+      await loadProducts()
+      if (detailProduct?.id === p.id) {
+        const fresh = await apiFetch<{ product: Product }>(`/api/v1/products/${p.id}`, token)
+        setDetailProduct(fresh.product)
+      }
+    } catch (err: unknown) {
+      const e2 = err as { data?: { message?: string } }
+      setError(e2.data?.message || 'Failed to reactivate product.')
     }
   }
 
@@ -309,12 +581,135 @@ export function ProductsScreen({ token }: { token: string | null }) {
     }
   }
 
+  // ─── Brand CRUD ────────────────────────────────────────────────────────────
+
+  const openAddBrand = () => {
+    setEditingBrandId(null); setBrandName(''); setBrandFormError(''); setShowBrandForm(true)
+  }
+  const openEditBrand = (b: Brand) => {
+    setEditingBrandId(b.id); setBrandName(b.name); setBrandFormError(''); setShowBrandForm(true)
+  }
+
+  const handleSaveBrand = async () => {
+    const check = validateName(brandName, 'Brand name')
+    if (!check.ok) {
+      setBrandFormError(check.message)
+      return
+    }
+    setBrandFormLoading(true)
+    setBrandFormError('')
+    try {
+      if (!editingBrandId) {
+        await apiFetch('/api/v1/brands', token, {
+          method: 'POST', body: JSON.stringify({ name: check.value })
+        })
+      } else {
+        await apiFetch(`/api/v1/brands/${editingBrandId}`, token, {
+          method: 'PUT', body: JSON.stringify({ name: check.value })
+        })
+      }
+      setShowBrandForm(false)
+      await loadBrands()
+      // A rename rewrites the denormalised name on every product.
+      if (editingBrandId) await loadProducts()
+    } catch (err: unknown) {
+      const e = err as { data?: { error?: string; message?: string } }
+      setBrandFormError(
+        e.data?.error === 'BRAND_NAME_EXISTS'
+          ? e.data.message || 'A brand with this name already exists.'
+          : e.data?.message || 'Failed to save brand.'
+      )
+    } finally {
+      setBrandFormLoading(false)
+    }
+  }
+
+  /** Inline "+ Add brand" from the product form — returns the new brand to select. */
+  const createBrandInline = async (
+    name: string
+  ): Promise<{ ok: true; brand: Brand } | { ok: false; message: string }> => {
+    const check = validateName(name, 'Brand name')
+    if (!check.ok) return { ok: false, message: check.message }
+    try {
+      const data = await apiFetch<{ brand: { id: string; name: string; isActive: boolean } }>(
+        '/api/v1/brands', token,
+        { method: 'POST', body: JSON.stringify({ name: check.value }) }
+      )
+      await loadBrands()
+      return { ok: true, brand: { ...data.brand, productCount: 0 } }
+    } catch (err: unknown) {
+      const e = err as { data?: { error?: string; message?: string } }
+      if (e.data?.error === 'BRAND_NAME_EXISTS') {
+        // It already exists — reload and hand back the matching row so the
+        // picker still ends up on the brand the user asked for.
+        try {
+          const data = await apiFetch<{ brands: Brand[] }>('/api/v1/brands?includeInactive=1', token)
+          setBrands(data.brands)
+          const match = data.brands.find(
+            (b) => b.name.toLowerCase() === check.value.toLowerCase()
+          )
+          if (match) return { ok: true, brand: match }
+        } catch { /* fall through to the message below */ }
+      }
+      return { ok: false, message: e.data?.message || 'Failed to add brand.' }
+    }
+  }
+
+  const askDeleteBrand = (b: Brand) => {
+    setBrandConfirmTarget(b)
+    setBrandConfirmError('')
+    setBrandOfferDeactivate(false)
+  }
+
+  const closeBrandConfirm = () => {
+    setBrandConfirmTarget(null)
+    setBrandConfirmError('')
+    setBrandOfferDeactivate(false)
+  }
+
+  const runDeleteBrand = async (b: Brand) => {
+    setBrandConfirmLoading(true)
+    setBrandConfirmError('')
+    try {
+      await apiFetch(`/api/v1/brands/${b.id}`, token, { method: 'DELETE' })
+      closeBrandConfirm()
+      await loadBrands()
+    } catch (err: unknown) {
+      const e = err as { data?: { error?: string; message?: string } }
+      if (e.data?.error === 'BRAND_IN_USE') {
+        setBrandConfirmError(e.data.message || 'Products still use this brand.')
+        setBrandOfferDeactivate(true)
+      } else {
+        setBrandConfirmError(e.data?.message || 'Failed to delete brand.')
+      }
+    } finally {
+      setBrandConfirmLoading(false)
+    }
+  }
+
+  const setBrandActive = async (b: Brand, isActive: boolean) => {
+    setBrandConfirmLoading(true)
+    setBrandConfirmError('')
+    try {
+      await apiFetch(`/api/v1/brands/${b.id}`, token, {
+        method: 'PUT', body: JSON.stringify({ isActive })
+      })
+      closeBrandConfirm()
+      await loadBrands()
+    } catch (err: unknown) {
+      const e = err as { data?: { message?: string } }
+      setBrandConfirmError(e.data?.message || 'Failed to update brand.')
+    } finally {
+      setBrandConfirmLoading(false)
+    }
+  }
+
   // ─── Batch / Restock ───────────────────────────────────────────────────────
 
   const openAddBatch = async (p: Product) => {
     setBatchTargetProduct(p)
     setBatchFormError('')
-    const form = emptyBatchForm()
+    const form = emptyBatchForm(p.gstPercentage)
     try {
       const data = await apiFetch<{ batchCode: string }>('/api/v1/system/next-batch-code', token)
       form.batchCode = data.batchCode
@@ -329,6 +724,11 @@ export function ProductsScreen({ token }: { token: string | null }) {
       setBatchFormError('Purchase rate and received qty are required.')
       return
     }
+    const qty = parseQty(batchForm.receivedQty, batchTargetProduct.sellMode)
+    if (qty <= 0) {
+      setBatchFormError('Received qty must be greater than zero.')
+      return
+    }
     setBatchFormLoading(true)
     setBatchFormError('')
     try {
@@ -337,7 +737,9 @@ export function ProductsScreen({ token }: { token: string | null }) {
         body: JSON.stringify({
           batchCode: batchForm.batchCode || undefined,
           purchaseRate: parseFloat(batchForm.purchaseRate),
-          receivedQty: parseInt(batchForm.receivedQty),
+          purchaseGstPct: parseFloat(batchForm.purchaseGstPct) || 0,
+          rateIncludesGst: batchForm.rateIncludesGst,
+          receivedQty: qty,
           supplierId: batchForm.supplierId || null,
           warehouseId: batchForm.warehouseId || null,
           receivedDate: batchForm.receivedDate,
@@ -363,11 +765,14 @@ export function ProductsScreen({ token }: { token: string | null }) {
   const openEditBatch = (b: Batch) => {
     setEditingBatch(b)
     setEditBatchForm({
+      // The stored rate is ex-GST, so the form opens on the "Excl. GST" basis.
       purchaseRate: String(b.purchaseRate),
+      purchaseGstPct: String(b.purchaseGstPct || detailProduct?.gstPercentage || 0),
+      rateIncludesGst: false,
       warehouseId: b.warehouseId || '',
       supplierId: b.supplierId || '',
       receivedDate: b.receivedDate ? new Date(b.receivedDate).toISOString().slice(0, 10) : '',
-      receivedQty: String(b.receivedQty),
+      receivedQty: formatQty(b.receivedQty),
       notes: '',
       isActive: b.isActive
     })
@@ -388,10 +793,14 @@ export function ProductsScreen({ token }: { token: string | null }) {
         method: 'PUT',
         body: JSON.stringify({
           purchaseRate: parseFloat(editBatchForm.purchaseRate),
+          purchaseGstPct: parseFloat(editBatchForm.purchaseGstPct) || 0,
+          rateIncludesGst: editBatchForm.rateIncludesGst,
           warehouseId: editBatchForm.warehouseId || null,
           supplierId: editBatchForm.supplierId || null,
           receivedDate: editBatchForm.receivedDate || null,
-          receivedQty: editBatchForm.receivedQty ? parseInt(editBatchForm.receivedQty) : undefined,
+          receivedQty: editBatchForm.receivedQty
+            ? parseQty(editBatchForm.receivedQty, detailProduct?.sellMode)
+            : undefined,
           notes: editBatchForm.notes || null,
           isActive: editBatchForm.isActive
         })
@@ -419,6 +828,104 @@ export function ProductsScreen({ token }: { token: string | null }) {
     const matchesCat = !selectedCategoryFilter || p.categoryId === selectedCategoryFilter
     return matchesSearch && matchesCat
   })
+
+  // ─── Confirm Modal (shared by list + detail views) ─────────────────────────
+
+  const confirmModal = (
+    <Modal
+      open={confirmTarget !== null}
+      onClose={closeConfirm}
+      title={confirmMode === 'hard' ? 'Delete Product Permanently' : 'Deactivate Product'}
+      size="sm"
+    >
+      <div className="space-y-4">
+        <p className="text-sm text-zinc-700">
+          {confirmMode === 'hard' ? (
+            <>
+              Permanently delete <span className="font-bold">{confirmTarget?.name}</span>? This cannot be undone.
+            </>
+          ) : (
+            <>
+              Deactivate <span className="font-bold">{confirmTarget?.name}</span>? It will stay on past bills
+              and can be reactivated later.
+            </>
+          )}
+        </p>
+        {confirmError && (
+          <div className="p-3 bg-red-50 border border-red-200 rounded-md text-red-600 text-xs">
+            {confirmError}
+          </div>
+        )}
+        <div className="flex gap-3 justify-end">
+          <Button variant="outline" onClick={closeConfirm} disabled={confirmLoading}>Cancel</Button>
+          {confirmOfferDeactivate ? (
+            <Button
+              onClick={() => confirmTarget && runDeactivate(confirmTarget)}
+              disabled={confirmLoading}
+              className="gap-2"
+            >
+              <Archive className="w-3.5 h-3.5" />
+              {confirmLoading ? 'Working…' : 'Deactivate instead'}
+            </Button>
+          ) : (
+            <Button
+              onClick={() => confirmTarget && (confirmMode === 'hard' ? runHardDelete(confirmTarget) : runDeactivate(confirmTarget))}
+              disabled={confirmLoading}
+              className="bg-red-600 hover:bg-red-700 text-white"
+            >
+              {confirmLoading
+                ? 'Working…'
+                : confirmMode === 'hard' ? 'Delete Permanently' : 'Deactivate'}
+            </Button>
+          )}
+        </div>
+      </div>
+    </Modal>
+  )
+
+  // ─── Brand Confirm Modal ───────────────────────────────────────────────────
+
+  const brandConfirmModal = (
+    <Modal
+      open={brandConfirmTarget !== null}
+      onClose={closeBrandConfirm}
+      title="Delete Brand"
+      size="sm"
+    >
+      <div className="space-y-4">
+        <p className="text-sm text-zinc-700">
+          Permanently delete <span className="font-bold">{brandConfirmTarget?.name}</span>?
+          This cannot be undone.
+        </p>
+        {brandConfirmError && (
+          <div className="p-3 bg-red-50 border border-red-200 rounded-md text-red-600 text-xs">
+            {brandConfirmError}
+          </div>
+        )}
+        <div className="flex gap-3 justify-end">
+          <Button variant="outline" onClick={closeBrandConfirm} disabled={brandConfirmLoading}>Cancel</Button>
+          {brandOfferDeactivate ? (
+            <Button
+              onClick={() => brandConfirmTarget && setBrandActive(brandConfirmTarget, false)}
+              disabled={brandConfirmLoading}
+              className="gap-2"
+            >
+              <Archive className="w-3.5 h-3.5" />
+              {brandConfirmLoading ? 'Working…' : 'Deactivate instead'}
+            </Button>
+          ) : (
+            <Button
+              onClick={() => brandConfirmTarget && runDeleteBrand(brandConfirmTarget)}
+              disabled={brandConfirmLoading}
+              className="bg-red-600 hover:bg-red-700 text-white"
+            >
+              {brandConfirmLoading ? 'Working…' : 'Delete Permanently'}
+            </Button>
+          )}
+        </div>
+      </div>
+    </Modal>
+  )
 
   // ─── Detail View ───────────────────────────────────────────────────────────
 
@@ -477,16 +984,21 @@ export function ProductsScreen({ token }: { token: string | null }) {
         <div className="grid grid-cols-4 gap-4 mb-6">
           <div className="p-4 rounded-xl border bg-card">
             <p className="text-xs text-muted-foreground font-medium mb-1">Total Stock</p>
-            <p className="text-2xl font-bold">{p.totalStock} <span className="text-sm font-normal text-muted-foreground">{p.unitOfMeasure}</span></p>
+            <p className="text-2xl font-bold">{formatQty(p.totalStock)} <span className="text-sm font-normal text-muted-foreground">{p.unitOfMeasure}</span></p>
           </div>
           <div className="p-4 rounded-xl border bg-card">
             <p className="text-xs text-muted-foreground font-medium mb-1">Selling Rate</p>
             <p className="text-2xl font-bold">₹{p.sellingRate.toFixed(2)}</p>
-            {margin && <p className={`text-xs font-medium mt-0.5 ${parseFloat(margin) < 0 ? 'text-red-600' : 'text-emerald-600'}`}>{margin}% margin</p>}
+            {margin && <p className={`text-xs font-medium mt-0.5 ${parseFloat(margin) < 0 ? 'text-red-600' : 'text-emerald-600'}`}>{margin}% margin on ex-GST cost</p>}
           </div>
           <div className="p-4 rounded-xl border bg-card">
-            <p className="text-xs text-muted-foreground font-medium mb-1">Purchase Rate</p>
+            <p className="text-xs text-muted-foreground font-medium mb-1">Cost (ex-GST)</p>
             <p className="text-2xl font-bold">₹{p.latestBatch ? p.latestBatch.purchaseRate.toFixed(2) : '—'}</p>
+            {p.latestBatch && (
+              <p className="text-xs text-muted-foreground mt-0.5">
+                Landed ₹{p.latestBatch.purchaseRateInclGst.toFixed(2)} incl. {p.latestBatch.purchaseGstPct}% GST
+              </p>
+            )}
           </div>
           <div className="p-4 rounded-xl border bg-card">
             <p className="text-xs text-muted-foreground font-medium mb-1">GST</p>
@@ -500,8 +1012,14 @@ export function ProductsScreen({ token }: { token: string | null }) {
           {p.specification && <div><span className="text-muted-foreground">Spec:</span> <span className="font-medium">{p.specification}</span></div>}
           {p.productType && <div><span className="text-muted-foreground">Type:</span> <span className="font-medium">{p.productType}</span></div>}
           <div><span className="text-muted-foreground">Category:</span> <span className="font-medium">{p.category.name}</span></div>
-          <div><span className="text-muted-foreground">Warranty:</span> <span className="font-medium">{p.warrantyPeriodDays}d</span></div>
-          <div><span className="text-muted-foreground">Min Stock:</span> <span className="font-medium">{p.minStockLevel}</span></div>
+          <div>
+            <span className="text-muted-foreground">Sold as:</span>{' '}
+            <span className="font-medium">
+              {isLengthMode(p.sellMode) ? `Cut to length (${p.unitOfMeasure})` : `Whole units (${p.unitOfMeasure})`}
+            </span>
+          </div>
+          <div><span className="text-muted-foreground">Warranty:</span> <span className="font-medium">{formatWarranty(p.warrantyPeriodDays)}</span></div>
+          <div><span className="text-muted-foreground">Min Stock:</span> <span className="font-medium">{formatQtyWithUnit(p.minStockLevel, p.unitOfMeasure)}</span></div>
         </div>
 
         {/* Batches */}
@@ -542,8 +1060,16 @@ export function ProductsScreen({ token }: { token: string | null }) {
                     </td>
                     <td className="px-4 py-3 text-right font-medium">₹{b.purchaseRate.toFixed(2)}</td>
                     <td className="px-4 py-3 text-right">
-                      <span className={`font-semibold ${b.currentQty === 0 ? 'text-red-600' : 'text-zinc-900'}`}>{b.currentQty}</span>
-                      <span className="text-xs text-muted-foreground"> / {b.receivedQty}</span>
+                      <span className="font-medium">₹{b.purchaseRateInclGst.toFixed(2)}</span>
+                      <span className="block text-xs text-muted-foreground">
+                        incl. {b.purchaseGstPct}% GST (₹{b.purchaseGstAmount.toFixed(2)})
+                      </span>
+                    </td>
+                    <td className="px-4 py-3 text-right">
+                      <span className={`font-semibold ${b.currentQty === 0 ? 'text-red-600' : 'text-zinc-900'}`}>
+                        {formatQtyWithUnit(b.currentQty, p.unitOfMeasure)}
+                      </span>
+                      <span className="block text-xs text-muted-foreground">of {formatQtyWithUnit(b.receivedQty, p.unitOfMeasure)}</span>
                     </td>
                     <td className="px-4 py-3 text-xs text-muted-foreground">
                       {new Date(b.receivedDate).toLocaleDateString()}
@@ -570,6 +1096,8 @@ export function ProductsScreen({ token }: { token: string | null }) {
           <BatchFormFields
             form={batchForm}
             onChange={setBatchForm}
+            sellMode={batchTargetProduct?.sellMode ?? 'UNIT'}
+            unitOfMeasure={batchTargetProduct?.unitOfMeasure ?? 'pcs'}
             suppliers={suppliers}
             warehouses={warehouses}
             error={batchFormError}
@@ -584,6 +1112,8 @@ export function ProductsScreen({ token }: { token: string | null }) {
           <EditBatchFormFields
             form={editBatchForm}
             onChange={setEditBatchForm}
+            sellMode={p.sellMode}
+            unitOfMeasure={p.unitOfMeasure}
             warehouses={warehouses}
             suppliers={suppliers}
             error={editBatchFormError}
@@ -599,13 +1129,20 @@ export function ProductsScreen({ token }: { token: string | null }) {
             form={productForm}
             onChange={setProductForm}
             categories={categories}
+            brands={brands}
+            onCreateBrand={createBrandInline}
             error={productFormError}
             loading={productFormLoading}
             isEdit={true}
+            itemCodeLocked={itemCodeLocked}
+            suggesting={suggestingCode}
+            onSuggestItemCode={handleSuggestItemCode}
             onSave={handleSaveProduct}
             onCancel={() => setShowProductForm(false)}
           />
         </Modal>
+
+        {confirmModal}
       </div>
     )
   }
@@ -634,14 +1171,18 @@ export function ProductsScreen({ token }: { token: string | null }) {
 
       {/* Tabs */}
       <div className="flex gap-1 mb-6 border-b">
-        {(['products', 'categories'] as const).map((t) => (
+        {(['products', 'categories', 'brands'] as const).map((t) => (
           <button
             key={t}
             type="button"
             onClick={() => setTab(t)}
             className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px capitalize ${tab === t ? 'border-zinc-900 text-zinc-900' : 'border-transparent text-muted-foreground hover:text-zinc-700'}`}
           >
-            {t === 'categories' ? <span className="flex items-center gap-1.5"><Tag className="w-3.5 h-3.5" /> Categories</span> : 'Products'}
+            {t === 'categories'
+              ? <span className="flex items-center gap-1.5"><Tag className="w-3.5 h-3.5" /> Categories</span>
+              : t === 'brands'
+                ? <span className="flex items-center gap-1.5"><Bookmark className="w-3.5 h-3.5" /> Brands</span>
+                : 'Products'}
           </button>
         ))}
       </div>
@@ -832,15 +1373,89 @@ export function ProductsScreen({ token }: { token: string | null }) {
         </>
       )}
 
+      {/* ── Brands Tab ─────────────────────────────────────────────────── */}
+      {tab === 'brands' && (
+        <>
+          <div className="flex justify-end mb-4">
+            <Button onClick={openAddBrand} className="gap-2" size="sm">
+              <Plus className="w-4 h-4" /> Add Brand
+            </Button>
+          </div>
+          <div className="rounded-xl border overflow-hidden">
+            <table className="w-full text-sm">
+              <thead className="bg-zinc-50 border-b">
+                <tr>
+                  <th className="text-left px-4 py-3 font-semibold text-zinc-600">Brand Name</th>
+                  <th className="text-right px-4 py-3 font-semibold text-zinc-600">Products</th>
+                  <th className="px-4 py-3"></th>
+                </tr>
+              </thead>
+              <tbody className="divide-y">
+                {brands.length === 0 ? (
+                  <tr>
+                    <td colSpan={3} className="px-4 py-10 text-center text-muted-foreground text-sm">No brands yet.</td>
+                  </tr>
+                ) : (
+                  brands.map((b) => (
+                    <tr key={b.id} className={`hover:bg-zinc-50/70 ${b.isActive ? '' : 'bg-zinc-50/60'}`}>
+                      <td className="px-4 py-3 font-medium text-zinc-900">
+                        <span className="flex items-center gap-2">
+                          {b.name}
+                          {!b.isActive && <InactiveBadge />}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3 text-right text-zinc-600">{b.productCount}</td>
+                      <td className="px-4 py-3">
+                        <div className="flex items-center gap-1 justify-end">
+                          <button type="button" onClick={() => openEditBrand(b)} className="p-1.5 rounded-md hover:bg-zinc-200 text-zinc-400" title="Rename"><Edit2 className="w-3.5 h-3.5" /></button>
+                          {b.isActive ? (
+                            <button
+                              type="button"
+                              onClick={() => setBrandActive(b, false)}
+                              className="p-1.5 rounded-md hover:bg-amber-50 hover:text-amber-600 text-zinc-400"
+                              title="Deactivate"
+                            >
+                              <Archive className="w-3.5 h-3.5" />
+                            </button>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => setBrandActive(b, true)}
+                              className="p-1.5 rounded-md hover:bg-emerald-50 hover:text-emerald-600 text-zinc-400"
+                              title="Reactivate"
+                            >
+                              <RotateCcw className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                          <button type="button" onClick={() => askDeleteBrand(b)} className="p-1.5 rounded-md hover:bg-red-50 hover:text-red-600 text-zinc-400" title="Delete"><Trash2 className="w-3.5 h-3.5" /></button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+          <p className="text-xs text-muted-foreground mt-3">
+            Renaming a brand updates it on every product that uses it.
+          </p>
+        </>
+      )}
+
       {/* Add/Edit Product Modal */}
       <Modal open={showProductForm} onClose={() => setShowProductForm(false)} title={editingProductId ? 'Edit Product' : 'Add Product'} size="lg">
         <ProductFormFields
           form={productForm}
           onChange={setProductForm}
           categories={categories}
+          brands={brands}
+          onCreateBrand={createBrandInline}
           error={productFormError}
           loading={productFormLoading}
           isEdit={!!editingProductId}
+          itemCodeLocked={itemCodeLocked}
+          suggesting={suggestingCode}
+          onSuggestItemCode={handleSuggestItemCode}
           onSave={handleSaveProduct}
           onCancel={() => setShowProductForm(false)}
         />
@@ -861,6 +1476,33 @@ export function ProductsScreen({ token }: { token: string | null }) {
           </div>
         </div>
       </Modal>
+
+      {/* Add/Edit Brand Modal */}
+      <Modal open={showBrandForm} onClose={() => setShowBrandForm(false)} title={editingBrandId ? 'Rename Brand' : 'Add Brand'} size="sm">
+        <div className="space-y-4">
+          {brandFormError && (
+            <div className="p-3 bg-red-50 border border-red-200 rounded-md text-red-600 text-sm">{brandFormError}</div>
+          )}
+          <div>
+            <label className="block text-sm font-semibold mb-1.5 ml-1">Brand Name</label>
+            <Input value={brandName} onChange={(e) => setBrandName(e.target.value)} placeholder="e.g. Finolex" className="h-11" autoFocus />
+            {editingBrandId && (
+              <p className="text-xs text-muted-foreground mt-1 ml-1">
+                Renaming updates the brand on every product that uses it.
+              </p>
+            )}
+          </div>
+          <div className="flex justify-end gap-3 pt-2 border-t">
+            <Button variant="outline" onClick={() => setShowBrandForm(false)}>Cancel</Button>
+            <Button onClick={handleSaveBrand} disabled={brandFormLoading}>
+              {brandFormLoading ? 'Saving...' : 'Save'}
+            </Button>
+          </div>
+        </div>
+      </Modal>
+
+      {confirmModal}
+      {brandConfirmModal}
     </div>
   )
 }
@@ -868,19 +1510,63 @@ export function ProductsScreen({ token }: { token: string | null }) {
 // ─── ProductFormFields ────────────────────────────────────────────────────────
 
 function ProductFormFields({
-  form, onChange, categories, error, loading, isEdit, onSave, onCancel
+  form, onChange, categories, brands, onCreateBrand, error, loading, isEdit, itemCodeLocked,
+  suggesting, onSuggestItemCode, onSave, onCancel
 }: {
   form: ProductForm
   onChange: (f: ProductForm) => void
   categories: Category[]
+  brands: Brand[]
+  onCreateBrand: (name: string) => Promise<{ ok: true; brand: Brand } | { ok: false; message: string }>
   error: string
   loading: boolean
   isEdit: boolean
+  itemCodeLocked: boolean
+  suggesting: boolean
+  onSuggestItemCode: () => void
   onSave: () => void
   onCancel: () => void
 }) {
   const set = <K extends keyof ProductForm>(key: K, value: ProductForm[K]) =>
     onChange({ ...form, [key]: value })
+
+  const [addingBrand, setAddingBrand] = useState(false)
+  const [newBrandName, setNewBrandName] = useState('')
+  const [newBrandError, setNewBrandError] = useState('')
+  const [newBrandLoading, setNewBrandLoading] = useState(false)
+
+  const submitNewBrand = async () => {
+    setNewBrandLoading(true)
+    setNewBrandError('')
+    const res = await onCreateBrand(newBrandName)
+    setNewBrandLoading(false)
+    if (!res.ok) {
+      setNewBrandError(res.message)
+      return
+    }
+    onChange({ ...form, brandId: res.brand.id })
+    setAddingBrand(false)
+    setNewBrandName('')
+  }
+
+  /**
+   * Switching mode swaps the unit list, so a unit that no longer makes sense
+   * (m on a whole-unit product) falls back to that mode's default.
+   */
+  const setSellMode = (mode: SellMode) => {
+    const allowed = measuresFor(mode)
+    onChange({
+      ...form,
+      sellMode: mode,
+      unitOfMeasure: allowed.includes(form.unitOfMeasure)
+        ? form.unitOfMeasure
+        : defaultMeasureFor(mode)
+    })
+  }
+
+  // An inactive brand still on this product stays selectable so an edit
+  // doesn't silently drop it.
+  const brandOptions = brands.filter((b) => b.isActive || b.id === form.brandId)
 
   return (
     <div className="space-y-5">
@@ -891,11 +1577,77 @@ function ProductFormFields({
         <div className="grid grid-cols-2 gap-3">
           <div>
             <label className="block text-sm font-semibold mb-1.5 ml-1">Item Code *</label>
-            <Input value={form.itemCode} onChange={(e) => set('itemCode', e.target.value)} placeholder="e.g. FIN-WIRE-1.5-RED" className="h-11" disabled={isEdit} />
+            <div className="flex gap-2">
+              <Input
+                value={form.itemCode}
+                onChange={(e) => set('itemCode', normalizeItemCode(e.target.value))}
+                placeholder="e.g. FIN-WIRE-1.5-RED"
+                className="h-11 flex-1 font-mono"
+                disabled={itemCodeLocked}
+              />
+              {!isEdit && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={onSuggestItemCode}
+                  disabled={suggesting}
+                  className="h-11 shrink-0 gap-1.5"
+                >
+                  <Wand2 className="w-3.5 h-3.5" /> {suggesting ? '...' : 'Suggest'}
+                </Button>
+              )}
+            </div>
+            <p className="text-xs text-muted-foreground mt-1 ml-1">
+              {itemCodeLocked ? 'Locked — this product already has stock or sales history' : ITEM_CODE_HINT}
+            </p>
           </div>
           <div>
             <label className="block text-sm font-semibold mb-1.5 ml-1">Brand</label>
-            <Input value={form.brand} onChange={(e) => set('brand', e.target.value)} placeholder="e.g. Finolex" className="h-11" />
+            {addingBrand ? (
+              <div className="flex gap-2">
+                <Input
+                  value={newBrandName}
+                  onChange={(e) => setNewBrandName(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); submitNewBrand() } }}
+                  placeholder="New brand name"
+                  className="h-11 flex-1"
+                  autoFocus
+                />
+                <Button type="button" onClick={submitNewBrand} disabled={newBrandLoading} className="h-11 shrink-0">
+                  {newBrandLoading ? '...' : 'Add'}
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => { setAddingBrand(false); setNewBrandName(''); setNewBrandError('') }}
+                  className="h-11 shrink-0"
+                >
+                  Cancel
+                </Button>
+              </div>
+            ) : (
+              <div className="flex gap-2">
+                <select
+                  value={form.brandId}
+                  onChange={(e) => set('brandId', e.target.value)}
+                  className="flex-1 h-11 rounded-md border border-input bg-background px-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                >
+                  <option value="">— No brand —</option>
+                  {brandOptions.map((b) => (
+                    <option key={b.id} value={b.id}>{b.name}{b.isActive ? '' : ' (inactive)'}</option>
+                  ))}
+                </select>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => { setAddingBrand(true); setNewBrandError('') }}
+                  className="h-11 shrink-0 gap-1.5"
+                >
+                  <Plus className="w-3.5 h-3.5" /> Add brand
+                </Button>
+              </div>
+            )}
+            {newBrandError && <p className="text-xs text-red-600 mt-1 ml-1">{newBrandError}</p>}
           </div>
         </div>
         <div className="mt-3">
@@ -929,11 +1681,27 @@ function ProductFormFields({
               onChange={(e) => set('unitOfMeasure', e.target.value)}
               className="w-full h-11 rounded-md border border-input bg-background px-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
             >
-              {['pcs', 'box', 'roll', 'coil', 'mtr', 'kg', 'ltr', 'set', 'pair'].map((u) => (
+              {measuresFor(form.sellMode).map((u) => (
                 <option key={u} value={u}>{u}</option>
               ))}
             </select>
           </div>
+        </div>
+        <div className="mt-3">
+          <label className="block text-sm font-semibold mb-1.5 ml-1">Sold as</label>
+          <Segmented<SellMode>
+            value={form.sellMode}
+            onChange={setSellMode}
+            options={[
+              { value: 'UNIT', label: 'Whole units' },
+              { value: 'LENGTH', label: 'Cut to length' }
+            ]}
+          />
+          <p className="text-xs text-muted-foreground mt-1 ml-1">
+            {isLengthMode(form.sellMode)
+              ? `Stock is tracked as one total length in ${form.unitOfMeasure} and can be billed in fractions — e.g. 2.75 ${form.unitOfMeasure} off a coil.`
+              : `Stock is counted in whole ${form.unitOfMeasure} — quantities can't be fractional.`}
+          </p>
         </div>
       </div>
 
@@ -957,12 +1725,48 @@ function ProductFormFields({
         </div>
         <div className="grid grid-cols-2 gap-3">
           <div>
-            <label className="block text-sm font-semibold mb-1.5 ml-1">Warranty (days)</label>
-            <Input type="number" min="0" value={form.warrantyPeriodDays} onChange={(e) => set('warrantyPeriodDays', e.target.value)} className="h-11" />
+            <label className="block text-sm font-semibold mb-1.5 ml-1">Warranty</label>
+            <div className="flex gap-2">
+              <Input
+                type="number"
+                min="0"
+                value={form.warrantyValue}
+                onChange={(e) => set('warrantyValue', e.target.value)}
+                className="h-11 flex-1"
+              />
+              <select
+                value={form.warrantyUnit}
+                onChange={(e) => set('warrantyUnit', e.target.value as WarrantyUnit)}
+                className="h-11 w-28 shrink-0 rounded-md border border-input bg-background px-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+              >
+                <option value="days">Days</option>
+                <option value="months">Months</option>
+                <option value="years">Years</option>
+              </select>
+            </div>
+            <p className="text-xs text-muted-foreground mt-1 ml-1">
+              {formatWarranty(warrantyToDays(form.warrantyValue, form.warrantyUnit))}
+              {form.warrantyUnit !== 'days' && warrantyToDays(form.warrantyValue, form.warrantyUnit) > 0
+                ? ` · stored as ${warrantyToDays(form.warrantyValue, form.warrantyUnit)} days`
+                : ''}
+            </p>
           </div>
           <div>
             <label className="block text-sm font-semibold mb-1.5 ml-1">Min Stock Level</label>
-            <Input type="number" min="0" value={form.minStockLevel} onChange={(e) => set('minStockLevel', e.target.value)} className="h-11" />
+            <div className="relative">
+              <Input
+                type="number"
+                min="0"
+                step={qtyStep(form.sellMode)}
+                value={form.minStockLevel}
+                onChange={(e) => set('minStockLevel', e.target.value)}
+                className="h-11 pr-14"
+              />
+              <span className="absolute right-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">{form.unitOfMeasure}</span>
+            </div>
+            <p className="text-xs text-muted-foreground mt-1 ml-1">
+              Low-stock warning below {formatQtyWithUnit(parseQty(form.minStockLevel, form.sellMode), form.unitOfMeasure)}
+            </p>
           </div>
         </div>
       </div>
@@ -980,10 +1784,12 @@ function ProductFormFields({
 // ─── BatchFormFields ──────────────────────────────────────────────────────────
 
 function BatchFormFields({
-  form, onChange, suppliers, warehouses, error, loading, onSave, onCancel
+  form, onChange, sellMode, unitOfMeasure, suppliers, warehouses, error, loading, onSave, onCancel
 }: {
   form: BatchForm
   onChange: (f: BatchForm) => void
+  sellMode: SellMode
+  unitOfMeasure: string
   suppliers: Supplier[]
   warehouses: Warehouse[]
   error: string
@@ -1010,18 +1816,56 @@ function BatchFormFields({
         </div>
       </div>
 
-      <div className="grid grid-cols-2 gap-3">
-        <div>
-          <label className="block text-sm font-semibold mb-1.5 ml-1">Purchase Rate *</label>
-          <div className="relative">
-            <span className="absolute left-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">₹</span>
-            <Input type="number" min="0" step="0.01" value={form.purchaseRate} onChange={(e) => set('purchaseRate', e.target.value)} className="h-11 pl-7" placeholder="0.00" />
+      <div className="space-y-3">
+        <div className="grid grid-cols-3 gap-3">
+          <div>
+            <label className="block text-sm font-semibold mb-1.5 ml-1">Purchase Rate *</label>
+            <div className="relative">
+              <span className="absolute left-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">₹</span>
+              <Input type="number" min="0" step="0.01" value={form.purchaseRate} onChange={(e) => set('purchaseRate', e.target.value)} className="h-11 pl-7" placeholder="0.00" />
+            </div>
+          </div>
+          <div>
+            <label className="block text-sm font-semibold mb-1.5 ml-1">Rate basis</label>
+            <Segmented<'ex' | 'incl'>
+              value={form.rateIncludesGst ? 'incl' : 'ex'}
+              onChange={(v) => set('rateIncludesGst', v === 'incl')}
+              options={[{ value: 'ex', label: 'Excl. GST' }, { value: 'incl', label: 'Incl. GST' }]}
+              className="h-11"
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-semibold mb-1.5 ml-1">GST %</label>
+            <div className="relative">
+              <Input type="number" min="0" max="28" step="0.5" value={form.purchaseGstPct} onChange={(e) => set('purchaseGstPct', e.target.value)} className="h-11 pr-8" />
+              <span className="absolute right-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">%</span>
+            </div>
           </div>
         </div>
+
         <div>
           <label className="block text-sm font-semibold mb-1.5 ml-1">Received Qty *</label>
-          <Input type="number" min="1" value={form.receivedQty} onChange={(e) => set('receivedQty', e.target.value)} className="h-11" placeholder="0" />
+          <div className="relative">
+            <Input
+              type="number"
+              min="0"
+              step={qtyStep(sellMode)}
+              value={form.receivedQty}
+              onChange={(e) => set('receivedQty', e.target.value)}
+              className="h-11 pr-14"
+              placeholder="0"
+            />
+            <span className="absolute right-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">{unitOfMeasure}</span>
+          </div>
         </div>
+
+        <PurchaseCostReadout
+          rate={form.purchaseRate}
+          gstPct={form.purchaseGstPct}
+          includesGst={form.rateIncludesGst}
+          qty={parseQty(form.receivedQty, sellMode)}
+          uom={unitOfMeasure}
+        />
       </div>
 
       <div className="grid grid-cols-2 gap-3">
@@ -1074,16 +1918,20 @@ function BatchFormFields({
 
 type EditBatchForm = {
   purchaseRate: string
+  purchaseGstPct: string
+  rateIncludesGst: boolean
   warehouseId: string; supplierId: string
   receivedDate: string; receivedQty: string
   notes: string; isActive: boolean
 }
 
 function EditBatchFormFields({
-  form, onChange, warehouses, suppliers, error, loading, onSave, onCancel
+  form, onChange, sellMode, unitOfMeasure, warehouses, suppliers, error, loading, onSave, onCancel
 }: {
   form: EditBatchForm
   onChange: (f: EditBatchForm) => void
+  sellMode: SellMode
+  unitOfMeasure: string
   warehouses: Warehouse[]
   suppliers: Supplier[]
   error: string
@@ -1099,20 +1947,58 @@ function EditBatchFormFields({
       {error && <div className="p-3 bg-red-50 border border-red-200 rounded-md text-red-600 text-sm">{error}</div>}
 
       {/* Purchase Rate */}
-      <div>
-        <label className="block text-sm font-semibold mb-1.5 ml-1">Purchase Rate *</label>
-        <div className="relative">
-          <span className="absolute left-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">₹</span>
-          <Input type="number" min="0" step="0.01" value={form.purchaseRate} onChange={(e) => set('purchaseRate', e.target.value)} className="h-11 pl-7" />
+      <div className="grid grid-cols-3 gap-3">
+        <div>
+          <label className="block text-sm font-semibold mb-1.5 ml-1">Purchase Rate *</label>
+          <div className="relative">
+            <span className="absolute left-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">₹</span>
+            <Input type="number" min="0" step="0.01" value={form.purchaseRate} onChange={(e) => set('purchaseRate', e.target.value)} className="h-11 pl-7" />
+          </div>
+        </div>
+        <div>
+          <label className="block text-sm font-semibold mb-1.5 ml-1">Rate basis</label>
+          <Segmented<'ex' | 'incl'>
+            value={form.rateIncludesGst ? 'incl' : 'ex'}
+            onChange={(v) => set('rateIncludesGst', v === 'incl')}
+            options={[{ value: 'ex', label: 'Excl. GST' }, { value: 'incl', label: 'Incl. GST' }]}
+            className="h-11"
+          />
+        </div>
+        <div>
+          <label className="block text-sm font-semibold mb-1.5 ml-1">GST %</label>
+          <div className="relative">
+            <Input type="number" min="0" max="28" step="0.5" value={form.purchaseGstPct} onChange={(e) => set('purchaseGstPct', e.target.value)} className="h-11 pr-8" />
+            <span className="absolute right-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">%</span>
+          </div>
         </div>
       </div>
 
       {/* Qty */}
       <div>
         <label className="block text-sm font-semibold mb-1.5 ml-1">Received Qty</label>
-        <Input type="number" min="0" value={form.receivedQty} onChange={(e) => set('receivedQty', e.target.value)} className="h-11" />
-        <p className="text-xs text-muted-foreground mt-1 ml-1">Total qty received in this batch</p>
+        <div className="relative">
+          <Input
+            type="number"
+            min="0"
+            step={qtyStep(sellMode)}
+            value={form.receivedQty}
+            onChange={(e) => set('receivedQty', e.target.value)}
+            className="h-11 pr-14"
+          />
+          <span className="absolute right-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">{unitOfMeasure}</span>
+        </div>
+        <p className="text-xs text-muted-foreground mt-1 ml-1">
+          Total qty received in this batch — changing it shifts the remaining stock by the same amount.
+        </p>
       </div>
+
+      <PurchaseCostReadout
+        rate={form.purchaseRate}
+        gstPct={form.purchaseGstPct}
+        includesGst={form.rateIncludesGst}
+        qty={parseQty(form.receivedQty, sellMode)}
+        uom={unitOfMeasure}
+      />
 
       {/* Supplier & Warehouse */}
       <div className="grid grid-cols-2 gap-3">

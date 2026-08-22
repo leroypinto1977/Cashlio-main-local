@@ -8,6 +8,8 @@ import { Input } from '../components/ui/input'
 import { Modal } from '../components/Modal'
 import { apiFetch } from '../lib/api'
 import { printReceipt, type ReceiptBill, type ReceiptShop } from '../lib/receipt'
+import { computeInvoiceTotals } from '@shared/money'
+import { isLengthMode, parseQty, qtyStep, roundQty, formatQty } from '@shared/units'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -17,6 +19,8 @@ type Product = {
   name: string
   brand: string | null
   unitOfMeasure: string
+  /** 'UNIT' | 'LENGTH'. Older cached rows may omit it, so treat it as optional. */
+  sellMode?: string
   sellingRate: number
   gstPercentage: number
   totalStock: number
@@ -27,6 +31,7 @@ type CartItem = {
   itemCode: string
   productName: string
   unitOfMeasure: string
+  sellMode?: string
   unitRate: number
   gstPercentage: number
   quantity: number
@@ -269,8 +274,11 @@ export function BillingScreen({
   }
 
   // Barcode-scanner support — exact itemCode match on Enter adds qty 1.
+  // A cut-length product has no meaningful default quantity, so scanning one
+  // opens the length prompt instead of silently adding one metre.
   const addProductDirect = (p: Product) => {
     if (p.totalStock <= 0) return
+    if (isLengthMode(p.sellMode)) { selectProduct(p); return }
     setCartItems((prev) => {
       const idx = prev.findIndex((it) => it.productId === p.id)
       if (idx >= 0) {
@@ -283,7 +291,7 @@ export function BillingScreen({
       }
       const base: Omit<CartItem, 'lineTotal' | 'lineGstAmount'> = {
         productId: p.id, itemCode: p.itemCode,
-        productName: p.name, unitOfMeasure: p.unitOfMeasure,
+        productName: p.name, unitOfMeasure: p.unitOfMeasure, sellMode: p.sellMode,
         unitRate: p.sellingRate, gstPercentage: p.gstPercentage,
         quantity: 1, maxQty: p.totalStock,
         lineDiscountPct: 0, lineDiscountAmt: 0
@@ -318,7 +326,9 @@ export function BillingScreen({
 
   const confirmAddToCart = () => {
     if (!pendingProduct) return
-    const qty = Math.max(1, Math.min(parseInt(pendingQty) || 1, pendingProduct.totalStock))
+    const parsed = parseQty(pendingQty, pendingProduct.sellMode)
+    const step = qtyStep(pendingProduct.sellMode)
+    const qty = Math.max(step, Math.min(parsed || step, pendingProduct.totalStock))
     setCartItems((prev) => {
       const idx = prev.findIndex((it) => it.productId === pendingProduct.id)
       if (idx >= 0) {
@@ -341,10 +351,21 @@ export function BillingScreen({
     setPendingQty('1')
   }
 
+  /** Sets an absolute quantity — cut-length lines are typed, not stepped. */
+  const setQty = (idx: number, raw: string) => {
+    setCartItems((prev) => prev.map((it, i) => {
+      if (i !== idx) return it
+      const parsed = parseQty(raw, it.sellMode)
+      if (parsed <= 0) return it
+      const next = { ...it, quantity: roundQty(Math.min(parsed, it.maxQty)) }
+      return { ...next, ...calcLine(next) }
+    }))
+  }
+
   const updateQty = (idx: number, delta: number) => {
     setCartItems((prev) => prev.map((it, i) => {
       if (i !== idx) return it
-      const q = Math.max(1, Math.min(it.quantity + delta, it.maxQty))
+      const q = roundQty(Math.max(qtyStep(it.sellMode), Math.min(it.quantity + delta, it.maxQty)))
       const next = { ...it, quantity: q }
       return { ...next, ...calcLine(next) }
     }))
@@ -620,19 +641,29 @@ export function BillingScreen({
                         type="button"
                         disabled={outOfStock}
                         onClick={() => selectProduct(p)}
-                        className={`w-full flex items-center justify-between px-4 py-3 text-left transition-colors border-b last:border-b-0 ${outOfStock ? 'opacity-40 cursor-not-allowed bg-zinc-50' : 'hover:bg-zinc-50 cursor-pointer'}`}
+                        className={`w-full flex items-center justify-between px-4 py-3 text-left transition-colors border-b last:border-b-0 ${outOfStock ? 'cursor-not-allowed bg-zinc-50/70' : 'hover:bg-zinc-50 cursor-pointer'}`}
                       >
                         <div className="min-w-0">
-                          <p className="font-medium text-zinc-900 text-sm truncate">{p.name}</p>
+                          <p className={`font-medium text-sm truncate ${outOfStock ? 'text-zinc-500' : 'text-zinc-900'}`}>
+                            {p.name}
+                          </p>
                           <p className="text-xs text-muted-foreground font-mono mt-0.5">
                             {p.itemCode}{p.brand ? ` · ${p.brand}` : ''}
                           </p>
                         </div>
                         <div className="ml-4 text-right shrink-0">
-                          <p className="font-semibold text-zinc-900 text-sm">₹{fmt(p.sellingRate)}</p>
-                          <p className={`text-xs mt-0.5 ${outOfStock ? 'text-red-500' : 'text-emerald-600'}`}>
-                            {outOfStock ? 'Out of stock' : `${p.totalStock} ${p.unitOfMeasure}`}
+                          <p className={`font-semibold text-sm ${outOfStock ? 'text-zinc-500' : 'text-zinc-900'}`}>
+                            ₹{fmt(p.sellingRate)}
                           </p>
+                          {outOfStock ? (
+                            <span className="inline-block mt-0.5 px-1.5 py-0.5 rounded bg-zinc-200 text-zinc-600 text-[10px] font-semibold uppercase tracking-wide">
+                              No stock
+                            </span>
+                          ) : (
+                            <p className="text-xs mt-0.5 text-emerald-600">
+                              {formatQty(p.totalStock)} {p.unitOfMeasure}
+                            </p>
+                          )}
                         </div>
                       </button>
                     )
@@ -652,15 +683,18 @@ export function BillingScreen({
                 <div className="flex-1 min-w-0">
                   <p className="font-semibold text-zinc-900 text-sm truncate">{pendingProduct.name}</p>
                   <p className="text-xs text-muted-foreground font-mono mt-0.5">
-                    ₹{fmt(pendingProduct.sellingRate)} · {pendingProduct.totalStock} {pendingProduct.unitOfMeasure} in stock
+                    ₹{fmt(pendingProduct.sellingRate)} per {pendingProduct.unitOfMeasure} · {formatQty(pendingProduct.totalStock)} {pendingProduct.unitOfMeasure} in stock
                   </p>
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
-                  <label className="text-xs font-semibold text-zinc-600 whitespace-nowrap">Qty:</label>
+                  <label className="text-xs font-semibold text-zinc-600 whitespace-nowrap">
+                    {isLengthMode(pendingProduct.sellMode) ? 'Length:' : 'Qty:'}
+                  </label>
                   <input
                     ref={pendingQtyRef}
                     type="number"
-                    min="1"
+                    min={qtyStep(pendingProduct.sellMode)}
+                    step={qtyStep(pendingProduct.sellMode)}
                     max={pendingProduct.totalStock}
                     value={pendingQty}
                     onChange={(e) => setPendingQty(e.target.value)}
@@ -719,25 +753,44 @@ export function BillingScreen({
                         <p className="text-xs text-muted-foreground font-mono mt-0.5">{it.itemCode}</p>
                       </td>
                       <td className="px-3 py-3">
-                        <div className="flex items-center justify-center gap-1">
-                          <button
-                            type="button"
-                            onClick={() => updateQty(idx, -1)}
-                            disabled={it.quantity <= 1}
-                            className="w-7 h-7 rounded-md border flex items-center justify-center hover:bg-zinc-100 disabled:opacity-30 transition-colors"
-                          >
-                            <Minus className="w-3 h-3" />
-                          </button>
-                          <span className="w-8 text-center font-semibold tabular-nums">{it.quantity}</span>
-                          <button
-                            type="button"
-                            onClick={() => updateQty(idx, 1)}
-                            disabled={it.quantity >= it.maxQty}
-                            className="w-7 h-7 rounded-md border flex items-center justify-center hover:bg-zinc-100 disabled:opacity-30 transition-colors"
-                          >
-                            <Plus className="w-3 h-3" />
-                          </button>
-                        </div>
+                        {/* Stepping a cut length by 0.001 would be useless, so
+                            those lines are typed directly instead. */}
+                        {isLengthMode(it.sellMode) ? (
+                          <div className="flex items-center justify-center gap-1">
+                            <input
+                              type="number"
+                              min={qtyStep(it.sellMode)}
+                              step={qtyStep(it.sellMode)}
+                              max={it.maxQty}
+                              defaultValue={formatQty(it.quantity)}
+                              key={`${it.productId}-${it.quantity}`}
+                              onBlur={(e) => setQty(idx, e.target.value)}
+                              onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
+                              className="w-20 h-7 px-2 text-sm font-semibold text-center rounded-md border tabular-nums focus:border-zinc-900 focus:outline-none"
+                            />
+                            <span className="text-xs text-muted-foreground">{it.unitOfMeasure}</span>
+                          </div>
+                        ) : (
+                          <div className="flex items-center justify-center gap-1">
+                            <button
+                              type="button"
+                              onClick={() => updateQty(idx, -1)}
+                              disabled={it.quantity <= 1}
+                              className="w-7 h-7 rounded-md border flex items-center justify-center hover:bg-zinc-100 disabled:opacity-30 transition-colors"
+                            >
+                              <Minus className="w-3 h-3" />
+                            </button>
+                            <span className="w-8 text-center font-semibold tabular-nums">{formatQty(it.quantity)}</span>
+                            <button
+                              type="button"
+                              onClick={() => updateQty(idx, 1)}
+                              disabled={it.quantity >= it.maxQty}
+                              className="w-7 h-7 rounded-md border flex items-center justify-center hover:bg-zinc-100 disabled:opacity-30 transition-colors"
+                            >
+                              <Plus className="w-3 h-3" />
+                            </button>
+                          </div>
+                        )}
                         {it.quantity >= it.maxQty && (
                           <p className="text-center text-xs text-amber-600 mt-0.5">max</p>
                         )}

@@ -18,7 +18,10 @@
     "build:unpack": "npm run build && electron-builder --dir",
     "build:win": "npm run build && electron-builder --win",
     "build:mac": "electron-vite build && electron-builder --mac",
-    "build:linux": "electron-vite build && electron-builder --linux"
+    "build:linux": "electron-vite build && electron-builder --linux",
+    "test:shared": "tsc src/shared/money.ts src/shared/validation.ts src/shared/units.ts --outDir .test-build --module commonjs --target es2020 --skipLibCheck && node test/shared.test.cjs",
+    "test:e2e": "./scripts/test-e2e.sh",
+    "test": "npm run test:shared && npm run test:e2e"
   },
   "dependencies": {
     "@electron-toolkit/preload": "^3.0.2",
