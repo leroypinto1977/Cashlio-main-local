@@ -1256,7 +1256,9 @@ export function BillingScreen({
             {/* Where the money landed */}
             {settlement.tendered > 0 && settlement.changeGiven > 0 && (
               <div className="flex items-center justify-between p-3 rounded-lg text-sm font-semibold bg-emerald-50 text-emerald-800">
-                <span>Change to return</span>
+                {/* "Change to return" read as if the customer were returning
+                    something. This is money going back across the counter. */}
+                <span>Change to give back</span>
                 <span className="text-base">₹{fmt(settlement.changeGiven)}</span>
               </div>
             )}

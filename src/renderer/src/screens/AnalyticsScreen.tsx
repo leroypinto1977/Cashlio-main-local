@@ -27,12 +27,18 @@ const TENDERS = [
   { key: 'CHEQUE', label: 'Cheque', icon: Receipt, bar: 'bg-amber-500', chip: 'bg-amber-50', fg: 'text-amber-600' }
 ] as const
 
+// These names match what /analytics/summary actually returns. They used to
+// read totalQty / totalRevenue, which the server has never sent — so the
+// units count rendered as NaN and every bar in the top-products chart was
+// sized from `undefined`. This is why the screen looked like it never
+// updated after a sale.
 type TopProduct = {
-  productId: string
   productName: string
   itemCode: string
-  totalQty: number
-  totalRevenue: number
+  qty: number
+  revenue: number
+  taxableValue: number
+  cost: number
 }
 
 type AnalyticsSummary = {
@@ -63,6 +69,9 @@ const fmt = (n: number) =>
   new Intl.NumberFormat('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(n)
 
 const fmtInt = (n: number) => new Intl.NumberFormat('en-IN').format(n)
+// Cut-to-length goods sell in fractions — 6.5 m of pipe is not 6 or 7 items.
+const fmtQty = (n: number) =>
+  new Intl.NumberFormat('en-IN', { maximumFractionDigits: 3 }).format(n)
 
 const PERIOD_LABELS: Record<Period, string> = {
   today: 'Today',
@@ -125,7 +134,7 @@ export function AnalyticsScreen({ token }: { token: string | null }): React.JSX.
     : []
 
   const topRevProduct = summary?.topProducts[0]
-  const topRevAmt = topRevProduct?.totalRevenue ?? 0
+  const topRevAmt = topRevProduct?.revenue ?? 0
 
   return (
     <div className="space-y-6">
@@ -254,7 +263,7 @@ export function AnalyticsScreen({ token }: { token: string | null }): React.JSX.
                 </div>
               </div>
               <p className="text-2xl font-bold text-zinc-900">
-                {fmtInt(summary.topProducts.reduce((s, p) => s + p.totalQty, 0))}
+                {fmtQty(summary.topProducts.reduce((s, p) => s + p.qty, 0))}
               </p>
               <p className="text-xs text-zinc-400 mt-1">Units across {summary.topProducts.length} products</p>
             </div>
@@ -458,18 +467,18 @@ export function AnalyticsScreen({ token }: { token: string | null }): React.JSX.
               ) : (
                 <div className="space-y-2">
                   {summary.topProducts.map((prod) => {
-                    const pct = topRevAmt > 0 ? (prod.totalRevenue / topRevAmt) * 100 : 0
+                    const pct = topRevAmt > 0 ? (prod.revenue / topRevAmt) * 100 : 0
                     return (
-                      <div key={prod.productId}>
+                      <div key={prod.itemCode}>
                         <div className="flex items-center justify-between mb-0.5">
                           <div className="flex-1 min-w-0 mr-4">
                             <span className="text-sm font-medium text-zinc-800 truncate block">
                               {prod.productName}
                             </span>
-                            <span className="text-xs text-zinc-400">{prod.itemCode} · {fmtInt(prod.totalQty)} units</span>
+                            <span className="text-xs text-zinc-400">{prod.itemCode} · {fmtQty(prod.qty)} sold</span>
                           </div>
                           <span className="text-sm font-semibold text-zinc-900 shrink-0">
-                            ₹{fmt(prod.totalRevenue)}
+                            ₹{fmt(prod.revenue)}
                           </span>
                         </div>
                         <div className="h-1.5 bg-zinc-100 rounded-full overflow-hidden">
