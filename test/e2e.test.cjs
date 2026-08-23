@@ -980,6 +980,59 @@ async function api(path, opts = {}, token) {
     afterReturn.estimatedMarginPct < 100, afterReturn.estimatedMarginPct)
 
 
+  console.log('\n— a sale is dated when it happened —')
+  {
+    // Its own product: earlier blocks deactivate and drain the shared ones.
+    const dateProd = await prisma.product.create({ data: {
+      itemCode: 'DATE-TEST-001', name: 'Dating Item', categoryId: cat.id,
+      sellingRate: 118, gstPercentage: 18 }})
+    await prisma.productBatch.create({ data: {
+      productId: dateProd.id, batchCode: 'D', uniqueStockCode: 'DATE-TEST-001/D',
+      purchaseRate: 60, receivedQty: 100, currentQty: 100 }})
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000)
+    r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+      originDeviceId: device.id, paymentMethod: 'CASH', soldAt: twoHoursAgo.toISOString(),
+      payments: [{ method: 'CASH', amount: 118 }],
+      items: [{ productId: dateProd.id, quantity: 1, unitRate: 118, gstPercentage: 18, lineDiscountPct: 0, lineDiscountAmt: 0 }] })}, token)
+    t('a backdated sale is accepted', r.status === 201, r.body)
+    const stored = await prisma.bill.findUnique({ where: { id: r.body.bill.id } })
+    t('the sale keeps the time the till reported',
+      Math.abs(stored.paidAt.getTime() - twoHoursAgo.getTime()) < 2000,
+      { stored: stored.paidAt, sent: twoHoursAgo })
+
+    // A till with a broken clock must not be able to write into next year's
+    // books, or into a month already closed and filed.
+    for (const [label, when] of [
+      ['a future date', new Date(Date.now() + 48 * 60 * 60 * 1000)],
+      ['a date beyond the backdating window', new Date(Date.now() - 90 * 24 * 60 * 60 * 1000)],
+      ['a nonsense date', 'not-a-date']
+    ]) {
+      const resp = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+        originDeviceId: device.id, paymentMethod: 'CASH',
+        soldAt: when instanceof Date ? when.toISOString() : when,
+        payments: [{ method: 'CASH', amount: 118 }],
+        items: [{ productId: dateProd.id, quantity: 1, unitRate: 118, gstPercentage: 18, lineDiscountPct: 0, lineDiscountAmt: 0 }] })}, token)
+      t(`${label} is accepted, not rejected`, resp.status === 201, resp.body)
+      const row = await prisma.bill.findUnique({ where: { id: resp.body.bill.id } })
+      t(`${label} is clamped to now`, Math.abs(row.paidAt.getTime() - Date.now()) < 60000, row.paidAt)
+    }
+
+    // Credit ageing has to run from the sale, not from the sync.
+    const backCust = await prisma.customer.create({ data: {
+      name: 'Backdated Buyer', phone: '9000000078', creditLimit: 50000, creditDays: 10 }})
+    const threeDaysAgo = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000)
+    r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+      originDeviceId: device.id, customerId: backCust.id, payments: [],
+      soldAt: threeDaysAgo.toISOString(),
+      items: [{ productId: dateProd.id, quantity: 1, unitRate: 118, gstPercentage: 18, lineDiscountPct: 0, lineDiscountAmt: 0 }] })}, token)
+    t('a backdated credit sale is accepted', r.status === 201, r.body)
+    const credit = await prisma.bill.findUnique({ where: { id: r.body.bill.id } })
+    const expectedDue = new Date(threeDaysAgo.getTime() + 10 * 24 * 60 * 60 * 1000)
+    t('the due date counts from the sale, not the sync',
+      Math.abs(credit.dueDate.getTime() - expectedDue.getTime()) < 2000,
+      { due: credit.dueDate, expected: expectedDue })
+  }
+
   console.log('\n— the change feed cannot skip a commit —')
   {
     // Drain whatever the earlier tests generated so the window is clean.

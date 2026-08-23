@@ -2230,6 +2230,37 @@ type CreateBillArgs = {
   discountAmount: number
   notes: string | null
   clientLocalId: string | null
+  /// When the sale actually happened, as reported by the terminal. An offline
+  /// bill can reach the server hours later; stamping it with arrival time puts
+  /// takings on the wrong day and ages credit from the wrong date. Clamped
+  /// before it gets here — see `resolveSoldAt`.
+  soldAt?: Date
+}
+
+/**
+ * Decide the time a sale happened.
+ *
+ * The terminal knows; the server only knows when the bill arrived, which for
+ * an offline bill can be hours or a day later. So the terminal's clock is
+ * preferred — but it is a machine in a shop, and a wrong one would let a sale
+ * land in next year's books or on a day already closed and reported.
+ *
+ * So it is trusted only within a window: never ahead of the server (a few
+ * minutes of skew allowed), and never more than a fortnight back, which is
+ * far longer than any real outage and short enough to bound the damage.
+ * Anything outside falls back to now, which is at worst the behaviour we
+ * already had.
+ */
+const SOLD_AT_MAX_BACKDATE_MS = 14 * 24 * 60 * 60 * 1000
+const SOLD_AT_MAX_SKEW_MS = 5 * 60 * 1000
+function resolveSoldAt(raw: unknown, now = new Date()): Date {
+  if (raw == null || raw === '') return now
+  const t = new Date(String(raw))
+  const ms = t.getTime()
+  if (!Number.isFinite(ms)) return now
+  if (ms > now.getTime() + SOLD_AT_MAX_SKEW_MS) return now
+  if (ms < now.getTime() - SOLD_AT_MAX_BACKDATE_MS) return now
+  return t
 }
 
 // Performs FIFO stock deduction and creates a PAID Bill row inside a tx.
@@ -2237,6 +2268,9 @@ type CreateBillArgs = {
 async function createBillCore(tx: TxClient, args: CreateBillArgs, billNumber?: string) {
   // Allocated inside the tx: if the sale rolls back, the number is released.
   const invoiceNumber = billNumber || (await allocateNumber(tx, 'INV'))
+  // The moment of sale, not the moment of arrival. Everything dated off the
+  // bill — the day's takings, credit ageing, warranty cover — hangs on this.
+  const soldAt = args.soldAt ?? new Date()
   type FinalLine = {
     productId: string; itemCode: string; productName: string; unitOfMeasure: string
     quantity: number; unitRate: number; gstPercentage: number
@@ -2496,7 +2530,8 @@ async function createBillCore(tx: TxClient, args: CreateBillArgs, billNumber?: s
       changeGiven,
       paidAmount: round2(settlement.paidAmount + creditApplied),
       balanceDue: settlement.balanceDue,
-      dueDate: settlement.balanceDue > 0 ? dueDateFor(new Date(), creditDays) : null,
+      paidAt: soldAt,
+      dueDate: settlement.balanceDue > 0 ? dueDateFor(soldAt, creditDays) : null,
       notes: args.notes,
       payments: {
         create: tenders.map((t) => ({
@@ -2521,7 +2556,6 @@ async function createBillCore(tx: TxClient, args: CreateBillArgs, billNumber?: s
   // than later from a report — a warranty that has to be remembered into
   // existence is one that gets forgotten. Lines are created in order, so
   // they pair with `lines` by index.
-  const soldAt = created.paidAt
   for (const [i, line] of lines.entries()) {
     if (line.warrantyPeriodDays <= 0) continue
     const item = created.items[i]
@@ -2874,7 +2908,8 @@ app.post('/api/v1/bills', requireActiveLicense(), requireAuth(), async (req, res
         req.user!.role === 'SUPER_ADMIN' && Boolean(req.body.allowPriceOverride),
       discountAmount: Number(discountAmount),
       notes: notes || null,
-      clientLocalId: clientLocalId ? String(clientLocalId) : null
+      clientLocalId: clientLocalId ? String(clientLocalId) : null,
+      soldAt: resolveSoldAt(req.body.soldAt)
     }, billNumber))
 
     return res.status(201).json({ success: true, bill: serializeBill(bill) })
