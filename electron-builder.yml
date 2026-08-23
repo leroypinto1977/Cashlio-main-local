@@ -1,5 +1,5 @@
-appId: com.electron.app
-productName: main-local
+appId: com.cashlio.manager
+productName: Cashlio Manager
 directories:
   buildResources: build
 files:
@@ -11,9 +11,6 @@ files:
   - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
 asarUnpack:
   - resources/**
-extraResources:
-  - from: resources/.env
-    to: .env
 win:
   executableName: main-local
 nsis:

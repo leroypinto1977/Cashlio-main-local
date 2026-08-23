@@ -1,4 +1,4 @@
-import { app, shell, BrowserWindow, ipcMain } from 'electron'
+import { app, shell, BrowserWindow, ipcMain, dialog } from 'electron'
 import { join } from 'path'
 import os from 'os'
 import fs from 'fs'
@@ -8,10 +8,59 @@ import icon from '../../resources/icon.png?asset'
 import { startExpressServer } from './server'
 import { runBackup, listBackups, getBackupStatus, getBackupDir, startBackupSchedule } from './backup'
 import { startRefreshLoop, checkClockTamper } from './licenseGuard'
+import { randomBytes } from 'crypto'
+import { dirname } from 'path'
+
+/**
+ * Per-install session secret.
+ *
+ * This used to ship inside the package, which meant every copy of the app
+ * signed cashier sessions with the same key — anyone holding the installer
+ * could mint a SUPER_ADMIN token for every shop running that build. The
+ * secret is now generated once on this machine and never leaves it.
+ */
+function ensureSessionSecret(): void {
+  if (process.env.JWT_SECRET) return
+  const file = join(app.getPath('userData'), 'session.key')
+  try {
+    if (fs.existsSync(file)) {
+      const existing = fs.readFileSync(file, 'utf8').trim()
+      if (existing) {
+        process.env.JWT_SECRET = existing
+        return
+      }
+    }
+    const secret = randomBytes(48).toString('base64url')
+    fs.mkdirSync(dirname(file), { recursive: true })
+    // Owner-only: any local account that can read this can forge sessions.
+    fs.writeFileSync(file, secret, { mode: 0o600 })
+    process.env.JWT_SECRET = secret
+    console.log('[env] generated a new session secret for this installation')
+  } catch (err) {
+    console.error('[env] could not establish a session secret:', err)
+  }
+}
+
+/**
+ * Refuses to run half-configured. Without these the app boots looking
+ * healthy: logins fail with an opaque 500, or — worse — the licence guard
+ * throws, hits its deliberate fail-open, and the shop runs unlicensed
+ * forever with nothing to notice.
+ */
+function validateEnv(): string[] {
+  const required: [string, string][] = [
+    ['DATABASE_URL', 'the local PostgreSQL connection string'],
+    ['JWT_SECRET', 'the session signing secret'],
+    ['LICENSE_PUBLIC_KEY', 'the licence verification key']
+  ]
+  return required
+    .filter(([k]) => !process.env[k])
+    .map(([k, why]) => `${k} — ${why}`)
+}
 
 // Load .env at runtime. In dev, electron-vite already injects from ./.env.
-// In a packaged build, look in (1) a user-editable file in userData and
-// (2) the bundled resources/.env that ships with the DMG. First file wins.
+// In a packaged build this reads a user-editable file in userData. Nothing
+// secret ships inside the package any more.
 function loadRuntimeEnv(): void {
   const candidates = [
     join(app.getPath('userData'), '.env'),
@@ -31,6 +80,24 @@ function loadRuntimeEnv(): void {
   if (!process.env.LOCAL_SERVER_PORT) process.env.LOCAL_SERVER_PORT = '52001'
 }
 loadRuntimeEnv()
+ensureSessionSecret()
+
+// A rejected promise in the main process terminates Electron under Node 20+.
+// Without these the manager app vanishes mid-shift, taking every till's
+// server with it, and leaves nothing behind to explain why.
+function logCrash(kind: string, err: unknown): void {
+  const line = `[${new Date().toISOString()}] ${kind}: ${
+    err instanceof Error ? (err.stack ?? err.message) : String(err)
+  }\n`
+  console.error(line)
+  try {
+    fs.appendFileSync(join(app.getPath('userData'), 'crash.log'), line)
+  } catch {
+    // Logging must never be the thing that brings the app down.
+  }
+}
+process.on('unhandledRejection', (reason) => logCrash('unhandledRejection', reason))
+process.on('uncaughtException', (err) => logCrash('uncaughtException', err))
 
 function getMacAddress(): string {
   const interfaces = os.networkInterfaces()
@@ -85,7 +152,7 @@ function createWindow(): void {
 // Some APIs can only be used after this event occurs.
 app.whenReady().then(async () => {
   // Set app user model id for windows
-  electronApp.setAppUserModelId('com.electron')
+  electronApp.setAppUserModelId('com.cashlio.manager')
 
   // Default open or close DevTools by F12 in development
   // and ignore CommandOrControl + R in production.
@@ -150,6 +217,22 @@ app.whenReady().then(async () => {
     return { ok: true, dir }
   })
 
+  // Refuse to run half-configured. A missing licence key in particular would
+  // otherwise hit the licence guard's deliberate fail-open and leave the shop
+  // running unlicensed with nothing to notice.
+  const missing = validateEnv()
+  if (missing.length > 0) {
+    const detail = missing.map((m) => `  • ${m}`).join('\n')
+    console.error(`[env] Refusing to start. Missing configuration:\n${detail}`)
+    dialog.showErrorBox(
+      'Cashlio cannot start',
+      `This installation is missing required configuration:\n\n${detail}\n\n` +
+        `Add it to:\n${join(app.getPath('userData'), '.env')}\n\nSee SETUP.md.`
+    )
+    app.quit()
+    return
+  }
+
   // Phase 4: clock-tampering check before anything else. If the user has
   // rolled their clock backwards more than an hour past the last server-issued
   // timestamp, refuse to start the API. The window keeps loading so they see
@@ -169,7 +252,16 @@ app.whenReady().then(async () => {
     const port = await startExpressServer(parseInt(process.env.LOCAL_SERVER_PORT || '52001'))
     console.log(`Express API started on port ${port}`)
   } catch (err) {
-    console.error('Failed to start Express API', err)
+    // A dead API means every till in the shop is offline. Say so, rather than
+    // opening a normal-looking window attached to nothing.
+    logCrash('expressStartFailed', err)
+    dialog.showErrorBox(
+      'Cashlio could not start its server',
+      `The billing service failed to start, so tills cannot connect.\n\n` +
+        `${err instanceof Error ? err.message : String(err)}\n\n` +
+        `The most common cause is another program using port ` +
+        `${process.env.LOCAL_SERVER_PORT || '52001'}.`
+    )
   }
 
   // Phase 4: daily license refresh worker. First tick is delayed 30s by the

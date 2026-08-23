@@ -683,6 +683,89 @@ async function api(path, opts = {}, token) {
   r = await api('/api/v1/warranties?status=ACTIVE', {}, token)
   t('ACTIVE filter excludes it', !r.body.warranties.some(w => w.id === lapsed.id))
 
+
+  console.log('\n— pricing cannot be dictated by the client —')
+  const goldProd = await prisma.product.create({ data: {
+    itemCode: 'GOLD-TEST-001', name: 'Expensive Item', categoryId: cat.id,
+    sellingRate: 45000, gstPercentage: 18 }})
+  await prisma.productBatch.create({ data: {
+    productId: goldProd.id, batchCode: 'G', uniqueStockCode: 'GOLD-TEST-001/G',
+    purchaseRate: 30000, receivedQty: 20, currentQty: 20 }})
+  const gline = (o) => [{ productId: goldProd.id, quantity: 1, unitRate: 45000,
+    gstPercentage: 18, lineDiscountPct: 0, lineDiscountAmt: 0, ...o }]
+
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, paymentMethod: 'CASH', items: gline({ quantity: 10, lineDiscountPct: 100 }) })}, cashierToken)
+  t('100% line discount refused', r.status === 400 && r.body.error === 'INVALID_LINE_DISCOUNT', r.body)
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, paymentMethod: 'CASH', items: gline({ lineDiscountAmt: 99999 }) })}, cashierToken)
+  t('oversized flat discount refused', r.status === 400 && r.body.error === 'INVALID_LINE_DISCOUNT', r.body)
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, paymentMethod: 'CASH', items: gline({ unitRate: 1 }) })}, cashierToken)
+  t('cashier cannot set the price', r.status === 403 && r.body.error === 'PRICE_OVERRIDE_NOT_ALLOWED', r.body)
+  t('refusal names the real price', r.body.catalogueRate === 45000, r.body.catalogueRate)
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, paymentMethod: 'CASH', items: gline({ unitRate: 1 }), allowPriceOverride: true })}, cashierToken)
+  t('cashier cannot self-grant the override', r.status === 403, r.body)
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, paymentMethod: 'CASH', items: gline({ gstPercentage: 0 }) })}, cashierToken)
+  t('client GST rate is ignored', r.status === 201 && r.body.bill.gstAmount > 0, r.body.bill?.gstAmount)
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, paymentMethod: 'CASH', items: gline({ unitRate: 40000 }), allowPriceOverride: true })}, token)
+  t('super admin may override the price', r.status === 201 && r.body.bill.totalAmount === 40000, r.body.bill?.totalAmount)
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, paymentMethod: 'CASH', items: gline({}) })}, cashierToken)
+  t('an ordinary sale is unaffected', r.status === 201 && r.body.bill.totalAmount === 45000, r.body.bill?.totalAmount)
+  // a deactivated product must not be sellable through the API
+  await prisma.product.update({ where: { id: goldProd.id }, data: { isActive: false } })
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, paymentMethod: 'CASH', items: gline({}) })}, cashierToken)
+  t('deactivated product cannot be sold', r.status === 409 && r.body.error === 'PRODUCT_INACTIVE', r.body)
+  await prisma.product.update({ where: { id: goldProd.id }, data: { isActive: true } })
+
+  console.log('\n— user management —')
+  r = await api('/api/v1/users', {}, cashierToken)
+  t('cashier cannot list users', r.status === 403, r.body)
+  r = await api('/api/v1/users', {}, token)
+  t('super admin can list users', r.status === 200 && r.body.users.length >= 2, r.body.users?.length)
+  r = await api('/api/v1/users', { method: 'POST', body: JSON.stringify({
+    username: 'till2', password: 'password123', role: 'CASHIER' })}, token)
+  t('cashier account created', r.status === 201 && r.body.user.role === 'CASHIER', r.body)
+  const till2 = r.body.user.id
+  r = await api('/api/v1/auth/login', { method: 'POST', body: JSON.stringify({ username: 'till2', password: 'password123' }) })
+  t('the new cashier can sign in', r.status === 200 && !!r.body.token, r.body)
+  const till2Token = r.body.token
+  r = await api('/api/v1/bills/nonexistent/void', { method: 'POST' }, till2Token)
+  t('and is genuinely limited to cashier rights', r.status === 403, r.body)
+  r = await api('/api/v1/users', { method: 'POST', body: JSON.stringify({
+    username: 'till2', password: 'password123', role: 'CASHIER' })}, token)
+  t('duplicate username refused', r.status === 409 && r.body.error === 'USERNAME_TAKEN', r.body)
+  r = await api('/api/v1/users', { method: 'POST', body: JSON.stringify({
+    username: 'x', password: 'password123', role: 'CASHIER' })}, token)
+  t('short username refused', r.status === 400, r.body)
+  r = await api('/api/v1/users', { method: 'POST', body: JSON.stringify({
+    username: 'till3', password: 'short', role: 'CASHIER' })}, token)
+  t('weak password refused', r.status === 400 && r.body.error === 'PASSWORD_TOO_SHORT', r.body)
+  r = await api('/api/v1/users', { method: 'POST', body: JSON.stringify({
+    username: 'till3', password: 'password123', role: 'OWNER' })}, token)
+  t('unknown role refused', r.status === 400 && r.body.error === 'INVALID_ROLE', r.body)
+  // the shop must never be able to lock itself out
+  const adminUser = await prisma.user.findFirst({ where: { username: 'admin' } })
+  r = await api(`/api/v1/users/${adminUser.id}`, { method: 'PUT', body: JSON.stringify({ role: 'CASHIER' }) }, token)
+  t('the only super admin cannot demote themselves', r.status === 409 && r.body.error === 'LAST_SUPER_ADMIN', r.body)
+  r = await api(`/api/v1/users/${adminUser.id}`, { method: 'DELETE' }, token)
+  t('and cannot delete themselves', r.status === 409, r.body)
+  r = await api(`/api/v1/users/${till2}`, { method: 'PUT', body: JSON.stringify({ password: 'newpassword1' }) }, token)
+  t('password can be reset', r.status === 200, r.body)
+  r = await api('/api/v1/auth/login', { method: 'POST', body: JSON.stringify({ username: 'till2', password: 'newpassword1' }) })
+  t('the new password works', r.status === 200, r.body)
+  r = await api(`/api/v1/users/${till2}`, { method: 'DELETE' }, token)
+  t('an unused account can be removed', r.status === 200, r.body)
+  // an account that has billed keeps its history
+  const cashierUser = await prisma.user.findFirst({ where: { username: 'cashier1' } })
+  r = await api(`/api/v1/users/${cashierUser.id}`, { method: 'DELETE' }, token)
+  t('an account with bills is protected', r.status === 409 && r.body.error === 'USER_HAS_BILLS', r.body)
+
   console.log(`\n${pass} passed, ${fail} failed`)
   await prisma.$disconnect()
   process.exit(fail ? 1 : 0)

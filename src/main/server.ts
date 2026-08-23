@@ -52,6 +52,13 @@ declare global {
   }
 }
 
+/**
+ * The largest per-line discount anyone may give without it being a price
+ * override. Higher than a normal markdown, low enough that "100% off" is
+ * no longer a way to walk stock out of the door.
+ */
+const MAX_LINE_DISCOUNT_PCT = 90
+
 const prisma = new PrismaClient()
 const app = express()
 
@@ -552,10 +559,35 @@ app.post('/api/v1/system/setup-profile', async (req, res) => {
 
     const passwordHash = await bcrypt.hash(String(adminPassword), 10)
     await prisma.user.create({
-      data: { username: String(adminUsername).trim(), passwordHash, role: 'SUPER_ADMIN' }
+      data: { username: String(adminUsername).trim().toLowerCase(), passwordHash, role: 'SUPER_ADMIN' }
     })
 
-    return res.status(200).json({ success: true })
+    // Optionally create the first till account in the same step. Without a
+    // cashier the shop has to run every terminal as the super admin, which
+    // makes every role gate in this file meaningless.
+    let cashierCreated = false
+    if (req.body?.cashierUsername) {
+      const cashierName = validateUsername(req.body.cashierUsername)
+      if (!cashierName.ok) return fieldError(res, cashierName)
+      const cashierPass = validatePassword(req.body?.cashierPassword)
+      if (!cashierPass.ok) return fieldError(res, cashierPass)
+      if (cashierName.value === String(adminUsername).trim().toLowerCase()) {
+        return res.status(409).json({
+          success: false, error: 'USERNAME_TAKEN',
+          message: 'The till account needs a different username from the manager account.'
+        })
+      }
+      await prisma.user.create({
+        data: {
+          username: cashierName.value,
+          passwordHash: await bcrypt.hash(cashierPass.value, 10),
+          role: 'CASHIER'
+        }
+      })
+      cashierCreated = true
+    }
+
+    return res.status(200).json({ success: true, cashierCreated })
   } catch (err) {
     console.error('Error in setup-profile:', err)
     return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
@@ -677,6 +709,180 @@ app.get('/api/v1/system/authorized-clients', async (_req, res) => {
     return res.status(200).json({ success: true, clients })
   } catch (err) {
     console.error('Error fetching authorized clients:', err)
+    return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
+  }
+})
+
+// ─── Users ────────────────────────────────────────────────────────────────────
+
+/**
+ * Until this existed the only account in a shop was the super admin created
+ * at setup, which had to be typed into every till — so every SUPER_ADMIN gate
+ * in this file was decorative, and the cashier *was* the admin.
+ */
+const ROLES = ['SUPER_ADMIN', 'CASHIER'] as const
+type Role = (typeof ROLES)[number]
+const isRole = (v: unknown): v is Role => typeof v === 'string' && (ROLES as readonly string[]).includes(v)
+
+/** Usernames are typed at a till, so keep them simple and unambiguous. */
+function validateUsername(raw: string): FieldResult {
+  const v = String(raw ?? '').trim().toLowerCase()
+  if (!v) return { ok: false, error: 'USERNAME_REQUIRED', message: 'Username is required.' }
+  if (v.length < 3 || v.length > 32) {
+    return { ok: false, error: 'USERNAME_INVALID', message: 'Username must be 3–32 characters.' }
+  }
+  if (!/^[a-z0-9._-]+$/.test(v)) {
+    return {
+      ok: false, error: 'USERNAME_INVALID',
+      message: 'Username may use letters, digits, and . _ - only.'
+    }
+  }
+  return { ok: true, value: v }
+}
+
+function validatePassword(raw: string): FieldResult {
+  const v = String(raw ?? '')
+  if (v.length < 8) {
+    return { ok: false, error: 'PASSWORD_TOO_SHORT', message: 'Password must be at least 8 characters.' }
+  }
+  if (v.length > 200) {
+    return { ok: false, error: 'PASSWORD_TOO_LONG', message: 'Password is too long.' }
+  }
+  return { ok: true, value: v }
+}
+
+app.get('/api/v1/users', requireAuth(['SUPER_ADMIN']), async (_req, res) => {
+  try {
+    const users = await prisma.user.findMany({
+      select: { id: true, username: true, role: true, createdAt: true, _count: { select: { bills: true } } },
+      orderBy: [{ role: 'asc' }, { username: 'asc' }]
+    })
+    return res.json({
+      success: true,
+      users: users.map((u) => ({
+        id: u.id, username: u.username, role: u.role,
+        createdAt: u.createdAt, billCount: u._count.bills
+      }))
+    })
+  } catch (err) {
+    console.error(err)
+    return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
+  }
+})
+
+app.post('/api/v1/users', requireAuth(['SUPER_ADMIN']), async (req, res) => {
+  try {
+    const nameCheck = validateUsername(req.body?.username)
+    if (!nameCheck.ok) return fieldError(res, nameCheck)
+    const passCheck = validatePassword(req.body?.password)
+    if (!passCheck.ok) return fieldError(res, passCheck)
+    if (!isRole(req.body?.role)) {
+      return res.status(400).json({
+        success: false, error: 'INVALID_ROLE', message: 'Choose either Cashier or Super Admin.'
+      })
+    }
+
+    const user = await prisma.user.create({
+      data: {
+        username: nameCheck.value,
+        passwordHash: await bcrypt.hash(passCheck.value, 10),
+        role: req.body.role
+      },
+      select: { id: true, username: true, role: true, createdAt: true }
+    })
+    return res.status(201).json({ success: true, user })
+  } catch (err: unknown) {
+    if ((err as { code?: string }).code === 'P2002') {
+      return res.status(409).json({
+        success: false, error: 'USERNAME_TAKEN', message: 'That username is already in use.'
+      })
+    }
+    console.error(err)
+    return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
+  }
+})
+
+app.put('/api/v1/users/:id', requireAuth(['SUPER_ADMIN']), async (req, res) => {
+  try {
+    const id = String(req.params.id)
+    const target = await prisma.user.findUnique({ where: { id } })
+    if (!target) return res.status(404).json({ success: false, error: 'NOT_FOUND' })
+
+    const data: Record<string, unknown> = {}
+
+    if (req.body?.password !== undefined) {
+      const passCheck = validatePassword(req.body.password)
+      if (!passCheck.ok) return fieldError(res, passCheck)
+      data.passwordHash = await bcrypt.hash(passCheck.value, 10)
+    }
+
+    if (req.body?.role !== undefined) {
+      if (!isRole(req.body.role)) {
+        return res.status(400).json({ success: false, error: 'INVALID_ROLE' })
+      }
+      // Never let the last super admin demote themselves — the shop would be
+      // locked out of its own settings with no way back in.
+      if (target.role === 'SUPER_ADMIN' && req.body.role !== 'SUPER_ADMIN') {
+        const admins = await prisma.user.count({ where: { role: 'SUPER_ADMIN' } })
+        if (admins <= 1) {
+          return res.status(409).json({
+            success: false, error: 'LAST_SUPER_ADMIN',
+            message: 'This is the only super admin. Promote someone else first.'
+          })
+        }
+      }
+      data.role = req.body.role
+    }
+
+    const user = await prisma.user.update({
+      where: { id }, data,
+      select: { id: true, username: true, role: true, createdAt: true }
+    })
+    return res.json({ success: true, user })
+  } catch (err) {
+    console.error(err)
+    return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
+  }
+})
+
+app.delete('/api/v1/users/:id', requireAuth(['SUPER_ADMIN']), async (req, res) => {
+  try {
+    const id = String(req.params.id)
+    if (id === req.user!.userId) {
+      return res.status(409).json({
+        success: false, error: 'CANNOT_DELETE_SELF',
+        message: 'You cannot remove your own account.'
+      })
+    }
+    const target = await prisma.user.findUnique({
+      where: { id },
+      include: { _count: { select: { bills: true } } }
+    })
+    if (!target) return res.status(404).json({ success: false, error: 'NOT_FOUND' })
+
+    if (target.role === 'SUPER_ADMIN') {
+      const admins = await prisma.user.count({ where: { role: 'SUPER_ADMIN' } })
+      if (admins <= 1) {
+        return res.status(409).json({
+          success: false, error: 'LAST_SUPER_ADMIN',
+          message: 'This is the only super admin and cannot be removed.'
+        })
+      }
+    }
+
+    // Bills reference their cashier, and a sale must always name who made it.
+    if (target._count.bills > 0) {
+      return res.status(409).json({
+        success: false, error: 'USER_HAS_BILLS',
+        message: `${target.username} has ${target._count.bills} bill${target._count.bills === 1 ? '' : 's'} against their name and cannot be deleted. Change their password to revoke access.`,
+        billCount: target._count.bills
+      })
+    }
+
+    await prisma.user.delete({ where: { id } })
+    return res.json({ success: true })
+  } catch (err) {
+    console.error(err)
     return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
   }
 })
@@ -2001,6 +2207,9 @@ type CreateBillArgs = {
   settleInFull?: boolean
   /// Set by a SUPER_ADMIN to let a bill exceed the customer's credit limit.
   allowCreditOverride: boolean
+  /// Set by a SUPER_ADMIN to bill a line at something other than the
+  /// catalogue price. A cashier's request for this is ignored.
+  allowPriceOverride?: boolean
   discountAmount: number
   notes: string | null
   clientLocalId: string | null
@@ -2028,12 +2237,71 @@ async function createBillCore(tx: TxClient, args: CreateBillArgs, billNumber?: s
     const product = await tx.product.findUnique({ where: { id: rawItem.productId } })
     if (!product) throw Object.assign(new Error('PRODUCT_NOT_FOUND'), { code: 'PRODUCT_NOT_FOUND' })
 
+    // A deactivated product must not be sellable through the API just because
+    // it is still reachable by id.
+    if (!product.isActive) {
+      throw Object.assign(new Error('PRODUCT_INACTIVE'), {
+        code: 'PRODUCT_INACTIVE', productName: product.name
+      })
+    }
+
+    // Price and tax come from the product master, never from the request.
+    //
+    // These used to be taken from the request body unchecked, which meant
+    // anyone who could reach the API could bill any item at any price: a
+    // 100% line discount, or a unit rate of 1, emptied the stock room for
+    // nothing and left a clean PAID invoice behind. A stale terminal mirror
+    // did the same thing accidentally. A genuine price override is still
+    // possible, but only a super admin may ask for one.
+    const catalogueRate = round2(Number(product.sellingRate))
+    const requestedRate = round2(Number(rawItem.unitRate))
+    const wantsOverride =
+      Number.isFinite(requestedRate) && requestedRate >= 0 && requestedRate !== catalogueRate
+
+    if (wantsOverride && !args.allowPriceOverride) {
+      throw Object.assign(new Error('PRICE_OVERRIDE_NOT_ALLOWED'), {
+        code: 'PRICE_OVERRIDE_NOT_ALLOWED',
+        productName: product.name,
+        catalogueRate,
+        requestedRate
+      })
+    }
+    const unitRate = wantsOverride ? requestedRate : catalogueRate
+
+    // Discounts are bounded so they cannot be used as a back door to the
+    // same result the rate check just closed.
+    const lineDiscountPct = Number(rawItem.lineDiscountPct) || 0
+    const lineDiscountAmt = Number(rawItem.lineDiscountAmt) || 0
+    if (lineDiscountPct < 0 || lineDiscountPct > MAX_LINE_DISCOUNT_PCT) {
+      throw Object.assign(new Error('INVALID_LINE_DISCOUNT'), {
+        code: 'INVALID_LINE_DISCOUNT', productName: product.name,
+        maxPercent: MAX_LINE_DISCOUNT_PCT
+      })
+    }
+
     // Cut-length products bill in fractions of their unit; everything else is
     // floored to whole pieces regardless of what the client sent.
-    const item = { ...rawItem, quantity: parseQty(rawItem.quantity, product.sellMode) }
+    const item = {
+      ...rawItem,
+      quantity: parseQty(rawItem.quantity, product.sellMode),
+      unitRate,
+      // The statutory rate for this product. A wrong rate here is a filing
+      // offence for the shop, so it is not the client's to choose.
+      gstPercentage: round2(Number(product.gstPercentage)),
+      lineDiscountPct,
+      lineDiscountAmt
+    }
     if (item.quantity <= 0) {
       throw Object.assign(new Error('INVALID_QUANTITY'), {
         code: 'INVALID_QUANTITY', productName: product.name
+      })
+    }
+
+    const maxFlatDiscount = round2(item.quantity * unitRate * (MAX_LINE_DISCOUNT_PCT / 100))
+    if (lineDiscountAmt < 0 || lineDiscountAmt > maxFlatDiscount) {
+      throw Object.assign(new Error('INVALID_LINE_DISCOUNT'), {
+        code: 'INVALID_LINE_DISCOUNT', productName: product.name,
+        maxAmount: maxFlatDiscount
       })
     }
 
@@ -2539,9 +2807,12 @@ app.post('/api/v1/bills', requireActiveLicense(), requireAuth(), async (req, res
       amountReceived: amountReceived != null ? Number(amountReceived) : null,
       tenders: tender.tenders,
       settleInFull: tender.settleInFull,
-      // Only a super-admin can put a customer past their credit limit.
+      // Only a super-admin can put a customer past their credit limit, or
+      // bill a line at something other than the catalogue price.
       allowCreditOverride:
         req.user!.role === 'SUPER_ADMIN' && Boolean(req.body.allowCreditOverride),
+      allowPriceOverride:
+        req.user!.role === 'SUPER_ADMIN' && Boolean(req.body.allowPriceOverride),
       discountAmount: Number(discountAmount),
       notes: notes || null,
       clientLocalId: clientLocalId ? String(clientLocalId) : null
@@ -2554,6 +2825,8 @@ app.post('/api/v1/bills', requireActiveLicense(), requireAuth(), async (req, res
       reason?: string; customerName?: string; creditLimit?: number
       currentOutstanding?: number; newBalance?: number; projectedOutstanding?: number
       overBy?: number; needsOverride?: boolean
+      catalogueRate?: number; requestedRate?: number
+      maxPercent?: number; maxAmount?: number
     }
     if (e.code === 'CREDIT_NOT_ALLOWED') {
       const messages: Record<string, string> = {
@@ -2573,6 +2846,41 @@ app.post('/api/v1/bills', requireActiveLicense(), requireAuth(), async (req, res
         projectedOutstanding: e.projectedOutstanding,
         overBy: e.overBy,
         needsOverride: e.needsOverride
+      })
+    }
+    if (e.code === 'PRICE_OVERRIDE_NOT_ALLOWED') {
+      return res.status(403).json({
+        success: false,
+        error: 'PRICE_OVERRIDE_NOT_ALLOWED',
+        message: `"${e.productName}" is priced at ₹${e.catalogueRate}. A manager must authorise a different price.`,
+        productName: e.productName,
+        catalogueRate: e.catalogueRate,
+        requestedRate: e.requestedRate,
+        needsOverride: true
+      })
+    }
+    if (e.code === 'INVALID_LINE_DISCOUNT') {
+      return res.status(400).json({
+        success: false,
+        error: 'INVALID_LINE_DISCOUNT',
+        message: `That discount on "${e.productName}" is outside what a bill may carry.`,
+        productName: e.productName,
+        maxPercent: e.maxPercent,
+        maxAmount: e.maxAmount
+      })
+    }
+    if (e.code === 'PRODUCT_INACTIVE') {
+      return res.status(409).json({
+        success: false,
+        error: 'PRODUCT_INACTIVE',
+        message: `"${e.productName}" is no longer sold.`,
+        productName: e.productName
+      })
+    }
+    if (e.code === 'INVALID_QUANTITY') {
+      return res.status(400).json({
+        success: false, error: 'INVALID_QUANTITY',
+        message: `Enter a quantity for "${e.productName}".`, productName: e.productName
       })
     }
     if (e.code === 'INSUFFICIENT_STOCK') {
@@ -2743,6 +3051,8 @@ app.post('/api/v1/bills/:id/exchange', requireActiveLicense(), requireAuth(['SUP
         tenders: [],
         settleInFull: true,
         allowCreditOverride: true,
+        // The replacement rate is resolved from the product master above.
+        allowPriceOverride: true,
         discountAmount: 0,
         notes: `Exchange for ${original.billNumber} (refund ${refund.billNumber})`,
         clientLocalId: null
@@ -2769,6 +3079,8 @@ app.post('/api/v1/bills/:id/exchange', requireActiveLicense(), requireAuth(['SUP
       reason?: string; customerName?: string; creditLimit?: number
       currentOutstanding?: number; newBalance?: number; projectedOutstanding?: number
       overBy?: number; needsOverride?: boolean
+      catalogueRate?: number; requestedRate?: number
+      maxPercent?: number; maxAmount?: number
     }
     if (e.code === 'NOT_FOUND') return res.status(404).json({ success: false, error: 'NOT_FOUND' })
     if (e.code === 'ORIGINAL_NOT_PAID') return res.status(409).json({ success: false, error: 'ORIGINAL_NOT_PAID', currentStatus: e.currentStatus })
@@ -2796,6 +3108,41 @@ app.post('/api/v1/bills/:id/exchange', requireActiveLicense(), requireAuth(['SUP
         projectedOutstanding: e.projectedOutstanding,
         overBy: e.overBy,
         needsOverride: e.needsOverride
+      })
+    }
+    if (e.code === 'PRICE_OVERRIDE_NOT_ALLOWED') {
+      return res.status(403).json({
+        success: false,
+        error: 'PRICE_OVERRIDE_NOT_ALLOWED',
+        message: `"${e.productName}" is priced at ₹${e.catalogueRate}. A manager must authorise a different price.`,
+        productName: e.productName,
+        catalogueRate: e.catalogueRate,
+        requestedRate: e.requestedRate,
+        needsOverride: true
+      })
+    }
+    if (e.code === 'INVALID_LINE_DISCOUNT') {
+      return res.status(400).json({
+        success: false,
+        error: 'INVALID_LINE_DISCOUNT',
+        message: `That discount on "${e.productName}" is outside what a bill may carry.`,
+        productName: e.productName,
+        maxPercent: e.maxPercent,
+        maxAmount: e.maxAmount
+      })
+    }
+    if (e.code === 'PRODUCT_INACTIVE') {
+      return res.status(409).json({
+        success: false,
+        error: 'PRODUCT_INACTIVE',
+        message: `"${e.productName}" is no longer sold.`,
+        productName: e.productName
+      })
+    }
+    if (e.code === 'INVALID_QUANTITY') {
+      return res.status(400).json({
+        success: false, error: 'INVALID_QUANTITY',
+        message: `Enter a quantity for "${e.productName}".`, productName: e.productName
       })
     }
     if (e.code === 'INSUFFICIENT_STOCK') {
