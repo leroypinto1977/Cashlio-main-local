@@ -16,8 +16,10 @@ fi
 echo "▸ recreating scratch database ${DB_NAME}"
 psql -U "$PG_USER" -q -c "DROP DATABASE IF EXISTS ${DB_NAME};" -c "CREATE DATABASE ${DB_NAME};"
 
-echo "▸ applying schema"
-npx prisma db push --skip-generate >/dev/null
+# Built from the migration files, not db push, so every test run also proves
+# the migrations produce a schema the server actually works against.
+echo "▸ applying migrations"
+npx prisma migrate deploy >/dev/null
 
 echo "▸ bundling server"
 mkdir -p .test-build
