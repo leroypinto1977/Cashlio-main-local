@@ -57,6 +57,10 @@ model AuthorizedClient {
   // terminals mint globally-unique bill numbers offline without server
   // coordination.
   terminalCode String?  @unique
+  /// Set when a till is taken off the branch. The row stays because bills name
+  /// the terminal they were rung up on; this is what stops it holding a
+  /// licence seat.
+  retiredAt    DateTime?
   bills        Bill[]
 }
 
@@ -86,6 +90,15 @@ model User {
   username     String   @unique
   passwordHash String
   role         String   @default("CASHIER")
+  /// A cashier who has left. Kept rather than deleted because their name is
+  /// on every bill they ever made; turning this off ends their access at the
+  /// next request without disturbing the history.
+  isActive     Boolean  @default(true)
+  /// Bumped whenever access should be cut off mid-session — a password change,
+  /// a demotion, a dismissal. A session carrying an older number is refused,
+  /// which is what makes "sign this person out" mean something before their
+  /// twelve-hour token would have expired on its own.
+  tokenVersion Int      @default(0)
   createdAt    DateTime @default(now())
   bills        Bill[]
   payments     Payment[]

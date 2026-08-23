@@ -980,6 +980,96 @@ async function api(path, opts = {}, token) {
     afterReturn.estimatedMarginPct < 100, afterReturn.estimatedMarginPct)
 
 
+  console.log('\n— access ends when you say it does —')
+  {
+    const cashier = await api('/api/v1/users', { method: 'POST', body: JSON.stringify({
+      username: 'till_hand', password: 'goodpassword1', role: 'CASHIER' })}, token)
+    t('a cashier can be created', cashier.status === 201, cashier.body)
+    const cashierId = cashier.body.user.id
+    const signIn = async (password = 'goodpassword1') =>
+      api('/api/v1/auth/login', { method: 'POST', body: JSON.stringify({ username: 'till_hand', password }) })
+
+    let s2 = await signIn()
+    t('the cashier can sign in', s2.status === 200, s2.body)
+    let cashierToken = s2.body.token
+
+    let probe = await api('/api/v1/products?limit=1', {}, cashierToken)
+    t('and use the API', probe.status === 200, probe.status)
+
+    // The role has to come from the database, not from what the token claims.
+    const forged = require('jsonwebtoken').sign(
+      { userId: cashierId, role: 'SUPER_ADMIN', tv: 0 }, process.env.JWT_SECRET, { expiresIn: '1h' })
+    const escalate = await api('/api/v1/users', { method: 'POST', body: JSON.stringify({
+      username: 'smuggled', password: 'goodpassword1', role: 'SUPER_ADMIN' })}, forged)
+    eqp('a token claiming a role it does not have is refused', escalate.status, 403)
+
+    // Switching the account off ends the session that is already open.
+    const off = await api(`/api/v1/users/${cashierId}`, { method: 'PUT', body: JSON.stringify({ isActive: false }) }, token)
+    t('the account can be switched off', off.status === 200, off.body)
+    probe = await api('/api/v1/products?limit=1', {}, cashierToken)
+    eqp('the open session stops working at once', probe.status, 403)
+    s2 = await signIn()
+    eqp('and they cannot sign back in', s2.status, 403)
+
+    const on = await api(`/api/v1/users/${cashierId}`, { method: 'PUT', body: JSON.stringify({ isActive: true }) }, token)
+    t('the account can be switched back on', on.status === 200, on.body)
+    s2 = await signIn()
+    t('and they can sign in again', s2.status === 200, s2.body)
+    cashierToken = s2.body.token
+
+    // A password change signs the old session out.
+    await api(`/api/v1/users/${cashierId}`, { method: 'PUT', body: JSON.stringify({ password: 'differentpass9' }) }, token)
+    probe = await api('/api/v1/products?limit=1', {}, cashierToken)
+    eqp('changing the password ends the old session', probe.status, 401)
+    s2 = await signIn('differentpass9')
+    t('the new password works', s2.status === 200, s2.body)
+
+    // The last super admin cannot switch themselves off, or be switched off.
+    const selfOff = await api(`/api/v1/users/${admin.id}`, { method: 'PUT', body: JSON.stringify({ isActive: false }) }, token)
+    eqp('you cannot switch off your own account', selfOff.status, 409)
+  }
+
+  console.log('\n— guessing a password takes more than a minute —')
+  {
+    let last
+    for (let i = 0; i < 12; i++) {
+      last = await api('/api/v1/auth/login', { method: 'POST', body: JSON.stringify({
+        username: 'admin', password: `wrong-${i}` }) })
+    }
+    eqp('repeated failures are throttled', last.status, 429)
+    const legit = await api('/api/v1/auth/login', { method: 'POST', body: JSON.stringify({
+      username: 'admin', password: 'password123' }) })
+    eqp('...including for the right password, once locked', legit.status, 429)
+  }
+
+  console.log('\n— the network is not a credential —')
+  {
+    const bare = await api('/api/v1/system/pair-client', { method: 'POST', body: JSON.stringify({
+      macAddress: 'DE:AD:BE:EF:00:01', friendlyName: 'Rogue' }) })
+    eqp('pairing without a token is refused', bare.status, 401)
+    const listed = await api('/api/v1/system/authorized-clients', {})
+    eqp('listing the tills without a token is refused', listed.status, 401)
+
+    const paired = await api('/api/v1/system/pair-client', { method: 'POST', body: JSON.stringify({
+      macAddress: 'DE:AD:BE:EF:00:02', friendlyName: 'Counter 2' }) }, token)
+    t('a manager can pair a till', paired.status === 200, paired.body)
+
+    const before = (await api('/api/v1/system/authorized-clients', {}, token)).body.clients.length
+    const unpair = await api(`/api/v1/system/authorized-clients/${paired.body.clientId}`, { method: 'DELETE' }, token)
+    t('a till with no sales is removed outright',
+      unpair.status === 200 && unpair.body.retired === false, unpair.body)
+    const after = (await api('/api/v1/system/authorized-clients', {}, token)).body.clients.length
+    eqp('...and stops taking up a seat', before - after, 1)
+
+    // The original till has sales against it, so it is retired, not erased.
+    const retire = await api(`/api/v1/system/authorized-clients/${device.id}`, { method: 'DELETE' }, token)
+    t('a till that has traded is retired instead', retire.status === 200 && retire.body.retired === true, retire.body)
+    const still = await prisma.authorizedClient.findUnique({ where: { id: device.id } })
+    t('...and its row survives for the bills that name it', still !== null && still.retiredAt !== null, still)
+    const bills = await prisma.bill.count({ where: { originDeviceId: device.id } })
+    t('...with its sales intact', bills > 0, bills)
+  }
+
   console.log('\n— the same sale submitted twice is one sale —')
   {
     const idemProd = await prisma.product.create({ data: {

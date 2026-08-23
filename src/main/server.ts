@@ -65,8 +65,42 @@ const app = express()
 type TxClient = Parameters<Parameters<typeof prisma.$transaction>[0]>[0]
 type DbClient = TxClient | typeof prisma
 
-app.use(cors())
-app.use(express.json())
+/**
+ * Who may read this API from a browser.
+ *
+ * It answered every origin with a wildcard, which meant any web page anyone in
+ * the shop happened to open — an ad frame on a phone joined to the same Wi-Fi
+ * is enough — could call this server from the visitor's browser and read the
+ * replies. The token lives in the till's local storage and is sent by script,
+ * not by a cookie, so the page could not have stolen it directly; it could,
+ * however, read every customer, every bill and every price out of a server
+ * that trusted it purely for being on the network.
+ *
+ * The only browsers meant to reach this are the app's own windows. In a
+ * packaged build those load from file:, which sends `Origin: null`; in
+ * development they load from a local Vite server. Nothing else is allowed a
+ * CORS header at all, which is what makes a browser refuse to hand the
+ * response back to the page that asked.
+ *
+ * Requests with no Origin header — the apps' own main processes, curl,
+ * anything that is not a browser — are unaffected. That is not a hole: those
+ * clients were never subject to the same-origin policy, and every route worth
+ * protecting requires a token regardless.
+ */
+const LOCAL_ORIGIN = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin || origin === 'null' || origin === 'file://') return callback(null, true)
+      if (LOCAL_ORIGIN.test(origin)) return callback(null, true)
+      // No header, rather than an error: the request still runs for non-browser
+      // callers, and a browser blocks the page from reading the answer.
+      return callback(null, false)
+    },
+    credentials: false
+  })
+)
+app.use(express.json({ limit: '2mb' }))
 
 // ─── License lock-out middleware (Phase 4) ─────────────────────────────────────
 //
@@ -99,25 +133,87 @@ function requireActiveLicense() {
 
 // ─── Auth Middleware ───────────────────────────────────────────────────────────
 
+/**
+ * Who a token-holder currently is, according to the database.
+ *
+ * The role used to come out of the token and was never questioned again, so a
+ * cashier promoted to super-admin for an afternoon stayed one until their
+ * token expired, and a dismissed one kept full access for twelve hours. The
+ * database decides now.
+ *
+ * Every request would otherwise become an extra query, so answers are held
+ * briefly. The window is short and — more to the point — every route that
+ * changes a user drops that user's entry, so dismissing someone takes effect
+ * on their next request rather than ten seconds later.
+ */
+type AuthUser = { role: string; isActive: boolean; tokenVersion: number }
+const USER_CACHE_TTL_MS = 10_000
+const userCache = new Map<string, { at: number; user: AuthUser | null }>()
+
+function forgetUser(userId: string): void {
+  userCache.delete(userId)
+}
+
+async function loadAuthUser(userId: string): Promise<AuthUser | null> {
+  const hit = userCache.get(userId)
+  if (hit && Date.now() - hit.at < USER_CACHE_TTL_MS) return hit.user
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { role: true, isActive: true, tokenVersion: true }
+  })
+  userCache.set(userId, { at: Date.now(), user })
+  return user
+}
+
 function requireAuth(roles?: string[]) {
-  return (req: Request, res: Response, next: NextFunction) => {
+  return async (req: Request, res: Response, next: NextFunction) => {
     const authHeader = req.headers.authorization
     if (!authHeader?.startsWith('Bearer ')) {
       return res.status(401).json({ success: false, error: 'UNAUTHORIZED' })
     }
+    let decoded: { userId: string; role: string; tv?: number }
     try {
-      const decoded = jwt.verify(
-        authHeader.slice(7),
-        process.env.JWT_SECRET as string
-      ) as { userId: string; role: string }
-      req.user = decoded
-      if (roles && !roles.includes(decoded.role)) {
-        return res.status(403).json({ success: false, error: 'FORBIDDEN' })
+      decoded = jwt.verify(authHeader.slice(7), process.env.JWT_SECRET as string) as {
+        userId: string
+        role: string
+        tv?: number
       }
-      return next()
     } catch {
       return res.status(401).json({ success: false, error: 'INVALID_TOKEN' })
     }
+
+    let current: AuthUser | null
+    try {
+      current = await loadAuthUser(decoded.userId)
+    } catch (e) {
+      // The database is the authority on identity. If it cannot be reached we
+      // refuse rather than fall back to the token's own claims, which is
+      // exactly the situation this check exists to cover.
+      console.error('Auth lookup failed:', e)
+      return res.status(503).json({ success: false, error: 'AUTH_UNAVAILABLE' })
+    }
+
+    if (!current) {
+      return res.status(401).json({ success: false, error: 'ACCOUNT_REMOVED' })
+    }
+    if (!current.isActive) {
+      return res.status(403).json({
+        success: false,
+        error: 'ACCOUNT_DISABLED',
+        message: 'This account has been switched off. Ask a manager.'
+      })
+    }
+    // A password change, a demotion or a dismissal bumps this, which ends any
+    // session issued before it — the point of being able to sign someone out.
+    if ((decoded.tv ?? 0) !== current.tokenVersion) {
+      return res.status(401).json({ success: false, error: 'SESSION_REVOKED' })
+    }
+
+    req.user = { userId: decoded.userId, role: current.role }
+    if (roles && !roles.includes(current.role)) {
+      return res.status(403).json({ success: false, error: 'FORBIDDEN' })
+    }
+    return next()
   }
 }
 
@@ -607,7 +703,15 @@ app.post('/api/v1/system/setup-profile', async (req, res) => {
   }
 })
 
-app.post('/api/v1/system/pair-client', async (req, res) => {
+/**
+ * Admit a till to this branch.
+ *
+ * This used to answer anyone. On a shop's Wi-Fi that meant a stranger could
+ * burn every seat the licence allows with invented MAC addresses, and there
+ * was no way to take one back. Pairing is now a manager's act: the till
+ * collects a super-admin's credentials once, at setup, and never stores them.
+ */
+app.post('/api/v1/system/pair-client', requireAuth(['SUPER_ADMIN']), async (req, res) => {
   try {
     const { macAddress, friendlyName } = req.body
 
@@ -633,7 +737,8 @@ app.post('/api/v1/system/pair-client', async (req, res) => {
     }
     const maxSystems = decoded?.maxSystemsPerBranch || 3
 
-    const currentClients = await prisma.authorizedClient.count()
+    // Retired tills don't hold a seat — that is the point of retiring them.
+    const currentClients = await prisma.authorizedClient.count({ where: { retiredAt: null } })
     const existing = await prisma.authorizedClient.findUnique({ where: { macAddress } })
     if (!existing && currentClients >= maxSystems) {
       return res.status(403).json({ success: false, error: 'LICENSE_LIMIT_REACHED' })
@@ -694,17 +799,102 @@ app.post('/api/v1/system/pair-client', async (req, res) => {
   }
 })
 
+/**
+ * Failed sign-in attempts, per username and per source address.
+ *
+ * A shop password is four to five characters of whatever the owner could
+ * remember, on a server that answers to anyone on the same Wi-Fi. Without a
+ * limit, guessing the whole space takes minutes. Held in memory rather than
+ * the database: the counter should not survive a restart of the server, and
+ * writing a row per failed guess is its own denial of service.
+ *
+ * Keyed on both the username and the address so one person hammering an
+ * account cannot lock out the shop from a different till, and one machine
+ * cannot sweep every username from the same place.
+ */
+const LOGIN_WINDOW_MS = 15 * 60 * 1000
+const LOGIN_MAX_FAILURES = 10
+const loginFailures = new Map<string, { count: number; first: number }>()
+
+function loginKeys(username: string, ip: string): string[] {
+  return [`u:${username.toLowerCase()}`, `a:${ip}`]
+}
+
+function loginBlockedFor(keys: string[], now = Date.now()): number {
+  let waitMs = 0
+  for (const k of keys) {
+    const e = loginFailures.get(k)
+    if (!e) continue
+    if (now - e.first > LOGIN_WINDOW_MS) {
+      loginFailures.delete(k)
+      continue
+    }
+    if (e.count >= LOGIN_MAX_FAILURES) {
+      waitMs = Math.max(waitMs, LOGIN_WINDOW_MS - (now - e.first))
+    }
+  }
+  return waitMs
+}
+
+function noteLoginFailure(keys: string[], now = Date.now()): void {
+  for (const k of keys) {
+    const e = loginFailures.get(k)
+    if (!e || now - e.first > LOGIN_WINDOW_MS) loginFailures.set(k, { count: 1, first: now })
+    else e.count++
+  }
+  // The map is keyed by username and address, both attacker-chosen, so it
+  // needs a ceiling of its own.
+  if (loginFailures.size > 5000) {
+    for (const [k, e] of loginFailures) {
+      if (now - e.first > LOGIN_WINDOW_MS) loginFailures.delete(k)
+    }
+  }
+}
+
+function clearLoginFailures(keys: string[]): void {
+  for (const k of keys) loginFailures.delete(k)
+}
+
 app.post('/api/v1/auth/login', async (req, res) => {
   try {
-    const { username, password } = req.body
-    const user = await prisma.user.findUnique({ where: { username } })
+    const username = String(req.body?.username ?? '')
+    const password = String(req.body?.password ?? '')
+    const keys = loginKeys(username, req.ip ?? 'unknown')
+
+    const waitMs = loginBlockedFor(keys)
+    if (waitMs > 0) {
+      const minutes = Math.max(1, Math.ceil(waitMs / 60000))
+      return res.status(429).json({
+        success: false,
+        error: 'TOO_MANY_ATTEMPTS',
+        message: `Too many failed sign-ins. Try again in ${minutes} minute${minutes === 1 ? '' : 's'}.`,
+        retryAfterSeconds: Math.ceil(waitMs / 1000)
+      })
+    }
+
+    const user = username ? await prisma.user.findUnique({ where: { username } }) : null
 
     if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
+      noteLoginFailure(keys)
       return res.status(401).json({ success: false, error: 'INVALID_CREDENTIALS' })
     }
 
+    // A dismissed cashier's password still matches; their account is what
+    // stopped being valid. Say so rather than implying they mistyped it.
+    if (!user.isActive) {
+      return res.status(403).json({
+        success: false,
+        error: 'ACCOUNT_DISABLED',
+        message: 'This account has been switched off. Ask a manager.'
+      })
+    }
+
+    clearLoginFailures(keys)
+
     const token = jwt.sign(
-      { userId: user.id, role: user.role },
+      // `tv` pins the session to the account as it stands now. Bump the user's
+      // tokenVersion and every token issued before it stops working.
+      { userId: user.id, role: user.role, tv: user.tokenVersion },
       process.env.JWT_SECRET as string,
       { expiresIn: '12h' }
     )
@@ -716,12 +906,59 @@ app.post('/api/v1/auth/login', async (req, res) => {
   }
 })
 
-app.get('/api/v1/system/authorized-clients', async (_req, res) => {
+// The MAC address and id of every till in the shop is a map of the network
+// for anyone who asks, so this asks for a token.
+app.get('/api/v1/system/authorized-clients', requireAuth(), async (_req, res) => {
   try {
-    const clients = await prisma.authorizedClient.findMany({ orderBy: { authorizedAt: 'desc' } })
+    const clients = await prisma.authorizedClient.findMany({
+      where: { retiredAt: null },
+      orderBy: { authorizedAt: 'desc' }
+    })
     return res.status(200).json({ success: true, clients })
   } catch (err) {
     console.error('Error fetching authorized clients:', err)
+    return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
+  }
+})
+
+/**
+ * Take a till back off the branch, freeing its licence seat.
+ *
+ * Without this a mistyped pairing, a replaced machine or a stolen one
+ * occupied a seat permanently — the shop had to call support to sell a till.
+ * Bills name the terminal they were rung up on, so a till that has traded
+ * cannot be erased; unpairing it clears the MAC and the terminal code, which
+ * is what actually returns the seat, and leaves the row for the history.
+ */
+app.delete('/api/v1/system/authorized-clients/:id', requireAuth(['SUPER_ADMIN']), async (req, res) => {
+  try {
+    const id = String(req.params.id)
+    const client = await prisma.authorizedClient.findUnique({
+      where: { id },
+      include: { _count: { select: { bills: true } } }
+    })
+    if (!client) return res.status(404).json({ success: false, error: 'NOT_FOUND' })
+
+    if (client._count.bills > 0) {
+      await prisma.authorizedClient.update({
+        where: { id },
+        data: {
+          retiredAt: new Date(),
+          // The MAC and the terminal code are unique, and this machine may be
+          // re-paired or replaced by one reusing the code, so they are freed
+          // here rather than held by a row nobody uses any more.
+          macAddress: `RETIRED:${id}`,
+          terminalCode: null,
+          friendlyName: `${client.friendlyName} (retired)`
+        }
+      })
+      return res.json({ success: true, retired: true, billCount: client._count.bills })
+    }
+
+    await prisma.authorizedClient.delete({ where: { id } })
+    return res.json({ success: true, retired: false })
+  } catch (err) {
+    console.error('Error unpairing client:', err)
     return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
   }
 })
@@ -767,13 +1004,16 @@ function validatePassword(raw: string): FieldResult {
 app.get('/api/v1/users', requireAuth(['SUPER_ADMIN']), async (_req, res) => {
   try {
     const users = await prisma.user.findMany({
-      select: { id: true, username: true, role: true, createdAt: true, _count: { select: { bills: true } } },
-      orderBy: [{ role: 'asc' }, { username: 'asc' }]
+      select: {
+        id: true, username: true, role: true, isActive: true, createdAt: true,
+        _count: { select: { bills: true } }
+      },
+      orderBy: [{ isActive: 'desc' }, { role: 'asc' }, { username: 'asc' }]
     })
     return res.json({
       success: true,
       users: users.map((u) => ({
-        id: u.id, username: u.username, role: u.role,
+        id: u.id, username: u.username, role: u.role, isActive: u.isActive,
         createdAt: u.createdAt, billCount: u._count.bills
       }))
     })
@@ -801,7 +1041,7 @@ app.post('/api/v1/users', requireAuth(['SUPER_ADMIN']), async (req, res) => {
         passwordHash: await bcrypt.hash(passCheck.value, 10),
         role: req.body.role
       },
-      select: { id: true, username: true, role: true, createdAt: true }
+      select: { id: true, username: true, role: true, isActive: true, createdAt: true }
     })
     return res.status(201).json({ success: true, user })
   } catch (err: unknown) {
@@ -823,10 +1063,41 @@ app.put('/api/v1/users/:id', requireAuth(['SUPER_ADMIN']), async (req, res) => {
 
     const data: Record<string, unknown> = {}
 
+    // Any of these three is somebody's access changing, and each one only
+    // means something if the sessions already open stop working. Bumping
+    // tokenVersion is what does that.
+    let revokeSessions = false
+
     if (req.body?.password !== undefined) {
       const passCheck = validatePassword(req.body.password)
       if (!passCheck.ok) return fieldError(res, passCheck)
       data.passwordHash = await bcrypt.hash(passCheck.value, 10)
+      revokeSessions = true
+    }
+
+    if (req.body?.isActive !== undefined) {
+      const active = Boolean(req.body.isActive)
+      if (!active) {
+        if (id === req.user!.userId) {
+          return res.status(409).json({
+            success: false, error: 'CANNOT_DISABLE_SELF',
+            message: 'You cannot switch off your own account.'
+          })
+        }
+        if (target.role === 'SUPER_ADMIN') {
+          const admins = await prisma.user.count({
+            where: { role: 'SUPER_ADMIN', isActive: true }
+          })
+          if (admins <= 1) {
+            return res.status(409).json({
+              success: false, error: 'LAST_SUPER_ADMIN',
+              message: 'This is the only active super admin. Promote someone else first.'
+            })
+          }
+        }
+      }
+      data.isActive = active
+      revokeSessions = true
     }
 
     if (req.body?.role !== undefined) {
@@ -836,7 +1107,9 @@ app.put('/api/v1/users/:id', requireAuth(['SUPER_ADMIN']), async (req, res) => {
       // Never let the last super admin demote themselves — the shop would be
       // locked out of its own settings with no way back in.
       if (target.role === 'SUPER_ADMIN' && req.body.role !== 'SUPER_ADMIN') {
-        const admins = await prisma.user.count({ where: { role: 'SUPER_ADMIN' } })
+        const admins = await prisma.user.count({
+          where: { role: 'SUPER_ADMIN', isActive: true }
+        })
         if (admins <= 1) {
           return res.status(409).json({
             success: false, error: 'LAST_SUPER_ADMIN',
@@ -844,13 +1117,19 @@ app.put('/api/v1/users/:id', requireAuth(['SUPER_ADMIN']), async (req, res) => {
           })
         }
       }
+      if (req.body.role !== target.role) revokeSessions = true
       data.role = req.body.role
     }
 
+    if (revokeSessions) data.tokenVersion = { increment: 1 }
+
     const user = await prisma.user.update({
       where: { id }, data,
-      select: { id: true, username: true, role: true, createdAt: true }
+      select: { id: true, username: true, role: true, isActive: true, createdAt: true }
     })
+    // The cached answer is now stale, and the whole point of the bump is that
+    // it takes effect at once rather than when the cache happens to expire.
+    forgetUser(id)
     return res.json({ success: true, user })
   } catch (err) {
     console.error(err)
@@ -887,12 +1166,13 @@ app.delete('/api/v1/users/:id', requireAuth(['SUPER_ADMIN']), async (req, res) =
     if (target._count.bills > 0) {
       return res.status(409).json({
         success: false, error: 'USER_HAS_BILLS',
-        message: `${target.username} has ${target._count.bills} bill${target._count.bills === 1 ? '' : 's'} against their name and cannot be deleted. Change their password to revoke access.`,
+        message: `${target.username} has ${target._count.bills} bill${target._count.bills === 1 ? '' : 's'} against their name and cannot be deleted. Switch the account off instead — it ends their access and keeps the sales history intact.`,
         billCount: target._count.bills
       })
     }
 
     await prisma.user.delete({ where: { id } })
+    forgetUser(id)
     return res.json({ success: true })
   } catch (err) {
     console.error(err)
