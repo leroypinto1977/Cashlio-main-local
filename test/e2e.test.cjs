@@ -263,7 +263,8 @@ async function api(path, opts = {}, token) {
     originDeviceId: device.id, paymentMethod: 'CASH', amountReceived: 500,
     items: [{ productId: cutId, quantity: 2.75, unitRate: 60, gstPercentage: 18, lineDiscountPct: 0, lineDiscountAmt: 0 }]
   })}, token)
-  t('fractional quantity billed', r.status === 201 && near(r.body.bill.items[0].quantity, 2.75), r.body.bill?.items?.[0]?.quantity)
+  t('fractional quantity billed', r.status === 201 && near(r.body.bill?.items?.[0]?.quantity, 2.75), { status: r.status, body: r.body })
+
   t('line total = 2.75 x 60', near(r.body.bill.items[0].lineTotal, 165), r.body.bill.items[0].lineTotal)
   t('invoice still foots', near(r.body.bill.taxableValue + r.body.bill.gstAmount, r.body.bill.totalAmount))
   const cutBill = r.body.bill
@@ -888,6 +889,53 @@ async function api(path, opts = {}, token) {
   eqp('the ledger records what was actually taken', Number(paidTotal._sum.amount ?? 0), 500)
   r = await api(`/api/v1/customers/${dupCust.id}/outstanding`, {}, token)
   eqp('and the customer owes nothing more', r.body.outstanding, 0)
+
+
+  console.log('\n— an exchange records only the money that moved —')
+  const exProd = await prisma.product.create({ data: {
+    itemCode: 'EX-CHEAP-001', name: 'Cheap Item', categoryId: cat.id, sellingRate: 200, gstPercentage: 0 }})
+  const exDear = await prisma.product.create({ data: {
+    itemCode: 'EX-DEAR-001', name: 'Dear Item', categoryId: cat.id, sellingRate: 1200, gstPercentage: 0 }})
+  for (const pr of [exProd, exDear]) {
+    await prisma.productBatch.create({ data: {
+      productId: pr.id, batchCode: 'E', uniqueStockCode: `${pr.itemCode}/E`,
+      purchaseRate: 100, receivedQty: 30, currentQty: 30 }})
+  }
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, paymentMethod: 'CASH',
+    items: [{ productId: exProd.id, quantity: 1, unitRate: 200, gstPercentage: 0, lineDiscountPct: 0, lineDiscountAmt: 0 }] })}, token)
+  const exBill = r.body.bill
+  const tenderBefore = Number((await prisma.payment.aggregate({ _sum: { amount: true } }))._sum.amount ?? 0)
+  // swap a 200 item for a 1200 one; the customer hands over 1000
+  r = await api(`/api/v1/bills/${exBill.id}/exchange`, { method: 'POST', body: JSON.stringify({
+    returnItems: [{ billItemId: exBill.items[0].id, quantity: 1 }],
+    replacementItems: [{ productId: exDear.id, quantity: 1 }],
+    amountReceived: 1000, reasonCode: 'WRONG_ITEM' })}, token)
+  t('exchange accepted', r.status === 201, r.body)
+  eqp('net difference reported', r.body.netDifference, 1000)
+  t('replacement is fully settled', r.body.replacementBill.balanceDue === 0, r.body.replacementBill?.balanceDue)
+  const tenderAfter = Number((await prisma.payment.aggregate({ _sum: { amount: true } }))._sum.amount ?? 0)
+  eqp('only the 1,000 difference enters the ledger', tenderAfter - tenderBefore, 1000)
+
+
+  console.log('\n— mixed whole and fractional quantities —')
+  // Guards a bind-format regression: Prisma binds 3 and 2.75 as different
+  // types, and a prepared statement keeps whichever it saw first, so mixing
+  // them against one connection pool used to fail intermittently.
+  const mixProd = await prisma.product.create({ data: {
+    itemCode: 'MIX-TEST-001', name: 'Mixed Units', categoryId: cat.id,
+    sellMode: 'LENGTH', unitOfMeasure: 'm', sellingRate: 10, gstPercentage: 0 }})
+  await prisma.productBatch.create({ data: {
+    productId: mixProd.id, batchCode: 'M', uniqueStockCode: 'MIX-TEST-001/M',
+    purchaseRate: 5, receivedQty: 100, currentQty: 100 }})
+  for (const qty of [2.75, 1, 0.25, 3, 0.001, 10]) {
+    r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+      originDeviceId: device.id, paymentMethod: 'CASH',
+      items: [{ productId: mixProd.id, quantity: qty, unitRate: 10, gstPercentage: 0, lineDiscountPct: 0, lineDiscountAmt: 0 }] })}, token)
+    t(`billing ${qty} works`, r.status === 201, { qty, status: r.status, body: r.body })
+  }
+  const mixLeft = Number((await prisma.productBatch.findFirst({ where: { productId: mixProd.id } })).currentQty)
+  eqp('stock reduced by the exact total', 100 - mixLeft, 16.999 + 0.002)
 
   console.log(`\n${pass} passed, ${fail} failed`)
   await prisma.$disconnect()

@@ -2215,9 +2215,13 @@ type CreateBillArgs = {
   amountReceived: number | null
   tenders: Tender[]
   /// Treat the bill as settled in full whatever the total turns out to be.
-  /// Used for the replacement half of an exchange, which is paid for by the
-  /// refund rather than by a tender the cashier counts.
+  /// Used for the legacy client shape, where "no amountReceived" has always
+  /// meant "paid in full at the counter".
   settleInFull?: boolean
+  /// Value carried over from a credit note rather than tendered. The
+  /// replacement half of an exchange is paid for by the refund; recording
+  /// that as a cash tender overstated takings by the refund amount.
+  creditApplied?: number
   /// Set by a SUPER_ADMIN to let a bill exceed the customer's credit limit.
   allowCreditOverride: boolean
   /// Set by a SUPER_ADMIN to bill a line at something other than the
@@ -2350,12 +2354,18 @@ async function createBillCore(tx: TxClient, args: CreateBillArgs, billNumber?: s
       // write the same result: two bills, one unit, no error, and a
       // discrepancy nobody sees until a stock count. The WHERE clause makes
       // that impossible — the loser simply updates no rows.
+      // The quantity is bound as text and cast, not as a JS number. Prisma
+      // binds 3 as an integer and 2.75 as a double, and a prepared statement
+      // keeps whichever type it saw first — so a fractional quantity landing
+      // on a connection that had already run a whole one failed with a bind
+      // format error, intermittently and only for cut-length products.
+      const wantParam = want.toFixed(3)
       const taken = await tx.$executeRaw`
         UPDATE "ProductBatch"
-           SET "currentQty" = "currentQty" - ${want}::numeric,
+           SET "currentQty" = "currentQty" - ${wantParam}::numeric,
                "updatedAt"  = NOW()
          WHERE "id" = ${batch.id}
-           AND "currentQty" >= ${want}::numeric
+           AND "currentQty" >= ${wantParam}::numeric
       `
       if (taken === 0) continue // another till took it first; try the next batch
 
@@ -2426,7 +2436,11 @@ async function createBillCore(tx: TxClient, args: CreateBillArgs, billNumber?: s
   const tenders: Tender[] = args.settleInFull
     ? [{ method: args.paymentMethod, amount: totalAmount }]
     : args.tenders
-  const settlement = settle(totalAmount, tenders)
+
+  // Credit carried from a refund is not money that changed hands, so it
+  // settles the bill without appearing as a tender in the payments ledger.
+  const creditApplied = round2(Math.min(Math.max(0, args.creditApplied ?? 0), totalAmount))
+  const settlement = settle(round2(totalAmount - creditApplied), tenders)
 
   const customer = args.customerId
     ? await tx.customer.findUnique({
@@ -2480,7 +2494,7 @@ async function createBillCore(tx: TxClient, args: CreateBillArgs, billNumber?: s
       paymentMethod: tenders[0]?.method ?? args.paymentMethod,
       amountReceived: settlement.tendered > 0 ? settlement.tendered : null,
       changeGiven,
-      paidAmount: settlement.paidAmount,
+      paidAmount: round2(settlement.paidAmount + creditApplied),
       balanceDue: settlement.balanceDue,
       dueDate: settlement.balanceDue > 0 ? dueDateFor(new Date(), creditDays) : null,
       notes: args.notes,
@@ -3093,8 +3107,13 @@ app.post('/api/v1/bills/:id/exchange', requireActiveLicense(), requireAuth(['SUP
         amountReceived: amountReceived != null ? Number(amountReceived) : null,
         // The refund settles the replacement; only the difference changes
         // hands, so the replacement is never left carrying a balance.
-        tenders: [],
-        settleInFull: true,
+        tenders:
+          // Only the difference changes hands. Anything the customer pays on
+          // top of the refund is the real tender.
+          amountReceived != null && Number(amountReceived) > 0
+            ? [{ method: pm, amount: round2(Number(amountReceived)) }]
+            : [],
+        creditApplied: Number(refund.totalAmount),
         allowCreditOverride: true,
         // The replacement rate is resolved from the product master above.
         allowPriceOverride: true,
