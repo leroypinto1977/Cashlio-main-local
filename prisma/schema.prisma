@@ -70,8 +70,15 @@ model SyncEvent {
   op        String   // 'upsert' | 'delete'
   payload   Json?    // full row snapshot for upsert; null for delete
   createdAt DateTime @default(now())
+  /// The transaction that wrote this row. `id` comes from a sequence, which
+  /// is handed out at insert time and says nothing about commit order — two
+  /// concurrent sales can take 100 and 101 and commit the other way round.
+  /// Terminals page by (txid, id) so a row can never appear behind a cursor
+  /// that has already moved past it. See /api/v1/sync/pull.
+  txid      BigInt   @default(dbgenerated("(pg_current_xact_id())::text::bigint"))
 
   @@index([entity, id])
+  @@index([txid, id])
 }
 
 model User {

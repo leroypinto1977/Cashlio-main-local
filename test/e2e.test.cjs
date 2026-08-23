@@ -979,6 +979,58 @@ async function api(path, opts = {}, token) {
   t('margin stays a believable percentage',
     afterReturn.estimatedMarginPct < 100, afterReturn.estimatedMarginPct)
 
+
+  console.log('\n— the change feed cannot skip a commit —')
+  {
+    // Drain whatever the earlier tests generated so the window is clean.
+    let cursor = '0'
+    for (let i = 0; i < 50; i++) {
+      const page = (await api(`/api/v1/sync/pull?cursor=${encodeURIComponent(cursor)}&limit=500`, {}, token)).body
+      if (!page.events.length) break
+      cursor = page.nextCursor
+      if (!page.hasMore) break
+    }
+    t('cursors are (txid, id) pairs', /^\d+:\d+$/.test(cursor) || cursor === '0', cursor)
+
+    // Hold a transaction open with an unsent event in it, exactly as a slow
+    // sale would. Then commit a *later* event from another connection.
+    let release
+    const gate = new Promise((r) => { release = r })
+    const held = prisma.$transaction(async (tx) => {
+      await tx.syncEvent.create({ data: {
+        entity: 'product', entityId: 'held-by-open-txn', op: 'upsert', payload: { name: 'Held' } }})
+      await gate
+    }, { timeout: 30000, maxWait: 30000 })
+
+    await new Promise((r) => setTimeout(r, 300))
+    await prisma.syncEvent.create({ data: {
+      entity: 'product', entityId: 'committed-after', op: 'upsert', payload: { name: 'After' } }})
+
+    const during = (await api(`/api/v1/sync/pull?cursor=${encodeURIComponent(cursor)}&limit=500`, {}, token)).body
+    const idsDuring = during.events.map((e) => e.entityId)
+    t('the later commit waits for the earlier one',
+      !idsDuring.includes('committed-after'), idsDuring)
+    t('...and so does the one still in flight',
+      !idsDuring.includes('held-by-open-txn'), idsDuring)
+
+    release()
+    await held
+
+    const after = (await api(`/api/v1/sync/pull?cursor=${encodeURIComponent(cursor)}&limit=500`, {}, token)).body
+    const idsAfter = after.events.map((e) => e.entityId)
+    t('both arrive once the slow write lands', idsAfter.includes('held-by-open-txn') && idsAfter.includes('committed-after'), idsAfter)
+    t('in commit order, oldest first',
+      idsAfter.indexOf('held-by-open-txn') < idsAfter.indexOf('committed-after'), idsAfter)
+    t('every event carries a resume token',
+      after.events.every((e) => /^\d+:\d+$/.test(e.cursor)), after.events[0])
+
+    // A bare id from an older terminal build still means something.
+    const legacy = (await api('/api/v1/sync/pull?cursor=0&limit=5', {}, token)).body
+    t('a legacy id-only cursor is accepted', legacy.events.length > 0, legacy)
+    const resumed = (await api(`/api/v1/sync/pull?cursor=${encodeURIComponent(after.nextCursor)}&limit=500`, {}, token)).body
+    eqp('resuming from nextCursor returns nothing new', resumed.events.length, 0)
+  }
+
   console.log(`\n${pass} passed, ${fail} failed`)
   await prisma.$disconnect()
   process.exit(fail ? 1 : 0)
