@@ -980,6 +980,51 @@ async function api(path, opts = {}, token) {
     afterReturn.estimatedMarginPct < 100, afterReturn.estimatedMarginPct)
 
 
+  console.log('\n— the same sale submitted twice is one sale —')
+  {
+    const idemProd = await prisma.product.create({ data: {
+      itemCode: 'IDEM-TEST-001', name: 'Idempotency Item', categoryId: cat.id,
+      sellingRate: 100, gstPercentage: 0 }})
+    await prisma.productBatch.create({ data: {
+      productId: idemProd.id, batchCode: 'I', uniqueStockCode: 'IDEM-TEST-001/I',
+      purchaseRate: 40, receivedQty: 100, currentQty: 100 }})
+    const mkBody = (key) => JSON.stringify({
+      originDeviceId: device.id, paymentMethod: 'CASH', clientLocalId: key,
+      payments: [{ method: 'CASH', amount: 300 }],
+      items: [{ productId: idemProd.id, quantity: 3, unitRate: 100, gstPercentage: 0, lineDiscountPct: 0, lineDiscountAmt: 0 }] })
+
+    const stockOf = async () =>
+      Number((await prisma.productBatch.findFirst({ where: { productId: idemProd.id } })).currentQty)
+
+    // Sequential retry — a response that went missing.
+    const before = await stockOf()
+    const first = await api('/api/v1/bills', { method: 'POST', body: mkBody('idem-key-1') }, token)
+    const retry = await api('/api/v1/bills', { method: 'POST', body: mkBody('idem-key-1') }, token)
+    t('the first submit creates the bill', first.status === 201, first.body)
+    t('the retry is answered, not refused', retry.status === 200, retry.body)
+    eqp('...with the same bill', retry.body.bill.id === first.body.bill.id ? 1 : 0, 1)
+    eqp('...and the goods leave the shelf once', before - (await stockOf()), 3)
+
+    // Simultaneous submits — a double-click, both past the lookup.
+    const beforeRace = await stockOf()
+    const [a1, b1] = await Promise.all([
+      api('/api/v1/bills', { method: 'POST', body: mkBody('idem-key-2') }, token),
+      api('/api/v1/bills', { method: 'POST', body: mkBody('idem-key-2') }, token)
+    ])
+    t('neither simultaneous submit errors',
+      [200, 201].includes(a1.status) && [200, 201].includes(b1.status), { a: a1.status, b: b1.status })
+    eqp('both are told about the same bill', a1.body.bill.id === b1.body.bill.id ? 1 : 0, 1)
+    eqp('the customer is billed once', beforeRace - (await stockOf()), 3)
+    eqp('and one bill exists for that key',
+      await prisma.bill.count({ where: { clientLocalId: 'idem-key-2' } }), 1)
+
+    // A different key is a different sale.
+    const beforeThird = await stockOf()
+    const other = await api('/api/v1/bills', { method: 'POST', body: mkBody('idem-key-3') }, token)
+    t('a fresh key is a fresh sale', other.status === 201 && other.body.bill.id !== first.body.bill.id, other.body)
+    eqp('...and deducts its own stock', beforeThird - (await stockOf()), 3)
+  }
+
   console.log('\n— a sale is dated when it happened —')
   {
     // Its own product: earlier blocks deactivate and drain the shared ones.

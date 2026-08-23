@@ -2,7 +2,7 @@ import express, { Request, Response, NextFunction } from 'express'
 import cors from 'cors'
 import jwt from 'jsonwebtoken'
 import bcrypt from 'bcryptjs'
-import { PrismaClient } from '@prisma/client'
+import { PrismaClient, Prisma } from '@prisma/client'
 import os from 'os'
 import {
   recordSync,
@@ -2863,7 +2863,11 @@ app.post('/api/v1/bills', requireActiveLicense(), requireAuth(), async (req, res
       return res.status(400).json({ success: false, error: 'BILL_ITEMS_REQUIRED' })
     }
 
-    // Idempotency: if this clientLocalId was already processed, return the existing bill
+    // Idempotency: if this clientLocalId was already processed, return the
+    // existing bill. This lookup catches the ordinary case — a retry after a
+    // response went missing. It cannot catch two genuinely simultaneous
+    // submits, which both miss it; the unique constraint stops those, and the
+    // handler below turns the resulting clash back into the same answer.
     if (clientLocalId) {
       const existing = await prisma.bill.findUnique({
         where: { clientLocalId: String(clientLocalId) },
@@ -2914,6 +2918,26 @@ app.post('/api/v1/bills', requireActiveLicense(), requireAuth(), async (req, res
 
     return res.status(201).json({ success: true, bill: serializeBill(bill) })
   } catch (err: unknown) {
+    // Two submits of the same sale raced past the lookup above and one lost
+    // the unique constraint. The loser did not create anything, so the right
+    // answer is the bill the winner made — not an error that would tempt a
+    // cashier into ringing the sale up a second time.
+    if (
+      err instanceof Prisma.PrismaClientKnownRequestError &&
+      err.code === 'P2002' &&
+      String((err.meta as { target?: string | string[] } | undefined)?.target ?? '').includes(
+        'clientLocalId'
+      ) &&
+      req.body?.clientLocalId
+    ) {
+      const winner = await prisma.bill.findUnique({
+        where: { clientLocalId: String(req.body.clientLocalId) },
+        include: { customer: { select: { name: true } }, items: true }
+      })
+      if (winner) {
+        return res.status(200).json({ success: true, bill: serializeBill(winner) })
+      }
+    }
     const e = err as {
       code?: string; productName?: string; available?: number; requested?: number
       reason?: string; customerName?: string; creditLimit?: number

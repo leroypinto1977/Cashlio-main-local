@@ -626,6 +626,14 @@ export function BillingScreen({
 
   // ─── Submit Bill ─────────────────────────────────────────────────────────
 
+  // One key per attempt at *this* cart, so the same sale submitted twice is
+  // recognised as one. The till has always sent one; the manager's own
+  // counter did not, which left it a double-click or a timed-out retry away
+  // from billing a customer twice for the same goods. It survives a failed
+  // attempt on purpose — the credit-override retry and a retry after a lost
+  // response are the same sale — and is replaced once a bill comes back.
+  const idempotencyKey = useRef(crypto.randomUUID())
+
   const handlePay = async (allowCreditOverride = false) => {
     if (!canPay || cartItems.length === 0) return
     setSubmitting(true)
@@ -645,12 +653,15 @@ export function BillingScreen({
         })),
         discountAmount: billDiscAmt,
         payments: tenderList.filter((t) => t.amount > 0),
+        clientLocalId: idempotencyKey.current,
         ...(allowCreditOverride ? { allowCreditOverride: true } : {})
       }
       const d = await apiFetch<{ bill: SavedBill }>('/api/v1/bills', token, {
         method: 'POST',
         body: JSON.stringify(body)
       })
+      // This sale is now on the books; the next one is a different sale.
+      idempotencyKey.current = crypto.randomUUID()
       // The create response does not echo the payment rows, so the tenders are
       // attached here for the receipt.
       setSuccessBill({
