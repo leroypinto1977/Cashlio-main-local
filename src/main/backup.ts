@@ -16,17 +16,13 @@ import fs from 'node:fs'
 import { spawn } from 'node:child_process'
 import { createGzip } from 'node:zlib'
 import { pipeline } from 'node:stream/promises'
-import { PrismaClient } from '@prisma/client'
+import { prisma } from './prisma'
 
 const RETENTION_COUNT = 30
 const FILE_PREFIX = 'cashlio-'
 const FILE_SUFFIX = '.sql.gz'
 
-let prismaForBackup: PrismaClient | null = null
-function getPrisma(): PrismaClient {
-  if (!prismaForBackup) prismaForBackup = new PrismaClient()
-  return prismaForBackup
-}
+
 
 const sanitize = (s: string): string => s.replace(/[^a-zA-Z0-9_\- ]+/g, '').trim() || 'branch'
 
@@ -38,16 +34,45 @@ function fileNameForNow(d = new Date()): string {
   return `${FILE_PREFIX}${stamp}${FILE_SUFFIX}`
 }
 
+/**
+ * Take the password out of a Postgres URL so it can be passed by environment
+ * instead of on the command line. Returns the URL unchanged if there is none
+ * (peer or trust authentication, or a password already in ~/.pgpass).
+ */
+function splitPassword(dbUrl: string): { url: string; password: string | null } {
+  try {
+    const u = new URL(dbUrl)
+    if (!u.password) return { url: dbUrl, password: null }
+    const password = decodeURIComponent(u.password)
+    u.password = ''
+    return { url: u.toString(), password }
+  } catch {
+    // Not a URL we can parse — hand it over untouched rather than mangling a
+    // connection string that works.
+    return { url: dbUrl, password: null }
+  }
+}
+
 export async function getBackupDir(): Promise<string> {
   let branchName = 'branch'
   try {
-    const cfg = await getPrisma().shopConfig.findFirst()
+    const cfg = await prisma.shopConfig.findFirst()
     if (cfg?.branchName) branchName = cfg.branchName
   } catch {
     // ShopConfig may not exist yet (pre-setup). Fall back to default.
   }
   const dir = path.join(app.getPath('home'), 'Cashlio Backups', sanitize(branchName))
   fs.mkdirSync(dir, { recursive: true })
+  // A dump is the whole shop: every customer, every price, every password
+  // hash. It was landing in the home directory at whatever the umask gave —
+  // typically readable by any account on the machine, and squarely inside the
+  // folders that consumer cloud-sync tools back up by default. Owner-only.
+  try {
+    fs.chmodSync(dir, 0o700)
+  } catch {
+    // Some filesystems (a network or FAT-formatted backup drive) don't carry
+    // POSIX modes. Nothing to be done there; the backup itself still runs.
+  }
   return dir
 }
 
@@ -142,16 +167,24 @@ export async function runBackup(): Promise<BackupResult> {
     const tmpPath = `${fullPath}.partial`
 
     const cmd = process.env.BACKUP_PG_DUMP_PATH || 'pg_dump'
+    // The connection string carries the database password, and an argument
+    // vector is public: `ps` shows it to every account on the machine for as
+    // long as the dump runs, twice a day. Postgres reads the same URL from
+    // the environment, which is not listed to other users.
+    const { url: safeUrl, password } = splitPassword(dbUrl)
     // --no-owner / --no-acl makes restores portable across users; --clean
     // includes DROPs so a restore can fully replace the existing schema.
-    const child = spawn(cmd, ['--no-owner', '--no-acl', '--clean', '--if-exists', dbUrl], {
-      stdio: ['ignore', 'pipe', 'pipe']
+    const child = spawn(cmd, ['--no-owner', '--no-acl', '--clean', '--if-exists', safeUrl], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: password ? { ...process.env, PGPASSWORD: password } : process.env
     })
 
     let stderr = ''
     child.stderr.on('data', (d) => { stderr += String(d) })
 
-    const out = fs.createWriteStream(tmpPath)
+    // Owner-only from the moment it exists, rather than chmod-ed afterwards —
+    // a dump is readable for as long as it is being written.
+    const out = fs.createWriteStream(tmpPath, { mode: 0o600 })
     const gz = createGzip()
 
     const exitPromise = new Promise<number>((resolve, reject) => {
@@ -175,6 +208,11 @@ export async function runBackup(): Promise<BackupResult> {
 
     // Atomic-ish rename so partial files never look like real backups.
     fs.renameSync(tmpPath, fullPath)
+    try {
+      fs.chmodSync(fullPath, 0o600)
+    } catch {
+      // See getBackupDir: not every filesystem carries modes.
+    }
 
     const sizeBytes = fs.statSync(fullPath).size
     const durationMs = Date.now() - started

@@ -5,7 +5,7 @@ import fs from 'fs'
 import dotenv from 'dotenv'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
-import { startExpressServer } from './server'
+import { startExpressServer, startSyncEventPruning } from './server'
 import { runBackup, listBackups, getBackupStatus, getBackupDir, startBackupSchedule } from './backup'
 import { startRefreshLoop, checkClockTamper } from './licenseGuard'
 import { randomBytes } from 'crypto'
@@ -278,6 +278,9 @@ app.whenReady().then(async () => {
 
   // Kick off the daily-backup schedule (runs ~1 minute after boot, then every 6h).
   startBackupSchedule()
+
+  // Keep the terminals' change log from growing without bound.
+  startSyncEventPruning()
 
   createWindow()
 

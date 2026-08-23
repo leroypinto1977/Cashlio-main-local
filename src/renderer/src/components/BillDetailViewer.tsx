@@ -8,6 +8,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { Receipt, X, Undo2, ArrowLeftRight, Search, Printer } from 'lucide-react'
 import { Button } from './ui/button'
+import { parseQty, qtyStep, roundQty } from '@shared/units'
 import { Input } from './ui/input'
 import { Modal } from './Modal'
 import { apiFetch } from '../lib/api'
@@ -37,6 +38,8 @@ type BillItem = {
   gstPercentage: number
   lineTotal: number
   alreadyReturnedQty?: number
+  /** 'LENGTH' lines are cut to size, so a return can be a fraction. */
+  sellMode?: string
 }
 
 type BillDetail = {
@@ -68,6 +71,8 @@ type ProductHit = {
   sellingRate: number
   gstPercentage: number
   totalStock: number
+  /** 'LENGTH' products are cut to size and sold in fractions. */
+  sellMode?: string
 }
 
 // A bill can be returned against while it still exists as a sale — that
@@ -400,10 +405,18 @@ function RefundLineModal({ line, billId, token, shopInfo, customerName, onClose,
             <div>
               <label className="block text-xs font-semibold mb-1 text-zinc-600">Refund qty</label>
               <Input
-                type="number" min={1} max={remaining} value={qty}
+                type="number"
+                min={qtyStep(line?.sellMode)}
+                max={remaining}
+                step={qtyStep(line?.sellMode)}
+                value={qty}
                 onChange={(e) => {
-                  const n = Math.max(1, Math.min(remaining, parseInt(e.target.value || '1', 10) || 1))
-                  setQty(n)
+                  // Cut-to-length lines come back as fractions: 2.5 m of pipe
+                  // is 2.5, not 2. parseInt refunded the customer for less
+                  // than they returned and left stock on the books that had
+                  // walked out of the shop.
+                  const raw = parseQty(e.target.value || '0', line?.sellMode)
+                  setQty(roundQty(Math.max(qtyStep(line?.sellMode), Math.min(remaining, raw))))
                 }}
                 className="h-10"
               />
@@ -609,9 +622,15 @@ function ReplaceLineModal({ line, billId, token, shopInfo, customer, onClose, on
           <div className="flex items-center gap-3 mt-2">
             <label className="text-xs text-zinc-600">Qty to return</label>
             <Input
-              type="number" min={1} max={remaining} value={returnQty}
+              type="number"
+              min={qtyStep(line?.sellMode)}
+              max={remaining}
+              step={qtyStep(line?.sellMode)}
+              value={returnQty}
               onChange={(e) => {
-                const n = Math.max(1, Math.min(remaining, parseInt(e.target.value || '1', 10) || 1))
+                // See the refund modal: a cut-length line returns as a fraction.
+                const raw = parseQty(e.target.value || '0', line?.sellMode)
+                const n = roundQty(Math.max(qtyStep(line?.sellMode), Math.min(remaining, raw)))
                 setReturnQty(n)
               }}
               className="h-8 w-20 text-sm"
@@ -680,10 +699,18 @@ function ReplaceLineModal({ line, billId, token, shopInfo, customer, onClose, on
                 <div>
                   <label className="block text-xs font-semibold mb-1 text-zinc-600">Qty</label>
                   <Input
-                    type="number" min={1} max={replacement.totalStock} value={replacementQty}
+                    type="number"
+                    min={qtyStep(replacement.sellMode)}
+                    max={replacement.totalStock}
+                    step={qtyStep(replacement.sellMode)}
+                    value={replacementQty}
                     onChange={(e) => {
-                      const n = Math.max(1, Math.min(replacement.totalStock, parseInt(e.target.value || '1', 10) || 1))
-                      setReplacementQty(n)
+                      const raw = parseQty(e.target.value || '0', replacement.sellMode)
+                      setReplacementQty(
+                        roundQty(
+                          Math.max(qtyStep(replacement.sellMode), Math.min(replacement.totalStock, raw))
+                        )
+                      )
                     }}
                     className="h-10"
                   />

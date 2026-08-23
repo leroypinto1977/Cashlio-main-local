@@ -1,8 +1,16 @@
-import { ElectronAPI } from '@electron-toolkit/preload'
-
 declare global {
   interface Window {
-    electron: ElectronAPI
+    electron: {
+      ipcRenderer: {
+        /** Only the channels named in the preload's allow-list resolve. */
+        invoke(channel: string, ...args: unknown[]): Promise<unknown>
+      }
+      process: {
+        versions: { electron: string; chrome: string; node: string }
+      }
+    }
     api: unknown
   }
 }
+
+export {}

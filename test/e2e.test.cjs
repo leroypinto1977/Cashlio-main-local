@@ -980,6 +980,178 @@ async function api(path, opts = {}, token) {
     afterReturn.estimatedMarginPct < 100, afterReturn.estimatedMarginPct)
 
 
+  console.log('\n— the API answers in JSON even when it fails —')
+  {
+    const missing = await api('/api/v1/no-such-thing', {}, token)
+    eqp('an unknown path is a 404', missing.status, 404)
+    t('...as JSON, not an HTML error page', missing.body?.error === 'NOT_FOUND', missing.body)
+
+    const bad = await fetch(BASE + '/api/v1/bills', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: '{ this is not json'
+    })
+    const badBody = await bad.json().catch(() => null)
+    t('malformed JSON does not return a stack trace', badBody !== null && !JSON.stringify(badBody).includes('at '), badBody)
+    t('...and says only that it failed', bad.status >= 400, bad.status)
+  }
+
+  console.log('\n— asking for everything gets you a page —')
+  {
+    // A caller cannot make the server build an unbounded result set.
+    const huge = await api('/api/v1/bills?limit=999999', {}, token)
+    t('an enormous limit is clamped', huge.status === 200 && huge.body.bills.length <= 200,
+      huge.body.bills?.length)
+    const junk = await api('/api/v1/bills?limit=abc&offset=xyz', {}, token)
+    t('a nonsense limit does not 500', junk.status === 200, junk.body)
+    const neg = await api('/api/v1/bills?limit=-5&offset=-10', {}, token)
+    t('a negative limit does not 500', neg.status === 200 && neg.body.bills.length >= 1, neg.body?.bills?.length)
+
+    // The catalogue pages, and the slim form leaves out the batch history.
+    const page1 = await api('/api/v1/products?limit=2&offset=0', {}, token)
+    t('the catalogue is paged', page1.status === 200 && page1.body.products.length <= 2, page1.body?.products?.length)
+    t('...and says how many there are', typeof page1.body.total === 'number', page1.body.total)
+    const slim = await api('/api/v1/products?limit=2&slim=true', {}, token)
+    t('the slim form drops the batch lists',
+      slim.body.products.every((p) => p.batches === undefined), slim.body.products[0])
+    t('...but keeps the stock figure',
+      slim.body.products.every((p) => typeof p.totalStock === 'number'), slim.body.products[0])
+    const page2 = await api('/api/v1/products?limit=2&offset=2', {}, token)
+    const ids1 = page1.body.products.map((p) => p.id)
+    t('a second page is different products',
+      page2.body.products.every((p) => !ids1.includes(p.id)), { ids1, p2: page2.body.products.map((p) => p.id) })
+  }
+
+  console.log('\n— the change log gets trimmed, but never ahead of a till —')
+  {
+    const { pruneSyncEvents } = require('../.test-build/server.cjs')
+    const old = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000)
+    // Two ancient events, well past any retention window.
+    await prisma.$executeRaw`
+      INSERT INTO "SyncEvent" ("entity","entityId","op","payload","createdAt","txid")
+      VALUES ('product','ancient-1','upsert','{}'::jsonb, ${old}, 1),
+             ('product','ancient-2','upsert','{}'::jsonb, ${old}, 2)`
+    const total = () => prisma.syncEvent.count()
+    const before = await total()
+
+    // A till exists and has never said how far it has read, so nothing goes.
+    await prisma.authorizedClient.update({
+      where: { id: device.id }, data: { syncCursorTxid: null } })
+    let pruned = await pruneSyncEvents()
+    eqp('nothing is deleted while a till has not reported', pruned.deleted, 0)
+    eqp('...and the log is untouched', await total(), before)
+
+    // It reports a cursor behind the old rows — still nothing to delete.
+    await prisma.authorizedClient.update({
+      where: { id: device.id }, data: { syncCursorTxid: 0 } })
+    pruned = await pruneSyncEvents()
+    eqp('nothing is deleted below a till that is behind', pruned.deleted, 0)
+
+    // It catches up past them, and only then do they go.
+    await prisma.authorizedClient.update({
+      where: { id: device.id }, data: { syncCursorTxid: 5 } })
+    pruned = await pruneSyncEvents()
+    eqp('old rows every till has read are deleted', pruned.deleted, 2)
+    eqp('...and only those', await total(), before - 2)
+
+    // Recent events survive regardless of how far the tills have read.
+    const recent = await prisma.syncEvent.count({
+      where: { createdAt: { gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } } })
+    t('today\'s changes are still there', recent > 0, recent)
+  }
+
+  console.log('\n— access ends when you say it does —')
+  {
+    const cashier = await api('/api/v1/users', { method: 'POST', body: JSON.stringify({
+      username: 'till_hand', password: 'goodpassword1', role: 'CASHIER' })}, token)
+    t('a cashier can be created', cashier.status === 201, cashier.body)
+    const cashierId = cashier.body.user.id
+    const signIn = async (password = 'goodpassword1') =>
+      api('/api/v1/auth/login', { method: 'POST', body: JSON.stringify({ username: 'till_hand', password }) })
+
+    let s2 = await signIn()
+    t('the cashier can sign in', s2.status === 200, s2.body)
+    let cashierToken = s2.body.token
+
+    let probe = await api('/api/v1/products?limit=1', {}, cashierToken)
+    t('and use the API', probe.status === 200, probe.status)
+
+    // The role has to come from the database, not from what the token claims.
+    const forged = require('jsonwebtoken').sign(
+      { userId: cashierId, role: 'SUPER_ADMIN', tv: 0 }, process.env.JWT_SECRET, { expiresIn: '1h' })
+    const escalate = await api('/api/v1/users', { method: 'POST', body: JSON.stringify({
+      username: 'smuggled', password: 'goodpassword1', role: 'SUPER_ADMIN' })}, forged)
+    eqp('a token claiming a role it does not have is refused', escalate.status, 403)
+
+    // Switching the account off ends the session that is already open.
+    const off = await api(`/api/v1/users/${cashierId}`, { method: 'PUT', body: JSON.stringify({ isActive: false }) }, token)
+    t('the account can be switched off', off.status === 200, off.body)
+    probe = await api('/api/v1/products?limit=1', {}, cashierToken)
+    eqp('the open session stops working at once', probe.status, 403)
+    s2 = await signIn()
+    eqp('and they cannot sign back in', s2.status, 403)
+
+    const on = await api(`/api/v1/users/${cashierId}`, { method: 'PUT', body: JSON.stringify({ isActive: true }) }, token)
+    t('the account can be switched back on', on.status === 200, on.body)
+    s2 = await signIn()
+    t('and they can sign in again', s2.status === 200, s2.body)
+    cashierToken = s2.body.token
+
+    // A password change signs the old session out.
+    await api(`/api/v1/users/${cashierId}`, { method: 'PUT', body: JSON.stringify({ password: 'differentpass9' }) }, token)
+    probe = await api('/api/v1/products?limit=1', {}, cashierToken)
+    eqp('changing the password ends the old session', probe.status, 401)
+    s2 = await signIn('differentpass9')
+    t('the new password works', s2.status === 200, s2.body)
+
+    // The last super admin cannot switch themselves off, or be switched off.
+    const selfOff = await api(`/api/v1/users/${admin.id}`, { method: 'PUT', body: JSON.stringify({ isActive: false }) }, token)
+    eqp('you cannot switch off your own account', selfOff.status, 409)
+  }
+
+  console.log('\n— guessing a password takes more than a minute —')
+  {
+    let last
+    for (let i = 0; i < 12; i++) {
+      last = await api('/api/v1/auth/login', { method: 'POST', body: JSON.stringify({
+        username: 'admin', password: `wrong-${i}` }) })
+    }
+    eqp('repeated failures are throttled', last.status, 429)
+    const legit = await api('/api/v1/auth/login', { method: 'POST', body: JSON.stringify({
+      username: 'admin', password: 'password123' }) })
+    eqp('...including for the right password, once locked', legit.status, 429)
+  }
+
+  console.log('\n— the network is not a credential —')
+  {
+    const bare = await api('/api/v1/system/pair-client', { method: 'POST', body: JSON.stringify({
+      macAddress: 'DE:AD:BE:EF:00:01', friendlyName: 'Rogue' }) })
+    eqp('pairing without a token is refused', bare.status, 401)
+    const listed = await api('/api/v1/system/authorized-clients', {})
+    eqp('listing the tills without a token is refused', listed.status, 401)
+
+    const paired = await api('/api/v1/system/pair-client', { method: 'POST', body: JSON.stringify({
+      macAddress: 'DE:AD:BE:EF:00:02', friendlyName: 'Counter 2' }) }, token)
+    t('a manager can pair a till', paired.status === 200, paired.body)
+
+    const listResp = await api('/api/v1/system/authorized-clients', {}, token)
+    t('the till list is readable with a token', listResp.status === 200, listResp.body)
+    const before = (listResp.body.clients ?? []).length
+    const unpair = await api(`/api/v1/system/authorized-clients/${paired.body.clientId}`, { method: 'DELETE' }, token)
+    t('a till with no sales is removed outright',
+      unpair.status === 200 && unpair.body.retired === false, unpair.body)
+    const after = (await api('/api/v1/system/authorized-clients', {}, token)).body.clients.length
+    eqp('...and stops taking up a seat', before - after, 1)
+
+    // The original till has sales against it, so it is retired, not erased.
+    const retire = await api(`/api/v1/system/authorized-clients/${device.id}`, { method: 'DELETE' }, token)
+    t('a till that has traded is retired instead', retire.status === 200 && retire.body.retired === true, retire.body)
+    const still = await prisma.authorizedClient.findUnique({ where: { id: device.id } })
+    t('...and its row survives for the bills that name it', still !== null && still.retiredAt !== null, still)
+    const bills = await prisma.bill.count({ where: { originDeviceId: device.id } })
+    t('...with its sales intact', bills > 0, bills)
+  }
+
   console.log('\n— the same sale submitted twice is one sale —')
   {
     const idemProd = await prisma.product.create({ data: {

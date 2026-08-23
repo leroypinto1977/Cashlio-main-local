@@ -5,6 +5,7 @@ import {
   KeyRound,
   Loader2,
   ShieldCheck,
+  Power,
   Trash2,
   UserPlus,
   Users
@@ -21,6 +22,7 @@ type User = {
   id: string
   username: string
   role: Role
+  isActive: boolean
   createdAt: string
   billCount: number
 }
@@ -114,6 +116,7 @@ export function UserSettings({ token }: { token: string | null }): React.JSX.Ele
 
   // Role change (inline select)
   const [roleSavingId, setRoleSavingId] = useState<string | null>(null)
+  const [activeSavingId, setActiveSavingId] = useState<string | null>(null)
   const [rowError, setRowError] = useState<{ id: string; message: string } | null>(null)
 
   // Remove
@@ -269,6 +272,44 @@ export function UserSettings({ token }: { token: string | null }): React.JSX.Ele
     }
   }
 
+  // ─── Switch an account on or off ────────────────────────────────────────────
+
+  /**
+   * The honest way to see someone off the premises.
+   *
+   * Deleting them is usually impossible — their name is on every bill they
+   * rang up — and resetting the password only locks them out at the next sign
+   * in, not out of the session already open on the till they walked away from.
+   * Switching the account off ends both, immediately, and leaves the sales
+   * history exactly as it was.
+   */
+  const handleActiveChange = async (user: User, isActive: boolean): Promise<void> => {
+    setActiveSavingId(user.id)
+    setRowError(null)
+    try {
+      const res = await fetch(`${LOCAL_API}/api/v1/users/${user.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ isActive })
+      })
+      const data = await res.json()
+      if (!data.success) {
+        setRowError({ id: user.id, message: data.message || 'Could not change the account.' })
+        return
+      }
+      flash(
+        isActive
+          ? `${user.username} can sign in again.`
+          : `${user.username} is switched off and signed out everywhere.`
+      )
+      await load()
+    } catch {
+      setRowError({ id: user.id, message: 'Could not reach the local server.' })
+    } finally {
+      setActiveSavingId(null)
+    }
+  }
+
   // ─── Remove ─────────────────────────────────────────────────────────────────
 
   const openDelete = (user: User): void => {
@@ -387,7 +428,16 @@ export function UserSettings({ token }: { token: string | null }): React.JSX.Ele
                     <React.Fragment key={u.id}>
                       <tr className="hover:bg-zinc-50">
                         <td className="px-4 py-3">
-                          <span className="font-semibold text-zinc-900">{u.username}</span>
+                          <span
+                            className={`font-semibold ${u.isActive ? 'text-zinc-900' : 'text-zinc-400 line-through'}`}
+                          >
+                            {u.username}
+                          </span>
+                          {!u.isActive && (
+                            <span className="ml-2 px-1.5 py-0.5 rounded bg-zinc-200 text-zinc-600 text-[10px] font-semibold uppercase">
+                              switched off
+                            </span>
+                          )}
                           {isSelf && (
                             <span className="ml-2 px-1.5 py-0.5 rounded bg-zinc-900 text-white text-[10px] font-semibold uppercase">
                               you
@@ -423,7 +473,23 @@ export function UserSettings({ token }: { token: string | null }): React.JSX.Ele
                             >
                               <KeyRound className="w-3.5 h-3.5" /> Reset password
                             </Button>
-                            {/* Never offer removal for the account you are signed in as. */}
+                            {/* Neither of these makes sense for your own account. */}
+                            {!isSelf && (
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                className={`gap-1.5 h-8 ${u.isActive ? 'text-amber-700 hover:bg-amber-50' : 'text-emerald-700 hover:bg-emerald-50'}`}
+                                disabled={activeSavingId === u.id}
+                                onClick={() => handleActiveChange(u, !u.isActive)}
+                              >
+                                {activeSavingId === u.id ? (
+                                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                ) : (
+                                  <Power className="w-3.5 h-3.5" />
+                                )}
+                                {u.isActive ? 'Switch off' : 'Switch on'}
+                              </Button>
+                            )}
                             {!isSelf && (
                               <Button
                                 size="sm"
@@ -618,8 +684,15 @@ export function UserSettings({ token }: { token: string | null }): React.JSX.Ele
               Cancel
             </Button>
             {deleteBlockedByBills && deleteUser ? (
-              <Button className="gap-2" onClick={() => openReset(deleteUser)}>
-                <KeyRound className="w-4 h-4" /> Reset password instead
+              <Button
+                className="gap-2"
+                onClick={() => {
+                  const u = deleteUser
+                  setDeleteUser(null)
+                  handleActiveChange(u, false)
+                }}
+              >
+                <Power className="w-4 h-4" /> Switch the account off instead
               </Button>
             ) : (
               <Button

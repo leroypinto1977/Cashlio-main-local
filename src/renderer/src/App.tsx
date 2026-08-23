@@ -82,6 +82,8 @@ function App(): React.JSX.Element {
   }
   const [devices, setDevices] = useState<AuthorizedClient[]>([])
   const [devicesLoading, setDevicesLoading] = useState(false)
+  const [unpairing, setUnpairing] = useState<string | null>(null)
+  const [deviceError, setDeviceError] = useState('')
 
   type Stats = {
     todayBills: number
@@ -118,7 +120,7 @@ function App(): React.JSX.Element {
     setLoading(true)
     setErrorMsg('')
     try {
-      const hardwareId: string = await window.electron.ipcRenderer.invoke('get-mac-address')
+      const hardwareId = (await window.electron.ipcRenderer.invoke('get-mac-address')) as string
       await axios.post(`${LOCAL_API}/api/v1/system/save-config`, {
         licenseKey: licenseData.licenseKey,
         hardwareId,
@@ -251,6 +253,36 @@ function App(): React.JSX.Element {
       .catch(() => setDevices([]))
       .finally(() => setDevicesLoading(false))
   }, [activeTab, step, authToken])
+
+  /**
+   * Take a till off the branch.
+   *
+   * A licence allows a fixed number of terminals, and until now every pairing
+   * was permanent — a mistyped setup, a machine that was replaced, or one that
+   * left the shop went on holding a seat with no way to release it short of
+   * editing the database. A till that has rung up sales keeps its row, because
+   * every one of those bills names it; what it gives up is the seat.
+   */
+  const handleUnpair = async (device: { id: string; friendlyName: string }): Promise<void> => {
+    setUnpairing(device.id)
+    setDeviceError('')
+    try {
+      const res = await axios.delete(
+        `${LOCAL_API}/api/v1/system/authorized-clients/${device.id}`,
+        { headers: { Authorization: `Bearer ${authToken}` } }
+      )
+      if (!res.data.success) {
+        setDeviceError('Could not remove that terminal.')
+        return
+      }
+      setDevices((prev) => prev.filter((d) => d.id !== device.id))
+    } catch (e) {
+      const msg = (e as { response?: { data?: { message?: string } } }).response?.data?.message
+      setDeviceError(msg || 'Could not reach the local server.')
+    } finally {
+      setUnpairing(null)
+    }
+  }
 
   // ─── Overview stats: fetch when tab is active ─────────────────────────────
   React.useEffect(() => {
@@ -735,6 +767,9 @@ function App(): React.JSX.Element {
                   <div className="w-4 h-4 border-2 border-zinc-300 border-t-zinc-700 rounded-full animate-spin" />
                 )}
               </div>
+              {deviceError && (
+                <p className="text-sm text-red-600 mb-3">{deviceError}</p>
+              )}
               {!devicesLoading && devices.length === 0 ? (
                 <div className="flex flex-col items-center justify-center p-12 mt-10 border-2 border-dashed rounded-xl bg-zinc-50/50">
                   <MonitorSmartphone className="w-10 h-10 text-muted-foreground mb-4" />
@@ -763,6 +798,15 @@ function App(): React.JSX.Element {
                           {new Date(device.authorizedAt).toLocaleDateString()}
                         </p>
                       </div>
+                      <button
+                        type="button"
+                        disabled={unpairing === device.id}
+                        onClick={() => handleUnpair(device)}
+                        title="Remove this terminal and free its licence seat"
+                        className="shrink-0 text-xs font-medium text-red-600 hover:text-red-700 hover:bg-red-50 border border-transparent hover:border-red-200 rounded-md px-2.5 py-1.5 transition-colors disabled:opacity-50"
+                      >
+                        {unpairing === device.id ? 'Removing…' : 'Remove'}
+                      </button>
                     </div>
                   ))}
                 </div>

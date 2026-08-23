@@ -10,6 +10,7 @@ import { Modal } from '../components/Modal'
 import { apiFetch } from '../lib/api'
 import { printReceipt, type ReceiptBill, type ReceiptShop } from '../lib/receipt'
 import { computeInvoiceTotals, round2 } from '@shared/money'
+import { stateCodeOf } from '@shared/validation'
 import { isLengthMode, parseQty, qtyStep, roundQty, formatQty } from '@shared/units'
 import { settle, checkCredit, PAYMENT_METHODS, type PaymentMethod, type Tender } from '@shared/credit'
 
@@ -53,6 +54,9 @@ type Customer = {
   creditLimit?: number
   outstanding?: number
   creditDays?: number
+  /** Decides the tax heads: a customer registered in another state is billed
+   *  IGST rather than CGST + SGST. */
+  gstin?: string | null
 }
 
 /** The customer's ledger as the counter needs it while taking payment. */
@@ -217,6 +221,8 @@ export function BillingScreen({
 
   // Receipt printing
   const [shopInfo, setShopInfo] = useState<ReceiptShop>({ name: 'My Shop' })
+  // The shop's GST state, which decides whether a sale is CGST + SGST or IGST.
+  const [shopStateCode, setShopStateCode] = useState<string | null>(null)
   const [autoPrint, setAutoPrint] = useState<boolean>(() => isAutoPrintEnabled())
   useEffect(() => { localStorage.setItem(AUTO_PRINT_KEY, autoPrint ? 'true' : 'false') }, [autoPrint])
   const [printingState, setPrintingState] = useState<'idle' | 'printing' | 'error'>('idle')
@@ -231,8 +237,9 @@ export function BillingScreen({
     apiFetch<{
       shopName?: string; branchName?: string
       address?: string | null; phone?: string | null; gstin?: string | null
+      stateCode?: string | null
     }>('/api/v1/system/status', token)
-      .then((d) =>
+      .then((d) => {
         setShopInfo({
           name: d.shopName || 'My Shop',
           branch: d.branchName || null,
@@ -240,7 +247,8 @@ export function BillingScreen({
           phone: d.phone ?? null,
           gstin: d.gstin ?? null
         })
-      )
+        setShopStateCode(d.stateCode ?? stateCodeOf(d.gstin))
+      })
       .catch(() => {})
   }, [token])
 
@@ -473,10 +481,17 @@ export function BillingScreen({
   // Same calculator the server uses, so the counter preview and the stored
   // invoice agree to the paisa — including how the bill discount is shared
   // across lines before tax is extracted.
+  // A customer registered in another state pays IGST rather than CGST + SGST.
+  // This was hardcoded intra-state, so the receipt handed over the counter
+  // named different tax heads from the invoice the server stored for the same
+  // sale. The server has always got this right; the screen now agrees with it.
+  const customerStateCode = stateCodeOf(customer?.gstin)
+  const interState =
+    shopStateCode != null && customerStateCode != null && customerStateCode !== shopStateCode
   const totals = computeInvoiceTotals(
     cartItems.map((it) => ({ lineTotal: it.lineTotal, gstPercentage: it.gstPercentage })),
     rawSubtotal * billDiscPct / 100 + billDiscFlat,
-    false
+    interState
   )
   const subtotal = totals.subtotal
   const billDiscAmt = totals.billDiscount

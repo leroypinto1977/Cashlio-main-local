@@ -14,9 +14,8 @@
 
 import { jwtVerify } from 'jose'
 import { createPublicKey, KeyObject } from 'node:crypto'
-import { PrismaClient } from '@prisma/client'
+import { prisma } from './prisma'
 
-const prisma = new PrismaClient()
 
 // ─── Public key ──────────────────────────────────────────────────────────────
 
