@@ -31,6 +31,7 @@ import { SalesScreen } from './screens/SalesScreen'
 import { AnalyticsScreen } from './screens/AnalyticsScreen'
 import { BackupSettings } from './components/BackupSettings'
 import { ShopProfileSettings } from './components/ShopProfileSettings'
+import { UserSettings } from './components/UserSettings'
 import axios from 'axios'
 
 // Always fall back to the known local port so requests never go to "undefined/..."
@@ -59,7 +60,9 @@ function App(): React.JSX.Element {
     gst: '',
     adminUsername: '',
     adminPassword: '',
-    confirmPassword: ''
+    confirmPassword: '',
+    cashierUsername: '',
+    cashierPassword: ''
   })
 
   // Step 3 data
@@ -149,7 +152,12 @@ function App(): React.JSX.Element {
         location: shopData.location,
         gst: shopData.gst,
         adminUsername: shopData.adminUsername,
-        adminPassword: shopData.adminPassword
+        adminPassword: shopData.adminPassword,
+        // Optional. Without a till account the shop has to run every terminal
+        // as the manager, which gives whoever stands at the counter every
+        // manager right there is.
+        cashierUsername: shopData.cashierUsername.trim() || undefined,
+        cashierPassword: shopData.cashierPassword || undefined
       })
       // Sign the freshly-created admin in straight away. Previously this
       // jumped to the dashboard with authToken still null, so every panel
@@ -450,6 +458,46 @@ function App(): React.JSX.Element {
                 </div>
               </div>
 
+              <hr className="border-border my-6" />
+
+              <div className="space-y-4">
+                <div>
+                  <h2 className="text-sm font-bold text-zinc-900 uppercase tracking-wider">
+                    Till Account <span className="text-zinc-400 font-medium normal-case tracking-normal">— optional</span>
+                  </h2>
+                  <p className="text-xs text-muted-foreground mt-1">
+                    A cashier login for the billing terminals. Without one you would
+                    have to sign the tills in as the manager, which gives whoever is
+                    at the counter every manager right — including voiding bills and
+                    changing credit limits. You can add more later in Settings.
+                  </p>
+                </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm font-semibold mb-1.5 ml-1">Cashier Username</label>
+                    <Input
+                      type="text"
+                      value={shopData.cashierUsername}
+                      onChange={(e) =>
+                        setShopData({ ...shopData, cashierUsername: e.target.value.toLowerCase() })
+                      }
+                      placeholder="e.g. counter1"
+                      className="h-11"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-semibold mb-1.5 ml-1">Cashier Password</label>
+                    <Input
+                      type="password"
+                      value={shopData.cashierPassword}
+                      onChange={(e) => setShopData({ ...shopData, cashierPassword: e.target.value })}
+                      placeholder="At least 8 characters"
+                      className="h-11"
+                    />
+                  </div>
+                </div>
+              </div>
+
               <Button
                 type="submit"
                 disabled={loading}
@@ -733,6 +781,9 @@ function App(): React.JSX.Element {
             <div className="grid grid-cols-2 gap-5 max-w-2xl">
               <div className="col-span-2">
                 <ShopProfileSettings token={authToken} />
+              </div>
+              <div className="col-span-2 empty:hidden">
+                <UserSettings token={authToken} />
               </div>
               <div className="p-5 rounded-xl border bg-card space-y-1 col-span-2">
                 <p className="text-xs font-semibold text-zinc-500 uppercase tracking-wide">Server Address</p>
