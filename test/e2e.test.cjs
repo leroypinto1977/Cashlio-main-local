@@ -606,6 +606,83 @@ async function api(path, opts = {}, token) {
   r = await api('/api/v1/purchase-orders?status=RECEIVED', {}, token)
   t('orders filterable by status', r.body.orders.every(o => o.status === 'RECEIVED'), r.body.orders?.length)
 
+
+  console.log('\n— warranties —')
+  const wProd = await prisma.product.create({ data: {
+    itemCode: 'WARR-TEST-001', name: 'Covered Fan', categoryId: cat.id,
+    sellingRate: 1500, gstPercentage: 18, warrantyPeriodDays: 365 }})
+  const noWarrProd = await prisma.product.create({ data: {
+    itemCode: 'WARR-TEST-002', name: 'Bare Wire', categoryId: cat.id,
+    sellingRate: 50, gstPercentage: 18, warrantyPeriodDays: 0 }})
+  for (const pr of [wProd, noWarrProd]) {
+    await prisma.productBatch.create({ data: {
+      productId: pr.id, batchCode: 'W', uniqueStockCode: `${pr.itemCode}/W`,
+      purchaseRate: 10, receivedQty: 50, currentQty: 50 }})
+  }
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, paymentMethod: 'CASH', customerId: localCust.id,
+    items: [
+      { productId: wProd.id, quantity: 2, unitRate: 1500, gstPercentage: 18, lineDiscountPct: 0, lineDiscountAmt: 0 },
+      { productId: noWarrProd.id, quantity: 5, unitRate: 50, gstPercentage: 18, lineDiscountPct: 0, lineDiscountAmt: 0 }
+    ] })}, token)
+  const wBill = r.body.bill
+  t('sale with a covered product created', r.status === 201, r.body)
+  const covers = await prisma.warranty.findMany({ where: { billId: wBill.id } })
+  t('one warranty per covered LINE, not per unit', covers.length === 1, covers.length)
+  t('uncovered product got no warranty', !covers.some(c => c.productId === noWarrProd.id))
+  t('warranty linked to the customer', covers[0].customerId === localCust.id)
+  const expDays = Math.round((covers[0].expiryDate - covers[0].purchaseDate) / 86400000)
+  t('expiry is purchase + 365 days', expDays === 365, expDays)
+  const wId = covers[0].id
+
+  r = await api('/api/v1/warranties?status=ACTIVE', {}, token)
+  t('listed as in cover', r.body.warranties.some(w => w.id === wId && w.status === 'ACTIVE'), r.body.warranties?.length)
+  r = await api('/api/v1/warranties?search=Covered', {}, token)
+  t('searchable by product name', r.body.warranties.some(w => w.id === wId))
+  r = await api('/api/v1/warranties/summary', {}, token)
+  t('summary counts active cover', r.body.active >= 1, r.body)
+  r = await api('/api/v1/warranties/expiring-soon', {}, token)
+  t('a year-long warranty is not expiring soon', !r.body.warranties.some(w => w.id === wId))
+
+  // claim — a cashier may do this
+  r = await api(`/api/v1/warranties/${wId}/claim`, { method: 'POST', body: JSON.stringify({ description: '' }) }, cashierToken)
+  t('claim needs a description', r.status === 400 && r.body.error === 'DESCRIPTION_REQUIRED', r.body)
+  r = await api(`/api/v1/warranties/${wId}/claim`, { method: 'POST', body: JSON.stringify({
+    description: 'Motor makes a grinding noise', serialNumber: 'SN-4471' }) }, cashierToken)
+  t('cashier can open a claim', r.status === 200 && r.body.warranty.status === 'CLAIMED', r.body)
+  t('serial recorded at claim time', r.body.warranty.serialNumber === 'SN-4471')
+  t('claimant recorded', r.body.warranty.claimedBy?.username === 'cashier1', r.body.warranty.claimedBy)
+  r = await api(`/api/v1/warranties/${wId}/claim`, { method: 'POST', body: JSON.stringify({ description: 'again' }) }, token)
+  t('cannot open a second claim', r.status === 409 && r.body.error === 'WARRANTY_ALREADY_CLAIMED', r.body)
+  r = await api('/api/v1/warranties?status=CLAIMED', {}, token)
+  t('appears under open claims', r.body.warranties.some(w => w.id === wId))
+
+  // resolve — super admin only
+  r = await api(`/api/v1/warranties/${wId}/resolve`, { method: 'PUT', body: JSON.stringify({ resolution: 'REPLACED' }) }, cashierToken)
+  t('cashier cannot resolve', r.status === 403, r.body)
+  r = await api(`/api/v1/warranties/${wId}/resolve`, { method: 'PUT', body: JSON.stringify({ resolution: 'LOST' }) }, token)
+  t('unknown resolution rejected', r.status === 400 && r.body.error === 'INVALID_RESOLUTION', r.body)
+  r = await api(`/api/v1/warranties/${wId}/resolve`, { method: 'PUT', body: JSON.stringify({
+    resolution: 'REPLACED', notes: 'Swapped for a new unit' }) }, token)
+  t('super admin resolves', r.status === 200 && r.body.warranty.status === 'RESOLVED', r.body)
+  t('resolution stored', r.body.warranty.resolution === 'REPLACED')
+  r = await api(`/api/v1/warranties/${wId}/resolve`, { method: 'PUT', body: JSON.stringify({ resolution: 'REPAIRED' }) }, token)
+  t('cannot resolve twice', r.status === 409 && r.body.error === 'NO_OPEN_CLAIM', r.body)
+
+  // expiry is a date test, never a stored state
+  const lapsed = await prisma.warranty.create({ data: {
+    productId: wProd.id, billId: wBill.id,
+    billItemId: wBill.items.find(i => i.productId === noWarrProd.id).id,
+    purchaseDate: new Date('2024-01-01'), expiryDate: new Date('2025-01-01'), status: 'ACTIVE' }})
+  r = await api(`/api/v1/warranties/${lapsed.id}`, {}, token)
+  t('lapsed cover reads EXPIRED though stored ACTIVE', r.body.warranty.status === 'EXPIRED' && r.body.warranty.storedStatus === 'ACTIVE', r.body.warranty)
+  r = await api(`/api/v1/warranties/${lapsed.id}/claim`, { method: 'POST', body: JSON.stringify({ description: 'broke' }) }, token)
+  t('cannot claim after expiry', r.status === 409 && r.body.error === 'WARRANTY_EXPIRED', r.body)
+  r = await api('/api/v1/warranties?status=EXPIRED', {}, token)
+  t('EXPIRED filter finds it', r.body.warranties.some(w => w.id === lapsed.id))
+  r = await api('/api/v1/warranties?status=ACTIVE', {}, token)
+  t('ACTIVE filter excludes it', !r.body.warranties.some(w => w.id === lapsed.id))
+
   console.log(`\n${pass} passed, ${fail} failed`)
   await prisma.$disconnect()
   process.exit(fail ? 1 : 0)

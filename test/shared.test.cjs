@@ -5,6 +5,7 @@ const V = require('../.test-build/validation.js')
 const U = require('../.test-build/units.js')
 const C = require('../.test-build/credit.js')
 const P = require('../.test-build/procurement.js')
+const W = require('../.test-build/warranty.js')
 
 let pass = 0, fail = 0
 function check(name, cond, detail) {
@@ -244,6 +245,24 @@ let out = P.outstandingLines([{ orderedQty: 10, receivedQty: 4 }, { orderedQty: 
 check('only short lines are outstanding', out.length === 1 && out[0].pendingQty === 6, out)
 check('valid status accepted', P.isPurchaseOrderStatus('RECEIVED'))
 check('junk status rejected', !P.isPurchaseOrderStatus('SHIPPED'))
+
+
+console.log('— Warranty —')
+const bought = new Date('2026-01-01T00:00:00Z')
+check('expiry adds the period', W.expiryDateFor(bought, 365).toISOString().startsWith('2027-01-01'))
+check('zero period expires immediately', W.expiryDateFor(bought, 0).getTime() === bought.getTime())
+const d2026 = new Date('2026-06-01'), d2028 = new Date('2028-01-01')
+check('in cover reads ACTIVE', W.effectiveStatus('ACTIVE', d2028, d2026) === 'ACTIVE')
+check('past expiry reads EXPIRED without being stored', W.effectiveStatus('ACTIVE', d2026, d2028) === 'EXPIRED')
+check('an open claim stays CLAIMED after cover ends', W.effectiveStatus('CLAIMED', d2026, d2028) === 'CLAIMED')
+check('resolved stays RESOLVED', W.effectiveStatus('RESOLVED', d2026, d2028) === 'RESOLVED')
+check('can claim in cover', W.canClaim('ACTIVE', d2028, d2026).allowed)
+check('cannot claim after expiry', W.canClaim('ACTIVE', d2026, d2028).reason === 'EXPIRED')
+check('cannot double-claim', W.canClaim('CLAIMED', d2028, d2026).reason === 'ALREADY_CLAIMED')
+check('cannot claim a resolved one', W.canClaim('RESOLVED', d2028, d2026).reason === 'ALREADY_RESOLVED')
+eq('days until expiry', W.daysUntilExpiry(new Date('2026-06-11'), new Date('2026-06-01')), 10)
+check('negative once expired', W.daysUntilExpiry(d2026, d2028) < 0)
+check('resolution codes validate', W.isWarrantyResolution('REPLACED') && !W.isWarrantyResolution('LOST'))
 
 console.log(`\n${pass} passed, ${fail} failed\n`)
 process.exit(fail ? 1 : 0)

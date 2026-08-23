@@ -84,6 +84,8 @@ model User {
   payments     Payment[]
   followUps    CustomerFollowUp[]
   purchaseOrders PurchaseOrder[]
+  warrantiesClaimed  Warranty[] @relation("WarrantyClaimedBy")
+  warrantiesResolved Warranty[] @relation("WarrantyResolvedBy")
 }
 
 model Warehouse {
@@ -166,6 +168,7 @@ model Product {
   sellingRate        Decimal           @default(0) @db.Decimal(10, 2)
   billItems          BillItem[]
   orderItems         PurchaseOrderItem[]
+  warranties         Warranty[]
   category           Category          @relation(fields: [categoryId], references: [id])
   batches            ProductBatch[]
   suppliers          ProductSupplier[]
@@ -263,6 +266,46 @@ model PurchaseOrderItem {
   @@index([purchaseOrderId])
 }
 
+/// Cover on a sold item, created at the point of sale for every line whose
+/// product carries a warranty period. One row per bill line rather than per
+/// unit: a 50-switch sale is one warranty, and the serial number — recorded
+/// when a claim is made, since that is when anyone looks at it — tells the
+/// units apart if it ever matters.
+model Warranty {
+  id               String    @id @default(uuid())
+  productId        String
+  product          Product   @relation(fields: [productId], references: [id])
+  billId           String
+  bill             Bill      @relation(fields: [billId], references: [id], onDelete: Cascade)
+  billItemId       String    @unique
+  billItem         BillItem  @relation(fields: [billItemId], references: [id], onDelete: Cascade)
+  customerId       String?
+  customer         Customer? @relation(fields: [customerId], references: [id])
+  serialNumber     String?
+  purchaseDate     DateTime
+  expiryDate       DateTime
+  /// ACTIVE while in cover, CLAIMED once a claim is open, RESOLVED when
+  /// closed. EXPIRED is never stored — it is a function of expiryDate and
+  /// now, so it cannot go stale.
+  status           String    @default("ACTIVE")
+  claimDate        DateTime?
+  claimDescription String?
+  claimedById      String?
+  claimedBy        User?     @relation("WarrantyClaimedBy", fields: [claimedById], references: [id])
+  resolvedById     String?
+  resolvedBy       User?     @relation("WarrantyResolvedBy", fields: [resolvedById], references: [id])
+  resolvedAt       DateTime?
+  /// REPAIRED | REPLACED | REFUNDED | REJECTED — what was actually done.
+  resolution       String?
+  resolutionNotes  String?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  @@index([status, expiryDate])
+  @@index([customerId])
+  @@index([expiryDate])
+}
+
 model Customer {
   id        String   @id @default(uuid())
   name      String
@@ -282,6 +325,7 @@ model Customer {
   bills     Bill[]
   payments  Payment[]
   followUps CustomerFollowUp[]
+  warranties Warranty[]
 }
 
 /// A collection against a bill. Bills carry one row per tender taken at the
@@ -375,6 +419,7 @@ model Bill {
   customer       Customer?        @relation(fields: [customerId], references: [id])
   originDevice   AuthorizedClient @relation(fields: [originDeviceId], references: [id])
   items          BillItem[]
+  warranties     Warranty[]
 }
 
 model BillItem {
@@ -407,6 +452,7 @@ model BillItem {
   originalBillItem   BillItem?  @relation("BillItemReturns", fields: [originalBillItemId], references: [id])
   returnedAs         BillItem[] @relation("BillItemReturns")
   batchAllocations   BillItemBatch[]
+  warranty           Warranty?
   bill               Bill       @relation(fields: [billId], references: [id], onDelete: Cascade)
   product            Product    @relation(fields: [productId], references: [id])
 }

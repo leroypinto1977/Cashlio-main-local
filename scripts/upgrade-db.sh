@@ -11,6 +11,13 @@ cd "$(dirname "$0")/.."
 
 BASELINE="20260823000001_baseline"
 
+# .env is not in git. Fail here, clearly, rather than three steps later with a
+# Prisma error about DATABASE_URL.
+if [ -z "${DATABASE_URL:-}" ] && [ ! -f .env ]; then
+  echo "No .env found. Copy .env.example to .env and fill it in (see SETUP.md)." >&2
+  exit 1
+fi
+
 echo "▸ checking migration state"
 # A pre-migration database has our tables but no _prisma_migrations record.
 HAS_TABLES=$(psql "${DATABASE_URL:-$(grep -E '^DATABASE_URL=' .env | cut -d= -f2- | tr -d '"')}" -qAt \
