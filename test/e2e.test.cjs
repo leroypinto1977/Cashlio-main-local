@@ -937,6 +937,48 @@ async function api(path, opts = {}, token) {
   const mixLeft = Number((await prisma.productBatch.findFirst({ where: { productId: mixProd.id } })).currentQty)
   eqp('stock reduced by the exact total', 100 - mixLeft, 16.999 + 0.002)
 
+
+  console.log('\n— analytics counts the right money —')
+  const anProd = await prisma.product.create({ data: {
+    itemCode: 'AN-TEST-001', name: 'Analytics Item', categoryId: cat.id, sellingRate: 1000, gstPercentage: 0 }})
+  await prisma.productBatch.create({ data: {
+    productId: anProd.id, batchCode: 'A', uniqueStockCode: 'AN-TEST-001/A',
+    purchaseRate: 400, receivedQty: 100, currentQty: 100 }})
+  const anCust = await prisma.customer.create({ data: {
+    name: 'Analytics Buyer', phone: '9000000099', creditLimit: 100000, creditDays: 30 }})
+  const anBefore = (await api('/api/v1/analytics/summary?period=today', {}, token)).body.summary
+
+  // a credit sale must count as revenue immediately
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, customerId: anCust.id, payments: [],
+    items: [{ productId: anProd.id, quantity: 5, unitRate: 1000, gstPercentage: 0, lineDiscountPct: 0, lineDiscountAmt: 0 }] })}, token)
+  const creditBill = r.body.bill
+  let anAfter = (await api('/api/v1/analytics/summary?period=today', {}, token)).body.summary
+  eqp('an unpaid credit sale still counts as revenue', anAfter.totalRevenue - anBefore.totalRevenue, 5000)
+
+  // a split tender must be attributed to both methods
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, paymentMethod: 'CASH',
+    payments: [{ method: 'CASH', amount: 400 }, { method: 'UPI', amount: 600 }],
+    items: [{ productId: anProd.id, quantity: 1, unitRate: 1000, gstPercentage: 0, lineDiscountPct: 0, lineDiscountAmt: 0 }] })}, token)
+  t('split-tender sale created', r.status === 201, r.body)
+  const afterSplit = (await api('/api/v1/analytics/summary?period=today', {}, token)).body.summary
+  eqp('cash half attributed to cash', afterSplit.paymentBreakdown.CASH - anAfter.paymentBreakdown.CASH, 400)
+  eqp('upi half attributed to upi', afterSplit.paymentBreakdown.UPI - anAfter.paymentBreakdown.UPI, 600)
+  t('cheque is reported, not silently dropped', typeof afterSplit.paymentBreakdown.CHEQUE === 'number', afterSplit.paymentBreakdown)
+
+  // returned goods come off revenue
+  r = await api(`/api/v1/bills/${creditBill.id}/return`, { method: 'POST', body: JSON.stringify({
+    items: [{ billItemId: creditBill.items[0].id, quantity: 5 }], reasonCode: 'CHANGED_MIND' })}, token)
+  t('full return accepted', r.status === 201, r.body)
+  const afterReturn = (await api('/api/v1/analytics/summary?period=today', {}, token)).body.summary
+  eqp('returns are subtracted from net revenue',
+    afterReturn.netRevenue - afterSplit.netRevenue, -5000)
+  t('gross and net are both reported',
+    afterReturn.totalRevenue > afterReturn.netRevenue, { g: afterReturn.totalRevenue, n: afterReturn.netRevenue })
+  t('margin stays a believable percentage',
+    afterReturn.estimatedMarginPct < 100, afterReturn.estimatedMarginPct)
+
   console.log(`\n${pass} passed, ${fail} failed`)
   await prisma.$disconnect()
   process.exit(fail ? 1 : 0)

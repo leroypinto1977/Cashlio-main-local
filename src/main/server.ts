@@ -4433,7 +4433,11 @@ app.get('/api/v1/analytics/summary', requireAuth(), async (req, res) => {
     }
 
     const where = {
-      status: 'PAID',
+      // A sale is a sale whether or not the customer has paid yet. Counting
+      // only PAID bills hid every credit sale until it was settled, and then
+      // moved it into the revenue of the day it was billed — so the same
+      // day's takings read differently a week later.
+      status: { in: ['PAID', 'PARTIAL', 'CREDIT'] },
       ...(startDate ? { paidAt: { gte: startDate } } : {})
     }
 
@@ -4464,8 +4468,8 @@ app.get('/api/v1/analytics/summary', requireAuth(), async (req, res) => {
     let totalLineDiscounts = 0
     let estimatedCOGS = 0
     let cogsItemCount = 0
-    const payBreakdownAmt: Record<string, number> = { CASH: 0, UPI: 0, CARD: 0 }
-    const payBreakdownCount: Record<string, number> = { CASH: 0, UPI: 0, CARD: 0 }
+    const payBreakdownAmt: Record<string, number> = { CASH: 0, UPI: 0, CARD: 0, CHEQUE: 0 }
+    const payBreakdownCount: Record<string, number> = { CASH: 0, UPI: 0, CARD: 0, CHEQUE: 0 }
     const productMap: Record<
       string,
       { productName: string; itemCode: string; revenue: number; taxableValue: number; qty: number; cost: number }
@@ -4475,8 +4479,6 @@ app.get('/api/v1/analytics/summary', requireAuth(), async (req, res) => {
       totalRevenue += Number(bill.totalAmount)
       totalTaxableValue += Number(bill.taxableValue ?? 0)
       totalBillDiscounts += Number(bill.discountAmount)
-      payBreakdownAmt[bill.paymentMethod] = (payBreakdownAmt[bill.paymentMethod] || 0) + Number(bill.totalAmount)
-      payBreakdownCount[bill.paymentMethod] = (payBreakdownCount[bill.paymentMethod] || 0) + 1
 
       for (const item of bill.items) {
         const qty = Number(item.quantity)
@@ -4509,14 +4511,44 @@ app.get('/api/v1/analytics/summary', requireAuth(), async (req, res) => {
       }
     }
 
+    // Goods that came back are not revenue. Credit notes were excluded from
+    // the query and never subtracted, so a fully-returned sale still counted
+    // in full — and a returned credit sale, whose settlement recompute marks
+    // it PAID at zero owing, counted as revenue nobody ever paid.
+    const returnAgg = await prisma.bill.aggregate({
+      where: { status: 'RETURN', ...(startDate ? { paidAt: { gte: startDate } } : {}) },
+      _sum: { totalAmount: true, taxableValue: true },
+      _count: true
+    })
+    const totalReturns = round2(Number(returnAgg._sum.totalAmount ?? 0))
+    const returnsTaxable = round2(Number(returnAgg._sum.taxableValue ?? 0))
+    const returnCount = returnAgg._count
+
+    // The tender split comes from the payments themselves. Attributing a
+    // bill's whole total to its first tender reported a 500 cash + 500 UPI
+    // sale as 1,000 cash, dropped CHEQUE entirely, and ignored every
+    // collection made after the sale.
+    const paymentRows = await prisma.payment.groupBy({
+      by: ['method'],
+      where: startDate ? { receivedAt: { gte: startDate } } : undefined,
+      _sum: { amount: true },
+      _count: true
+    })
+    for (const row of paymentRows) {
+      payBreakdownAmt[row.method] = round2(Number(row._sum.amount ?? 0))
+      payBreakdownCount[row.method] = row._count
+    }
+
     const totalDiscounts = totalLineDiscounts + totalBillDiscounts
     const grossRevenuePlusDics = totalRevenue + totalDiscounts
     // Margin compares ex-GST revenue with ex-GST cost. Using the GST-inclusive
     // total against an ex-GST purchase rate overstated every margin by the tax.
     // Bills written before the tax breakdown existed have taxableValue 0, so
     // fall back to the gross total for those rather than reporting 100% margin.
-    const revenueExGst = totalTaxableValue > 0 ? totalTaxableValue : totalRevenue
-    const estimatedGrossProfit = revenueExGst - estimatedCOGS
+    const netRevenue = round2(totalRevenue - totalReturns)
+    const grossTaxable = totalTaxableValue > 0 ? totalTaxableValue : totalRevenue
+    const revenueExGst = round2(grossTaxable - returnsTaxable)
+    const estimatedGrossProfit = round2(revenueExGst - estimatedCOGS)
     const estimatedMarginPct = revenueExGst > 0 ? (estimatedGrossProfit / revenueExGst) * 100 : 0
     const topProducts = Object.values(productMap).sort((a, b) => b.revenue - a.revenue).slice(0, 8)
 
@@ -4525,7 +4557,11 @@ app.get('/api/v1/analytics/summary', requireAuth(), async (req, res) => {
       summary: {
         period: String(period),
         totalBills: bills.length,
+        // Gross sales, what came back, and the difference.
         totalRevenue,
+        totalReturns,
+        netRevenue,
+        returnCount,
         avgBillValue: bills.length > 0 ? totalRevenue / bills.length : 0,
         totalDiscounts,
         totalLineDiscounts,
@@ -4537,8 +4573,11 @@ app.get('/api/v1/analytics/summary', requireAuth(), async (req, res) => {
         revenueExGst,
         totalTaxableValue,
         hasCOGSData: cogsItemCount > 0,
-        paymentBreakdown: { CASH: payBreakdownAmt.CASH, UPI: payBreakdownAmt.UPI, CARD: payBreakdownAmt.CARD },
-        paymentCounts: { CASH: payBreakdownCount.CASH, UPI: payBreakdownCount.UPI, CARD: payBreakdownCount.CARD },
+        // Every method, including CHEQUE, which used to be counted in
+        // revenue but omitted here so the two never reconciled.
+        paymentBreakdown: payBreakdownAmt,
+        paymentCounts: payBreakdownCount,
+        totalCollected: round2(Object.values(payBreakdownAmt).reduce((a, b) => a + b, 0)),
         topProducts
       }
     })
