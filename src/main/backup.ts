@@ -16,17 +16,13 @@ import fs from 'node:fs'
 import { spawn } from 'node:child_process'
 import { createGzip } from 'node:zlib'
 import { pipeline } from 'node:stream/promises'
-import { PrismaClient } from '@prisma/client'
+import { prisma } from './prisma'
 
 const RETENTION_COUNT = 30
 const FILE_PREFIX = 'cashlio-'
 const FILE_SUFFIX = '.sql.gz'
 
-let prismaForBackup: PrismaClient | null = null
-function getPrisma(): PrismaClient {
-  if (!prismaForBackup) prismaForBackup = new PrismaClient()
-  return prismaForBackup
-}
+
 
 const sanitize = (s: string): string => s.replace(/[^a-zA-Z0-9_\- ]+/g, '').trim() || 'branch'
 
@@ -60,7 +56,7 @@ function splitPassword(dbUrl: string): { url: string; password: string | null } 
 export async function getBackupDir(): Promise<string> {
   let branchName = 'branch'
   try {
-    const cfg = await getPrisma().shopConfig.findFirst()
+    const cfg = await prisma.shopConfig.findFirst()
     if (cfg?.branchName) branchName = cfg.branchName
   } catch {
     // ShopConfig may not exist yet (pre-setup). Fall back to default.

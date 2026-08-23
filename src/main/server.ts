@@ -2,7 +2,8 @@ import express, { Request, Response, NextFunction } from 'express'
 import cors from 'cors'
 import jwt from 'jsonwebtoken'
 import bcrypt from 'bcryptjs'
-import { PrismaClient, Prisma } from '@prisma/client'
+import { Prisma } from '@prisma/client'
+import { prisma } from './prisma'
 import os from 'os'
 import {
   recordSync,
@@ -59,7 +60,6 @@ declare global {
  */
 const MAX_LINE_DISCOUNT_PCT = 90
 
-const prisma = new PrismaClient()
 const app = express()
 
 type TxClient = Parameters<Parameters<typeof prisma.$transaction>[0]>[0]
@@ -5279,6 +5279,28 @@ export function startSyncEventPruning(): void {
   setTimeout(tick, 10 * 60 * 1000)
   pruneTimer = setInterval(tick, 24 * 60 * 60 * 1000)
 }
+
+/**
+ * Anything that got past every route.
+ *
+ * Express's built-in fallbacks answer an unknown path with an HTML error
+ * page, and an unhandled throw with a stack trace — the file layout of the
+ * shop's server, handed to whoever asked. Neither is what a JSON API should
+ * say, and a till that gets HTML where it expected JSON fails with a parse
+ * error that tells the cashier nothing.
+ */
+app.use((req: Request, res: Response) => {
+  res.status(404).json({ success: false, error: 'NOT_FOUND', path: req.path })
+})
+
+app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+  // The routes catch their own errors; reaching here means something threw
+  // outside one — malformed JSON in the body is the usual cause. Log the
+  // detail locally, tell the caller only that it failed.
+  console.error('[api] unhandled error:', err?.stack ?? err)
+  if (res.headersSent) return
+  res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
+})
 
 // ─── Server Export ────────────────────────────────────────────────────────────
 

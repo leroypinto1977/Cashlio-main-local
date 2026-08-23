@@ -980,6 +980,22 @@ async function api(path, opts = {}, token) {
     afterReturn.estimatedMarginPct < 100, afterReturn.estimatedMarginPct)
 
 
+  console.log('\n— the API answers in JSON even when it fails —')
+  {
+    const missing = await api('/api/v1/no-such-thing', {}, token)
+    eqp('an unknown path is a 404', missing.status, 404)
+    t('...as JSON, not an HTML error page', missing.body?.error === 'NOT_FOUND', missing.body)
+
+    const bad = await fetch(BASE + '/api/v1/bills', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: '{ this is not json'
+    })
+    const badBody = await bad.json().catch(() => null)
+    t('malformed JSON does not return a stack trace', badBody !== null && !JSON.stringify(badBody).includes('at '), badBody)
+    t('...and says only that it failed', bad.status >= 400, bad.status)
+  }
+
   console.log('\n— asking for everything gets you a page —')
   {
     // A caller cannot make the server build an unbounded result set.
