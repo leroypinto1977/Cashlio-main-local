@@ -61,6 +61,11 @@ model AuthorizedClient {
   /// the terminal they were rung up on; this is what stops it holding a
   /// licence seat.
   retiredAt    DateTime?
+  /// How far this till has read the change log, reported on every pull. The
+  /// log is pruned to the furthest point *every* till has passed, so trimming
+  /// it can never delete a change one of them has not seen yet.
+  syncCursorTxid BigInt?
+  lastSyncAt     DateTime?
   bills        Bill[]
 }
 
@@ -373,6 +378,9 @@ model Payment {
 
   @@index([customerId, receivedAt])
   @@index([billId])
+  // The tender split groups the whole payment table over a date window.
+  @@index([method, receivedAt])
+  @@index([receivedAt])
 }
 
 /// A note to chase a customer, usually about an overdue balance.
@@ -440,6 +448,19 @@ model Bill {
   originDevice   AuthorizedClient @relation(fields: [originDeviceId], references: [id])
   items          BillItem[]
   warranties     Warranty[]
+
+  // Prisma does not index foreign keys, and nothing here was indexed at all.
+  // Every one of these backs a screen the shop opens daily: the sales list
+  // and the analytics window read (status, paidAt); a customer's history and
+  // the receivables ageing read (customerId, paidAt); the return flow walks
+  // back to the bill it refunds. Without them each of those sorts the whole
+  // table, which is instant at a thousand bills and not at a hundred thousand.
+  @@index([paidAt])
+  @@index([status, paidAt])
+  @@index([customerId, paidAt])
+  @@index([cashierId, paidAt])
+  @@index([originalBillId])
+  @@index([originDeviceId])
 }
 
 model BillItem {
@@ -475,4 +496,11 @@ model BillItem {
   warranty           Warranty?
   bill               Bill       @relation(fields: [billId], references: [id], onDelete: Cascade)
   product            Product    @relation(fields: [productId], references: [id])
+
+  // billId backs every bill detail view and every return; productId backs the
+  // top-products roll-up, which groups the whole table; originalBillItemId is
+  // walked once per line on every return to check what is left to give back.
+  @@index([billId])
+  @@index([productId])
+  @@index([originalBillItemId])
 }

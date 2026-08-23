@@ -219,6 +219,33 @@ function requireAuth(roles?: string[]) {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+/**
+ * Turn `?limit=&offset=` into something safe to hand a database.
+ *
+ * These came straight off the query string through `parseInt`, so a caller
+ * could ask for every row in the table — and on the endpoints that include
+ * batches or bill lines, every related row too. That is a few keystrokes
+ * away from exhausting the server's memory and taking every till in the shop
+ * offline with it. `?limit=abc` was worse: NaN reached Prisma and became a
+ * 500 on a screen the shop needed.
+ *
+ * A ceiling of 200 is above any page a person reads and far below what hurts.
+ */
+const DEFAULT_PAGE = 50
+const MAX_PAGE = 200
+
+function pageArgs(
+  query: { limit?: unknown; offset?: unknown },
+  fallback = DEFAULT_PAGE
+): { take: number; skip: number } {
+  const rawTake = parseInt(String(query.limit ?? fallback), 10)
+  const rawSkip = parseInt(String(query.offset ?? 0), 10)
+  return {
+    take: Math.min(MAX_PAGE, Math.max(1, Number.isFinite(rawTake) ? rawTake : fallback)),
+    skip: Math.max(0, Number.isFinite(rawSkip) ? rawSkip : 0)
+  }
+}
+
 // IST is UTC+5:30. All date-boundary calculations must use IST so that
 // "today" in the UI matches the actual calendar day the user is on.
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000
@@ -910,8 +937,18 @@ app.post('/api/v1/auth/login', async (req, res) => {
 // for anyone who asks, so this asks for a token.
 app.get('/api/v1/system/authorized-clients', requireAuth(), async (_req, res) => {
   try {
+    // Named fields rather than the whole row: syncCursorTxid is a BigInt,
+    // which JSON cannot serialise, and it is bookkeeping nobody needs to see.
     const clients = await prisma.authorizedClient.findMany({
       where: { retiredAt: null },
+      select: {
+        id: true,
+        friendlyName: true,
+        macAddress: true,
+        terminalCode: true,
+        authorizedAt: true,
+        lastSyncAt: true
+      },
       orderBy: { authorizedAt: 'desc' }
     })
     return res.status(200).json({ success: true, clients })
@@ -1642,23 +1679,45 @@ app.delete('/api/v1/suppliers/:id', requireAuth(['SUPER_ADMIN']), async (req, re
 
 // ─── Phase 2A — Products ──────────────────────────────────────────────────────
 
+/**
+ * The product catalogue.
+ *
+ * This returned every matching product with every one of its batches, and
+ * ignored any limit it was given. Each terminal asked for the lot once an
+ * hour to fill its offline cache, so a shop with a few thousand products and
+ * a few years of batches moved tens of megabytes across the counter network
+ * every hour, per till, and built all of it in the branch server's memory
+ * first.
+ *
+ * It pages now. `slim=true` drops the batch lists, which is what a till
+ * actually wants: it sells from stock totals and has no use for the purchase
+ * history behind them.
+ */
 app.get('/api/v1/products', requireAuth(), async (req, res) => {
   try {
     const { search, categoryId, isActive } = req.query
+    const slim = String(req.query.slim ?? '') === 'true'
+    const page = pageArgs(req.query, MAX_PAGE)
 
-    const products = await prisma.product.findMany({
-      where: {
-        isActive: isActive === 'false' ? false : isActive === 'true' ? true : undefined,
-        categoryId: categoryId ? String(categoryId) : undefined,
-        OR: search
-          ? [
-              { name: { contains: String(search), mode: 'insensitive' } },
-              { itemCode: { contains: String(search), mode: 'insensitive' } },
-              { brand: { contains: String(search), mode: 'insensitive' } }
-            ]
-          : undefined
-      },
+    const where: Prisma.ProductWhereInput = {
+      isActive: isActive === 'false' ? false : isActive === 'true' ? true : undefined,
+      categoryId: categoryId ? String(categoryId) : undefined,
+      OR: search
+        ? [
+            { name: { contains: String(search), mode: 'insensitive' } },
+            { itemCode: { contains: String(search), mode: 'insensitive' } },
+            { brand: { contains: String(search), mode: 'insensitive' } }
+          ]
+        : undefined
+    }
+
+    const [total, products] = await Promise.all([
+      prisma.product.count({ where }),
+      prisma.product.findMany({
+      where,
       include: {
+        // The category is one row and the till shows it; the batches are the
+        // expensive part, and only the manager screens read them.
         category: true,
         batches: {
           where: { isActive: true },
@@ -1680,24 +1739,35 @@ app.get('/api/v1/products', requireAuth(), async (req, res) => {
           }
         }
       },
-      orderBy: { name: 'asc' }
-    })
+      orderBy: { name: 'asc' },
+      ...page
+      })
+    ])
 
     const result = products.map((p) => {
       const mappedBatches = p.batches.map(serializeBatch)
-      return {
+      const totalStock = roundQty(mappedBatches.reduce((sum, b) => sum + b.currentQty, 0))
+      const base = {
         ...p,
-        totalStock: roundQty(mappedBatches.reduce((sum, b) => sum + b.currentQty, 0)),
+        totalStock,
         batchCount: mappedBatches.length,
-        latestBatch: mappedBatches[0] ?? null,
-        batches: mappedBatches,
         sellingRate: Number(p.sellingRate),
         gstPercentage: Number(p.gstPercentage),
         minStockLevel: Number(p.minStockLevel)
       }
+      if (slim) {
+        const { batches: _b, ...rest } = base
+        return rest
+      }
+      return { ...base, latestBatch: mappedBatches[0] ?? null, batches: mappedBatches }
     })
 
-    return res.json({ success: true, products: result })
+    return res.json({
+      success: true,
+      products: result,
+      total,
+      hasMore: page.skip + result.length < total
+    })
   } catch (err) {
     console.error(err)
     return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
@@ -2355,7 +2425,7 @@ app.get('/api/v1/system/next-bill-number', requireAuth(), async (_req, res) => {
 
 app.get('/api/v1/bills', requireAuth(), async (req, res) => {
   try {
-    const { status, search, limit = '50', offset = '0' } = req.query
+    const { status, search } = req.query
     // One filter object for both the page and the count — they previously
     // diverged, so paging through search results ran off the end.
     const where = {
@@ -2376,8 +2446,7 @@ app.get('/api/v1/bills', requireAuth(), async (req, res) => {
         _count: { select: { items: true } }
       },
       orderBy: { createdAt: 'desc' },
-      take: parseInt(String(limit)),
-      skip: parseInt(String(offset))
+      ...pageArgs(req.query)
     })
     const total = await prisma.bill.count({ where })
     return res.json({ success: true, bills: bills.map(serializeBill), total })
@@ -3824,7 +3893,7 @@ app.post('/api/v1/payments', requireActiveLicense(), requireAuth(), async (req, 
 
 app.get('/api/v1/payments', requireAuth(), async (req, res) => {
   try {
-    const { customerId, billId, limit = '50', offset = '0' } = req.query
+    const { customerId, billId } = req.query
     const where = {
       customerId: customerId ? String(customerId) : undefined,
       billId: billId ? String(billId) : undefined
@@ -3838,8 +3907,7 @@ app.get('/api/v1/payments', requireAuth(), async (req, res) => {
           collectedBy: { select: { username: true } }
         },
         orderBy: { receivedAt: 'desc' },
-        take: parseInt(String(limit)),
-        skip: parseInt(String(offset))
+        ...pageArgs(req.query)
       }),
       prisma.payment.count({ where })
     ])
@@ -4120,7 +4188,7 @@ app.get('/api/v1/purchase-orders/suggestions', requireAuth(['SUPER_ADMIN']), asy
 
 app.get('/api/v1/purchase-orders', requireAuth(['SUPER_ADMIN']), async (req, res) => {
   try {
-    const { status, supplierId, limit = '50', offset = '0' } = req.query
+    const { status, supplierId } = req.query
     const where = {
       status: status && isPurchaseOrderStatus(status) ? String(status) : undefined,
       supplierId: supplierId ? String(supplierId) : undefined
@@ -4134,8 +4202,7 @@ app.get('/api/v1/purchase-orders', requireAuth(['SUPER_ADMIN']), async (req, res
           items: { include: { product: { select: { itemCode: true, name: true, unitOfMeasure: true } } } }
         },
         orderBy: { createdAt: 'desc' },
-        take: parseInt(String(limit)),
-        skip: parseInt(String(offset))
+        ...pageArgs(req.query)
       }),
       prisma.purchaseOrder.count({ where })
     ])
@@ -4544,7 +4611,7 @@ function serializeWarranty(w: any, now = new Date()): any {
  */
 app.get('/api/v1/warranties', requireAuth(), async (req, res) => {
   try {
-    const { status, search, customerId, limit = '50', offset = '0' } = req.query
+    const { status, search, customerId } = req.query
     const now = new Date()
     const wantStatus = status ? String(status) : undefined
 
@@ -4574,8 +4641,7 @@ app.get('/api/v1/warranties', requireAuth(), async (req, res) => {
         where,
         include: WARRANTY_INCLUDE,
         orderBy: [{ status: 'asc' }, { expiryDate: 'asc' }],
-        take: parseInt(String(limit)),
-        skip: parseInt(String(offset))
+        ...pageArgs(req.query)
       }),
       prisma.warranty.count({ where })
     ])
@@ -5115,12 +5181,100 @@ app.get('/api/v1/sync/pull', requireAuth(), async (req, res) => {
     }))
     const nextCursor =
       events.length > 0 ? events[events.length - 1].cursor : `${curTxid}:${curId}`
+
+    // Remember how far this till has read, so the log can be trimmed to the
+    // point every till has passed rather than to a guess about how long one
+    // might have been switched off. Best-effort: a sync that works matters
+    // more than a prune that is perfectly tight.
+    const deviceId = typeof req.query.deviceId === 'string' ? req.query.deviceId : null
+    if (deviceId) {
+      prisma.authorizedClient
+        .update({
+          where: { id: deviceId },
+          data: { syncCursorTxid: curTxid, lastSyncAt: new Date() }
+        })
+        .catch(() => undefined)
+    }
+
     return res.json({ success: true, events, nextCursor, hasMore })
   } catch (err) {
     console.error('Error in /sync/pull:', err)
     return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
   }
 })
+
+/**
+ * Trim the change log.
+ *
+ * SyncEvent is append-only and had nothing removing rows, so every price
+ * edit, every customer change and every bill written since the shop opened
+ * stayed in it forever — each carrying a full JSON snapshot of the row it
+ * describes. On a busy counter that is hundreds of thousands of rows a year,
+ * inside the database the shop also has to back up twice a day.
+ *
+ * What makes them safe to delete is that a terminal only ever reads forward
+ * from its cursor. Anything older than every terminal's cursor can never be
+ * asked for again. The retention window is generous on purpose — a till that
+ * has been switched off for a fortnight should still catch up rather than
+ * silently miss the changes it slept through — and rows newer than the
+ * furthest-behind terminal are kept regardless of age, so a long-idle till is
+ * never quietly stranded.
+ */
+const SYNC_EVENT_RETENTION_DAYS = 30
+
+export async function pruneSyncEvents(now = new Date()): Promise<{ deleted: number }> {
+  const cutoffDate = new Date(now.getTime() - SYNC_EVENT_RETENTION_DAYS * 24 * 60 * 60 * 1000)
+
+  const tills = await prisma.authorizedClient.findMany({
+    where: { retiredAt: null },
+    select: { syncCursorTxid: true }
+  })
+
+  // A till that has never reported a cursor might be anywhere in the log, so
+  // nothing is deleted until every one of them has been heard from. Retired
+  // tills don't count — they are not coming back for it.
+  if (tills.length > 0 && tills.some((c) => c.syncCursorTxid === null)) {
+    return { deleted: 0 }
+  }
+
+  const safeBelow = tills.reduce<bigint | null>((min, c) => {
+    const v = c.syncCursorTxid
+    if (v === null) return min
+    return min === null || v < min ? v : min
+  }, null)
+
+  // Both conditions, not either: old enough that no reasonable outage covers
+  // it, *and* already read by every till.
+  const result =
+    safeBelow === null
+      ? await prisma.$executeRaw`
+          DELETE FROM "SyncEvent" WHERE "createdAt" < ${cutoffDate}`
+      : await prisma.$executeRaw`
+          DELETE FROM "SyncEvent"
+           WHERE "createdAt" < ${cutoffDate}
+             AND "txid" <= ${safeBelow}::bigint`
+
+  if (result > 0) {
+    console.log(
+      `[sync] pruned ${result} change-log rows older than ${SYNC_EVENT_RETENTION_DAYS} days` +
+        (safeBelow === null ? ' (no tills paired)' : ` and read by every till`)
+    )
+  }
+  return { deleted: result }
+}
+
+let pruneTimer: NodeJS.Timeout | null = null
+
+export function startSyncEventPruning(): void {
+  if (pruneTimer) return
+  const tick = (): void => {
+    pruneSyncEvents().catch((e) => console.error('[sync] prune failed', e))
+  }
+  // Not at boot: the first minutes after a restart are when terminals are
+  // reconnecting and catching up.
+  setTimeout(tick, 10 * 60 * 1000)
+  pruneTimer = setInterval(tick, 24 * 60 * 60 * 1000)
+}
 
 // ─── Server Export ────────────────────────────────────────────────────────────
 

@@ -980,6 +980,70 @@ async function api(path, opts = {}, token) {
     afterReturn.estimatedMarginPct < 100, afterReturn.estimatedMarginPct)
 
 
+  console.log('\n— asking for everything gets you a page —')
+  {
+    // A caller cannot make the server build an unbounded result set.
+    const huge = await api('/api/v1/bills?limit=999999', {}, token)
+    t('an enormous limit is clamped', huge.status === 200 && huge.body.bills.length <= 200,
+      huge.body.bills?.length)
+    const junk = await api('/api/v1/bills?limit=abc&offset=xyz', {}, token)
+    t('a nonsense limit does not 500', junk.status === 200, junk.body)
+    const neg = await api('/api/v1/bills?limit=-5&offset=-10', {}, token)
+    t('a negative limit does not 500', neg.status === 200 && neg.body.bills.length >= 1, neg.body?.bills?.length)
+
+    // The catalogue pages, and the slim form leaves out the batch history.
+    const page1 = await api('/api/v1/products?limit=2&offset=0', {}, token)
+    t('the catalogue is paged', page1.status === 200 && page1.body.products.length <= 2, page1.body?.products?.length)
+    t('...and says how many there are', typeof page1.body.total === 'number', page1.body.total)
+    const slim = await api('/api/v1/products?limit=2&slim=true', {}, token)
+    t('the slim form drops the batch lists',
+      slim.body.products.every((p) => p.batches === undefined), slim.body.products[0])
+    t('...but keeps the stock figure',
+      slim.body.products.every((p) => typeof p.totalStock === 'number'), slim.body.products[0])
+    const page2 = await api('/api/v1/products?limit=2&offset=2', {}, token)
+    const ids1 = page1.body.products.map((p) => p.id)
+    t('a second page is different products',
+      page2.body.products.every((p) => !ids1.includes(p.id)), { ids1, p2: page2.body.products.map((p) => p.id) })
+  }
+
+  console.log('\n— the change log gets trimmed, but never ahead of a till —')
+  {
+    const { pruneSyncEvents } = require('../.test-build/server.cjs')
+    const old = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000)
+    // Two ancient events, well past any retention window.
+    await prisma.$executeRaw`
+      INSERT INTO "SyncEvent" ("entity","entityId","op","payload","createdAt","txid")
+      VALUES ('product','ancient-1','upsert','{}'::jsonb, ${old}, 1),
+             ('product','ancient-2','upsert','{}'::jsonb, ${old}, 2)`
+    const total = () => prisma.syncEvent.count()
+    const before = await total()
+
+    // A till exists and has never said how far it has read, so nothing goes.
+    await prisma.authorizedClient.update({
+      where: { id: device.id }, data: { syncCursorTxid: null } })
+    let pruned = await pruneSyncEvents()
+    eqp('nothing is deleted while a till has not reported', pruned.deleted, 0)
+    eqp('...and the log is untouched', await total(), before)
+
+    // It reports a cursor behind the old rows — still nothing to delete.
+    await prisma.authorizedClient.update({
+      where: { id: device.id }, data: { syncCursorTxid: 0 } })
+    pruned = await pruneSyncEvents()
+    eqp('nothing is deleted below a till that is behind', pruned.deleted, 0)
+
+    // It catches up past them, and only then do they go.
+    await prisma.authorizedClient.update({
+      where: { id: device.id }, data: { syncCursorTxid: 5 } })
+    pruned = await pruneSyncEvents()
+    eqp('old rows every till has read are deleted', pruned.deleted, 2)
+    eqp('...and only those', await total(), before - 2)
+
+    // Recent events survive regardless of how far the tills have read.
+    const recent = await prisma.syncEvent.count({
+      where: { createdAt: { gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } } })
+    t('today\'s changes are still there', recent > 0, recent)
+  }
+
   console.log('\n— access ends when you say it does —')
   {
     const cashier = await api('/api/v1/users', { method: 'POST', body: JSON.stringify({
@@ -1054,7 +1118,9 @@ async function api(path, opts = {}, token) {
       macAddress: 'DE:AD:BE:EF:00:02', friendlyName: 'Counter 2' }) }, token)
     t('a manager can pair a till', paired.status === 200, paired.body)
 
-    const before = (await api('/api/v1/system/authorized-clients', {}, token)).body.clients.length
+    const listResp = await api('/api/v1/system/authorized-clients', {}, token)
+    t('the till list is readable with a token', listResp.status === 200, listResp.body)
+    const before = (listResp.body.clients ?? []).length
     const unpair = await api(`/api/v1/system/authorized-clients/${paired.body.clientId}`, { method: 'DELETE' }, token)
     t('a till with no sales is removed outright',
       unpair.status === 200 && unpair.body.retired === false, unpair.body)
