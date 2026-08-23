@@ -4,6 +4,7 @@ import { Button } from '../components/ui/button'
 import { Input } from '../components/ui/input'
 import { Modal } from '../components/Modal'
 import { apiFetch } from '../lib/api'
+import { parseQty, qtyStep, roundQty } from '@shared/units'
 import { printReceipt, type ReceiptShop } from '../lib/receipt'
 import { RETURN_REASONS, shouldRestock, returnReasonLabel, type ReturnReasonCode } from '@shared/procurement'
 
@@ -66,6 +67,8 @@ type BillDetail = {
     lineTotal: number
     purchaseRate: number | null
     alreadyReturnedQty?: number
+    /** 'LENGTH' lines are cut to size, so a return can be a fraction. */
+    sellMode?: string
   }[]
 }
 
@@ -832,12 +835,18 @@ export function SalesScreen({ token }: Props) {
                               type="number"
                               min={0}
                               max={remaining}
+                              step={qtyStep(it.sellMode)}
                               disabled={disabled}
                               value={qty || ''}
                               placeholder="0"
                               onChange={(e) => {
-                                const raw = parseInt(e.target.value || '0', 10) || 0
-                                const clamped = Math.max(0, Math.min(remaining, raw))
+                                // parseInt floored a 2.5 m return to 2 —
+                                // the customer was refunded for less than
+                                // they brought back, and half a metre of
+                                // pipe stayed on the books as stock the
+                                // shop no longer had.
+                                const raw = parseQty(e.target.value || '0', it.sellMode)
+                                const clamped = roundQty(Math.max(0, Math.min(remaining, raw)))
                                 setReturnQty((prev) => ({ ...prev, [it.id]: clamped }))
                               }}
                               className="w-20 h-8 px-2 text-sm text-right rounded-md border border-input focus:outline-none focus:ring-1 focus:ring-ring tabular-nums"

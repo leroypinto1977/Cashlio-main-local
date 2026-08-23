@@ -2479,6 +2479,9 @@ app.get('/api/v1/bills/:id', requireAuth(), async (req, res) => {
             product: {
               select: {
                 itemCode: true, name: true,
+                // A returns screen has to know whether this line is cut to
+                // length: half a metre of pipe comes back as 0.5, not 0.
+                sellMode: true,
                 batches: {
                   where: { isActive: true },
                   orderBy: { createdAt: 'desc' },
@@ -2532,6 +2535,7 @@ app.get('/api/v1/bills/:id', requireAuth(), async (req, res) => {
               : it.product.batches[0]
                 ? Number(it.product.batches[0].purchaseRate)
                 : null,
+          sellMode: it.product.sellMode,
           alreadyReturnedQty: returnedByLineId.get(it.id) ?? 0
         }))
       }
