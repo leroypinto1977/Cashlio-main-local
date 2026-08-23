@@ -5,6 +5,7 @@ import { Input } from '../components/ui/input'
 import { Modal } from '../components/Modal'
 import { apiFetch } from '../lib/api'
 import { printReceipt, type ReceiptShop } from '../lib/receipt'
+import { RETURN_REASONS, shouldRestock, returnReasonLabel, type ReturnReasonCode } from '@shared/procurement'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -47,7 +48,10 @@ type BillDetail = {
   cashier: { username: string }
   originDevice: { friendlyName: string }
   originalBill?: { id: string; billNumber: string; status: BillStatus } | null
-  returns?: { id: string; billNumber: string; status: BillStatus; totalAmount: number; paidAt: string; returnReason: string | null }[]
+  returns?: {
+    id: string; billNumber: string; status: BillStatus; totalAmount: number
+    paidAt: string; returnReason: string | null; returnReasonCode?: string | null
+  }[]
   items: {
     id: string
     itemCode: string
@@ -118,6 +122,8 @@ export function SalesScreen({ token }: Props) {
   const [returnFor, setReturnFor] = useState<BillDetail | null>(null)
   const [returnQty, setReturnQty] = useState<Record<string, number>>({})
   const [returnReason, setReturnReason] = useState('')
+  const [returnReasonCode, setReturnReasonCode] = useState<ReturnReasonCode | ''>('')
+  // A reason is required so returns can be reported on later.
   const [returnSubmitting, setReturnSubmitting] = useState(false)
   const [returnError, setReturnError] = useState('')
 
@@ -207,6 +213,7 @@ export function SalesScreen({ token }: Props) {
     for (const it of b.items) initial[it.id] = 0
     setReturnQty(initial)
     setReturnReason('')
+    setReturnReasonCode('')
     setReturnError('')
     setReturnFor(b)
   }
@@ -225,7 +232,11 @@ export function SalesScreen({ token }: Props) {
     try {
       const d = await apiFetch<{ bill: BillDetail }>(`/api/v1/bills/${returnFor.id}/return`, token, {
         method: 'POST',
-        body: JSON.stringify({ items, reason: returnReason.trim() || undefined })
+        body: JSON.stringify({
+          items,
+          reasonCode: returnReasonCode || undefined,
+          reason: returnReason.trim() || undefined
+        })
       })
       // Print refund receipt with RETURN banner
       void printReceipt(shopInfo, {
@@ -736,6 +747,7 @@ export function SalesScreen({ token }: Props) {
                               <p className="font-mono font-semibold text-amber-900 text-xs">{r.billNumber}</p>
                               <p className="text-xs text-amber-700">
                                 {new Date(r.paidAt).toLocaleString('en-IN')}
+                                {r.returnReasonCode ? ` · ${returnReasonLabel(r.returnReasonCode)}` : ''}
                                 {r.returnReason ? ` · ${r.returnReason}` : ''}
                               </p>
                             </div>
@@ -841,12 +853,36 @@ export function SalesScreen({ token }: Props) {
                 </table>
               </div>
 
-              <div>
-                <label className="block text-xs font-semibold mb-1 text-zinc-600">Reason (optional)</label>
+              <div className="space-y-2">
+                <label className="block text-xs font-semibold text-zinc-600">Why is it coming back?</label>
+                <div className="flex flex-wrap gap-1.5">
+                  {RETURN_REASONS.map((r) => (
+                    <button
+                      key={r.code}
+                      type="button"
+                      onClick={() => setReturnReasonCode(r.code)}
+                      title={r.hint}
+                      className={`px-2.5 py-1.5 rounded-lg border text-xs font-medium transition-colors ${
+                        returnReasonCode === r.code
+                          ? 'bg-zinc-900 text-white border-zinc-900'
+                          : 'bg-white text-zinc-600 border-zinc-200 hover:bg-zinc-50'
+                      }`}
+                    >
+                      {r.label}
+                    </button>
+                  ))}
+                </div>
+                {/* Broken stock must not be put back on the shelf; the credit
+                    note still records it, which is what makes the loss visible. */}
+                {returnReasonCode && !shouldRestock(returnReasonCode) && (
+                  <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-md px-2.5 py-1.5">
+                    The customer is refunded, but these goods will <strong>not</strong> go back into stock.
+                  </p>
+                )}
                 <Input
                   value={returnReason}
                   onChange={(e) => setReturnReason(e.target.value)}
-                  placeholder="Damaged, wrong item, customer changed mind…"
+                  placeholder="Add a note (optional)"
                   className="h-9 text-sm"
                 />
               </div>
@@ -887,7 +923,8 @@ export function SalesScreen({ token }: Props) {
                 </Button>
                 <Button
                   onClick={submitReturn}
-                  disabled={returnSubmitting || refundTotal <= 0}
+                  disabled={returnSubmitting || refundTotal <= 0 || !returnReasonCode}
+                  title={!returnReasonCode ? 'Pick a reason first' : undefined}
                   className="bg-amber-600 hover:bg-amber-700 text-white"
                 >
                   {returnSubmitting ? (

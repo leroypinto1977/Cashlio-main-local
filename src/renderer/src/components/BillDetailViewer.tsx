@@ -12,6 +12,7 @@ import { Input } from './ui/input'
 import { Modal } from './Modal'
 import { apiFetch } from '../lib/api'
 import { printReceipt, type ReceiptShop } from '../lib/receipt'
+import { RETURN_REASONS, shouldRestock, type ReturnReasonCode } from '@shared/procurement'
 
 type BillStatus = 'PAID' | 'VOID' | 'RETURN'
 
@@ -327,6 +328,7 @@ type RefundProps = {
 }
 
 function RefundLineModal({ line, billId, token, shopInfo, customerName, onClose, onDone }: RefundProps) {
+  const [reasonCode, setReasonCode] = useState<ReturnReasonCode | ''>('')
   const remaining = line ? line.quantity - (line.alreadyReturnedQty ?? 0) : 0
   const [qty, setQty] = useState(1)
   const [reason, setReason] = useState('')
@@ -348,6 +350,7 @@ function RefundLineModal({ line, billId, token, shopInfo, customerName, onClose,
         method: 'POST',
         body: JSON.stringify({
           items: [{ billItemId: line.id, quantity: qty }],
+          reasonCode: reasonCode || undefined,
           reason: reason.trim() || undefined
         })
       })
@@ -413,16 +416,43 @@ function RefundLineModal({ line, billId, token, shopInfo, customerName, onClose,
             </div>
           </div>
 
-          <div>
-            <label className="block text-xs font-semibold mb-1 text-zinc-600">Reason (optional)</label>
-            <Input value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Damaged, wrong item…" className="h-10" />
+          <div className="space-y-2">
+            <label className="block text-xs font-semibold text-zinc-600">Why is it coming back?</label>
+            <div className="flex flex-wrap gap-1.5">
+              {RETURN_REASONS.map((r) => (
+                <button
+                  key={r.code}
+                  type="button"
+                  onClick={() => setReasonCode(r.code)}
+                  title={r.hint}
+                  className={`px-2.5 py-1.5 rounded-lg border text-xs font-medium transition-colors ${
+                    reasonCode === r.code
+                      ? 'bg-zinc-900 text-white border-zinc-900'
+                      : 'bg-white text-zinc-600 border-zinc-200 hover:bg-zinc-50'
+                  }`}
+                >
+                  {r.label}
+                </button>
+              ))}
+            </div>
+            {reasonCode && !shouldRestock(reasonCode) && (
+              <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-md px-2.5 py-1.5">
+                The customer is refunded, but these goods will <strong>not</strong> go back into stock.
+              </p>
+            )}
+            <Input value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Add a note (optional)" className="h-10" />
           </div>
 
           {error && <div className="p-3 bg-red-50 border border-red-200 rounded-md text-red-600 text-xs">{error}</div>}
 
           <div className="flex justify-end gap-3 pt-1">
             <Button variant="outline" onClick={onClose} disabled={submitting}>Cancel</Button>
-            <Button onClick={submit} disabled={submitting || qty <= 0} className="bg-amber-600 hover:bg-amber-700 text-white">
+            <Button
+              onClick={submit}
+              disabled={submitting || qty <= 0 || !reasonCode}
+              title={!reasonCode ? 'Pick a reason first' : undefined}
+              className="bg-amber-600 hover:bg-amber-700 text-white"
+            >
               {submitting ? 'Refunding…' : <><Undo2 className="w-4 h-4 mr-1" />Refund ₹{fmt(refundAmount)}</>}
             </Button>
           </div>
@@ -456,6 +486,7 @@ function ReplaceLineModal({ line, billId, token, shopInfo, customer, onClose, on
   const [replacement, setReplacement] = useState<ProductHit | null>(null)
   const [replacementQty, setReplacementQty] = useState(1)
   const [replacementRate, setReplacementRate] = useState(0)
+  const [reasonCode, setReasonCode] = useState<ReturnReasonCode | ''>('')
   const [reason, setReason] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
@@ -508,7 +539,7 @@ function ReplaceLineModal({ line, billId, token, shopInfo, customer, onClose, on
   const netDifference = replacementTotal - refundAmount  // +ve = customer pays more, -ve = customer gets back
 
   const canSubmit = !!replacement && replacementQty > 0 && returnQty > 0 && returnQty <= remaining
-    && (replacement.totalStock >= replacementQty)
+    && (replacement.totalStock >= replacementQty) && !!reasonCode
 
   const submit = async (): Promise<void> => {
     if (!canSubmit || !billId || !token || !replacement) return
@@ -525,6 +556,7 @@ function ReplaceLineModal({ line, billId, token, shopInfo, customer, onClose, on
             quantity: replacementQty,
             unitRate: replacementRate
           }],
+          reasonCode: reasonCode || undefined,
           reason: reason.trim() || undefined
         })
       })
@@ -683,9 +715,31 @@ function ReplaceLineModal({ line, billId, token, shopInfo, customer, onClose, on
           </span>
         </div>
 
-        <div>
-          <label className="block text-xs font-semibold mb-1 text-zinc-600">Reason (optional)</label>
-          <Input value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Wrong size, defective…" className="h-10" />
+        <div className="space-y-2">
+          <label className="block text-xs font-semibold text-zinc-600">Why is it being exchanged?</label>
+          <div className="flex flex-wrap gap-1.5">
+            {RETURN_REASONS.map((r) => (
+              <button
+                key={r.code}
+                type="button"
+                onClick={() => setReasonCode(r.code)}
+                title={r.hint}
+                className={`px-2.5 py-1.5 rounded-lg border text-xs font-medium transition-colors ${
+                  reasonCode === r.code
+                    ? 'bg-zinc-900 text-white border-zinc-900'
+                    : 'bg-white text-zinc-600 border-zinc-200 hover:bg-zinc-50'
+                }`}
+              >
+                {r.label}
+              </button>
+            ))}
+          </div>
+          {reasonCode && !shouldRestock(reasonCode) && (
+            <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-md px-2.5 py-1.5">
+              The returned item will <strong>not</strong> go back into stock.
+            </p>
+          )}
+          <Input value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Add a note (optional)" className="h-10" />
         </div>
 
         {error && <div className="p-3 bg-red-50 border border-red-200 rounded-md text-red-600 text-xs">{error}</div>}

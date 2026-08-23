@@ -1896,7 +1896,7 @@ app.get('/api/v1/bills/:id', requireAuth(), async (req, res) => {
         returns: {
           select: {
             id: true, billNumber: true, status: true, totalAmount: true,
-            paidAt: true, returnReason: true,
+            paidAt: true, returnReason: true, returnReasonCode: true,
             items: { select: { originalBillItemId: true, quantity: true } }
           },
           orderBy: { createdAt: 'asc' }
@@ -1944,7 +1944,8 @@ app.get('/api/v1/bills/:id', requireAuth(), async (req, res) => {
           status: r.status,
           totalAmount: Number(r.totalAmount),
           paidAt: r.paidAt,
-          returnReason: r.returnReason
+          returnReason: r.returnReason,
+          returnReasonCode: r.returnReasonCode
         })),
         items: bill.items.map((it) => ({
           ...serializeBillItem(it),

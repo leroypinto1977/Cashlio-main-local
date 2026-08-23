@@ -16,7 +16,8 @@ import {
   Receipt,
   BarChart3,
   TrendingUp,
-  Wallet
+  Wallet,
+  ClipboardList
 } from 'lucide-react'
 import { Button } from './components/ui/button'
 import { Input } from './components/ui/input'
@@ -24,6 +25,7 @@ import { ProductsScreen } from './screens/ProductsScreen'
 import { SuppliersScreen } from './screens/SuppliersScreen'
 import { CustomersScreen } from './screens/CustomersScreen'
 import { ReceivablesScreen } from './screens/ReceivablesScreen'
+import { OrdersScreen } from './screens/OrdersScreen'
 import { BillingScreen } from './screens/BillingScreen'
 import { SalesScreen } from './screens/SalesScreen'
 import { AnalyticsScreen } from './screens/AnalyticsScreen'
@@ -555,6 +557,7 @@ function App(): React.JSX.Element {
               ['analytics',  <TrendingUp className="w-4 h-4" />,       'Analytics'],
               ['products',   <Package className="w-4 h-4" />,          'Products'],
               ['suppliers',  <Truck className="w-4 h-4" />,            'Suppliers'],
+              ['orders',     <ClipboardList className="w-4 h-4" />,     'Orders'],
               ['customers',  <Users className="w-4 h-4" />,            'Customers'],
               ['receivables', <Wallet className="w-4 h-4" />,           'Receivables'],
               ['devices',    <MonitorSmartphone className="w-4 h-4" />, 'Devices'],
@@ -589,6 +592,7 @@ function App(): React.JSX.Element {
         {/* Phase 2 screens manage their own headers */}
         {activeTab === 'products' && <ProductsScreen token={authToken} />}
         {activeTab === 'suppliers' && <SuppliersScreen token={authToken} />}
+        {activeTab === 'orders' && <OrdersScreen token={authToken} />}
         {activeTab === 'customers' && <CustomersScreen token={authToken} />}
         {activeTab === 'receivables' && <ReceivablesScreen token={authToken} />}
 
