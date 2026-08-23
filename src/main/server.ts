@@ -2,7 +2,7 @@ import express, { Request, Response, NextFunction } from 'express'
 import cors from 'cors'
 import jwt from 'jsonwebtoken'
 import bcrypt from 'bcryptjs'
-import { PrismaClient } from '@prisma/client'
+import { PrismaClient, Prisma } from '@prisma/client'
 import os from 'os'
 import {
   recordSync,
@@ -32,7 +32,7 @@ import {
 import { round2, computeInvoiceTotals } from '../shared/money'
 import { parseQty, roundQty, computePurchaseCost, defaultMeasureFor, measuresFor } from '../shared/units'
 import {
-  settle, statusFor, checkCredit, isPaymentMethod, dueDateFor, ageBucketOf,
+  settle, checkCredit, isPaymentMethod, dueDateFor, ageBucketOf,
   daysBetween, UNSETTLED_STATUSES, type Tender
 } from '../shared/credit'
 import {
@@ -377,6 +377,19 @@ function serializePayment(p: any): any {
   }
 }
 /* eslint-enable @typescript-eslint/no-explicit-any */
+
+/**
+ * Takes an exclusive lock on a bill for the rest of the transaction.
+ *
+ * Void, return and payment all used to read their preconditions outside the
+ * transaction that enforced them, so two concurrent requests could both pass
+ * the same check: stock restocked twice by a double void, two credit notes
+ * for one return, or two payments where the second silently overwrote the
+ * first and the shop lost the record of money it had taken.
+ */
+async function lockBill(tx: TxClient, billId: string): Promise<void> {
+  await tx.$executeRaw`SELECT "id" FROM "Bill" WHERE "id" = ${billId} FOR UPDATE`
+}
 
 /**
  * Recomputes a bill's settlement from the records that actually exist: what
@@ -2202,9 +2215,13 @@ type CreateBillArgs = {
   amountReceived: number | null
   tenders: Tender[]
   /// Treat the bill as settled in full whatever the total turns out to be.
-  /// Used for the replacement half of an exchange, which is paid for by the
-  /// refund rather than by a tender the cashier counts.
+  /// Used for the legacy client shape, where "no amountReceived" has always
+  /// meant "paid in full at the counter".
   settleInFull?: boolean
+  /// Value carried over from a credit note rather than tendered. The
+  /// replacement half of an exchange is paid for by the refund; recording
+  /// that as a cash tender overstated takings by the refund amount.
+  creditApplied?: number
   /// Set by a SUPER_ADMIN to let a bill exceed the customer's credit limit.
   allowCreditOverride: boolean
   /// Set by a SUPER_ADMIN to bill a line at something other than the
@@ -2213,6 +2230,37 @@ type CreateBillArgs = {
   discountAmount: number
   notes: string | null
   clientLocalId: string | null
+  /// When the sale actually happened, as reported by the terminal. An offline
+  /// bill can reach the server hours later; stamping it with arrival time puts
+  /// takings on the wrong day and ages credit from the wrong date. Clamped
+  /// before it gets here — see `resolveSoldAt`.
+  soldAt?: Date
+}
+
+/**
+ * Decide the time a sale happened.
+ *
+ * The terminal knows; the server only knows when the bill arrived, which for
+ * an offline bill can be hours or a day later. So the terminal's clock is
+ * preferred — but it is a machine in a shop, and a wrong one would let a sale
+ * land in next year's books or on a day already closed and reported.
+ *
+ * So it is trusted only within a window: never ahead of the server (a few
+ * minutes of skew allowed), and never more than a fortnight back, which is
+ * far longer than any real outage and short enough to bound the damage.
+ * Anything outside falls back to now, which is at worst the behaviour we
+ * already had.
+ */
+const SOLD_AT_MAX_BACKDATE_MS = 14 * 24 * 60 * 60 * 1000
+const SOLD_AT_MAX_SKEW_MS = 5 * 60 * 1000
+function resolveSoldAt(raw: unknown, now = new Date()): Date {
+  if (raw == null || raw === '') return now
+  const t = new Date(String(raw))
+  const ms = t.getTime()
+  if (!Number.isFinite(ms)) return now
+  if (ms > now.getTime() + SOLD_AT_MAX_SKEW_MS) return now
+  if (ms < now.getTime() - SOLD_AT_MAX_BACKDATE_MS) return now
+  return t
 }
 
 // Performs FIFO stock deduction and creates a PAID Bill row inside a tx.
@@ -2220,6 +2268,9 @@ type CreateBillArgs = {
 async function createBillCore(tx: TxClient, args: CreateBillArgs, billNumber?: string) {
   // Allocated inside the tx: if the sale rolls back, the number is released.
   const invoiceNumber = billNumber || (await allocateNumber(tx, 'INV'))
+  // The moment of sale, not the moment of arrival. Everything dated off the
+  // bill — the day's takings, credit ageing, warranty cover — hangs on this.
+  const soldAt = args.soldAt ?? new Date()
   type FinalLine = {
     productId: string; itemCode: string; productName: string; unitOfMeasure: string
     quantity: number; unitRate: number; gstPercentage: number
@@ -2326,19 +2377,53 @@ async function createBillCore(tx: TxClient, args: CreateBillArgs, billNumber?: s
     for (const batch of batches) {
       if (remaining <= 0) break
       const batchQty = Number(batch.currentQty)
-      const deduct = roundQty(Math.min(batchQty, remaining))
-      await tx.productBatch.update({
-        where: { id: batch.id },
-        data: { currentQty: roundQty(batchQty - deduct) }
-      })
+      const want = roundQty(Math.min(batchQty, remaining))
+      if (want <= 0) continue
+
+      // Deduct conditionally, in one statement, so the database decides
+      // whether the stock was there.
+      //
+      // Reading the quantity and then writing back the difference let two
+      // tills selling the last unit both pass the availability check and both
+      // write the same result: two bills, one unit, no error, and a
+      // discrepancy nobody sees until a stock count. The WHERE clause makes
+      // that impossible — the loser simply updates no rows.
+      // The quantity is bound as text and cast, not as a JS number. Prisma
+      // binds 3 as an integer and 2.75 as a double, and a prepared statement
+      // keeps whichever type it saw first — so a fractional quantity landing
+      // on a connection that had already run a whole one failed with a bind
+      // format error, intermittently and only for cut-length products.
+      const wantParam = want.toFixed(3)
+      const taken = await tx.$executeRaw`
+        UPDATE "ProductBatch"
+           SET "currentQty" = "currentQty" - ${wantParam}::numeric,
+               "updatedAt"  = NOW()
+         WHERE "id" = ${batch.id}
+           AND "currentQty" >= ${wantParam}::numeric
+      `
+      if (taken === 0) continue // another till took it first; try the next batch
+
       // Remembering the split is what lets a later return put the goods back
       // where they came from, and gives this line a true cost of goods.
       allocations.push({
         batchId: batch.id,
-        quantity: deduct,
+        quantity: want,
         unitCost: round2(Number(batch.purchaseRate))
       })
-      remaining = roundQty(remaining - deduct)
+      remaining = roundQty(remaining - want)
+    }
+
+    // The pre-check above is advisory; this is the authoritative one. If a
+    // concurrent sale drained the batches between the two, we get here short
+    // and the whole transaction rolls back rather than shipping goods that
+    // were never in stock.
+    if (remaining > 0) {
+      throw Object.assign(new Error('INSUFFICIENT_STOCK'), {
+        code: 'INSUFFICIENT_STOCK',
+        productName: product.name,
+        available: roundQty(item.quantity - remaining),
+        requested: item.quantity
+      })
     }
 
     const base = item.quantity * item.unitRate
@@ -2385,7 +2470,11 @@ async function createBillCore(tx: TxClient, args: CreateBillArgs, billNumber?: s
   const tenders: Tender[] = args.settleInFull
     ? [{ method: args.paymentMethod, amount: totalAmount }]
     : args.tenders
-  const settlement = settle(totalAmount, tenders)
+
+  // Credit carried from a refund is not money that changed hands, so it
+  // settles the bill without appearing as a tender in the payments ledger.
+  const creditApplied = round2(Math.min(Math.max(0, args.creditApplied ?? 0), totalAmount))
+  const settlement = settle(round2(totalAmount - creditApplied), tenders)
 
   const customer = args.customerId
     ? await tx.customer.findUnique({
@@ -2439,9 +2528,10 @@ async function createBillCore(tx: TxClient, args: CreateBillArgs, billNumber?: s
       paymentMethod: tenders[0]?.method ?? args.paymentMethod,
       amountReceived: settlement.tendered > 0 ? settlement.tendered : null,
       changeGiven,
-      paidAmount: settlement.paidAmount,
+      paidAmount: round2(settlement.paidAmount + creditApplied),
       balanceDue: settlement.balanceDue,
-      dueDate: settlement.balanceDue > 0 ? dueDateFor(new Date(), creditDays) : null,
+      paidAt: soldAt,
+      dueDate: settlement.balanceDue > 0 ? dueDateFor(soldAt, creditDays) : null,
       notes: args.notes,
       payments: {
         create: tenders.map((t) => ({
@@ -2466,7 +2556,6 @@ async function createBillCore(tx: TxClient, args: CreateBillArgs, billNumber?: s
   // than later from a report — a warranty that has to be remembered into
   // existence is one that gets forgotten. Lines are created in order, so
   // they pair with `lines` by index.
-  const soldAt = created.paidAt
   for (const [i, line] of lines.entries()) {
     if (line.warrantyPeriodDays <= 0) continue
     const item = created.items[i]
@@ -2567,6 +2656,10 @@ async function planRestock(
 // already-returned qty per line; restocks; creates a RETURN bill.
 // Throws { code: 'ORIGINAL_NOT_PAID' | 'BILL_ITEM_NOT_IN_ORIGINAL' | 'RETURN_QTY_EXCEEDS_REMAINING' | 'NO_RETURN_LINES', ... }.
 async function processReturnCore(tx: TxClient, args: ProcessReturnArgs) {
+  // Lock first: the already-returned tally below decides how much may still
+  // come back, and two concurrent returns reading it unlocked both passed.
+  await lockBill(tx, args.originalBillId)
+
   const original = await tx.bill.findUnique({
     where: { id: args.originalBillId },
     include: { items: true }
@@ -2770,7 +2863,11 @@ app.post('/api/v1/bills', requireActiveLicense(), requireAuth(), async (req, res
       return res.status(400).json({ success: false, error: 'BILL_ITEMS_REQUIRED' })
     }
 
-    // Idempotency: if this clientLocalId was already processed, return the existing bill
+    // Idempotency: if this clientLocalId was already processed, return the
+    // existing bill. This lookup catches the ordinary case — a retry after a
+    // response went missing. It cannot catch two genuinely simultaneous
+    // submits, which both miss it; the unique constraint stops those, and the
+    // handler below turns the resulting clash back into the same answer.
     if (clientLocalId) {
       const existing = await prisma.bill.findUnique({
         where: { clientLocalId: String(clientLocalId) },
@@ -2815,11 +2912,32 @@ app.post('/api/v1/bills', requireActiveLicense(), requireAuth(), async (req, res
         req.user!.role === 'SUPER_ADMIN' && Boolean(req.body.allowPriceOverride),
       discountAmount: Number(discountAmount),
       notes: notes || null,
-      clientLocalId: clientLocalId ? String(clientLocalId) : null
+      clientLocalId: clientLocalId ? String(clientLocalId) : null,
+      soldAt: resolveSoldAt(req.body.soldAt)
     }, billNumber))
 
     return res.status(201).json({ success: true, bill: serializeBill(bill) })
   } catch (err: unknown) {
+    // Two submits of the same sale raced past the lookup above and one lost
+    // the unique constraint. The loser did not create anything, so the right
+    // answer is the bill the winner made — not an error that would tempt a
+    // cashier into ringing the sale up a second time.
+    if (
+      err instanceof Prisma.PrismaClientKnownRequestError &&
+      err.code === 'P2002' &&
+      String((err.meta as { target?: string | string[] } | undefined)?.target ?? '').includes(
+        'clientLocalId'
+      ) &&
+      req.body?.clientLocalId
+    ) {
+      const winner = await prisma.bill.findUnique({
+        where: { clientLocalId: String(req.body.clientLocalId) },
+        include: { customer: { select: { name: true } }, items: true }
+      })
+      if (winner) {
+        return res.status(200).json({ success: true, bill: serializeBill(winner) })
+      }
+    }
     const e = err as {
       code?: string; productName?: string; available?: number; requested?: number
       reason?: string; customerName?: string; creditLimit?: number
@@ -3048,8 +3166,13 @@ app.post('/api/v1/bills/:id/exchange', requireActiveLicense(), requireAuth(['SUP
         amountReceived: amountReceived != null ? Number(amountReceived) : null,
         // The refund settles the replacement; only the difference changes
         // hands, so the replacement is never left carrying a balance.
-        tenders: [],
-        settleInFull: true,
+        tenders:
+          // Only the difference changes hands. Anything the customer pays on
+          // top of the refund is the real tender.
+          amountReceived != null && Number(amountReceived) > 0
+            ? [{ method: pm, amount: round2(Number(amountReceived)) }]
+            : [],
+        creditApplied: Number(refund.totalAmount),
         allowCreditOverride: true,
         // The replacement rate is resolved from the product master above.
         allowPriceOverride: true,
@@ -3157,37 +3280,36 @@ app.post('/api/v1/bills/:id/exchange', requireActiveLicense(), requireAuth(['SUP
 app.post('/api/v1/bills/:id/void', requireAuth(['SUPER_ADMIN']), async (req, res) => {
   try {
     const billId = String(req.params.id)
-    const bill = await prisma.bill.findUnique({
-      where: { id: billId },
-      include: { items: true }
-    })
-    if (!bill) return res.status(404).json({ success: false, error: 'NOT_FOUND' })
-    if (bill.status === 'VOID') {
-      return res.status(409).json({ success: false, error: 'ALREADY_VOID' })
-    }
-    if (bill.status === 'RETURN') {
-      return res.status(409).json({ success: false, error: 'CANNOT_VOID_RETURN' })
-    }
-    // If any item has been returned, restocking on void would double-count.
-    // Money collected after the sale cannot be un-collected by voiding the
-    // bill it was paid against — that would leave the cash drawer unexplained.
-    const settlements = await prisma.payment.count({
-      where: { billId, isSettlement: true }
-    })
-    if (settlements > 0) {
-      return res.status(409).json({
-        success: false, error: 'BILL_HAS_SETTLEMENTS',
-        message: 'Payments have been collected against this bill. Refund them before voiding it.',
-        settlements
-      })
-    }
 
-    const returnsExist = await prisma.bill.count({ where: { originalBillId: billId, status: 'RETURN' } })
-    if (returnsExist > 0) {
-      return res.status(409).json({ success: false, error: 'BILL_HAS_RETURNS' })
-    }
-
+    // Every check runs inside the transaction, behind the lock that enforces
+    // it. Read outside, two concurrent voids both passed and both restocked.
     await prisma.$transaction(async (tx) => {
+      await lockBill(tx, billId)
+
+      const bill = await tx.bill.findUnique({
+        where: { id: billId },
+        include: { items: true }
+      })
+      if (!bill) throw Object.assign(new Error('NOT_FOUND'), { code: 'NOT_FOUND' })
+      if (bill.status === 'VOID') throw Object.assign(new Error('ALREADY_VOID'), { code: 'ALREADY_VOID' })
+      if (bill.status === 'RETURN') {
+        throw Object.assign(new Error('CANNOT_VOID_RETURN'), { code: 'CANNOT_VOID_RETURN' })
+      }
+
+      // Money collected after the sale cannot be un-collected by voiding the
+      // bill it was paid against — that would leave the cash drawer unexplained.
+      const settlements = await tx.payment.count({ where: { billId, isSettlement: true } })
+      if (settlements > 0) {
+        throw Object.assign(new Error('BILL_HAS_SETTLEMENTS'), {
+          code: 'BILL_HAS_SETTLEMENTS', settlements
+        })
+      }
+      // If any item has been returned, restocking on void would double-count.
+      const returnsExist = await tx.bill.count({ where: { originalBillId: billId, status: 'RETURN' } })
+      if (returnsExist > 0) {
+        throw Object.assign(new Error('BILL_HAS_RETURNS'), { code: 'BILL_HAS_RETURNS' })
+      }
+
       // Put every unit back exactly where the sale took it from.
       for (const item of bill.items) {
         const plan = await planRestock(tx, item.id, item.productId, Number(item.quantity))
@@ -3198,16 +3320,35 @@ app.post('/api/v1/bills/:id/void', requireAuth(['SUPER_ADMIN']), async (req, res
           })
         }
       }
+
+      // A voided sale never happened: its cover and its tender go with it.
+      // Leaving them behind showed live warranties on a cancelled sale and
+      // counted the tender in the payments ledger.
+      await tx.warranty.deleteMany({ where: { billId } })
+      await tx.payment.deleteMany({ where: { billId, isSettlement: false } })
+
       const voided = await tx.bill.update({
         where: { id: billId },
-        data: { status: 'VOID', balanceDue: 0 }
+        data: { status: 'VOID', balanceDue: 0, paidAmount: 0 }
       })
       await emitBillUpsert(tx, voided)
       await emitProductUpsertBulk(tx, bill.items.map((it) => it.productId))
     })
 
     return res.json({ success: true })
-  } catch (err) {
+  } catch (err: unknown) {
+    const e = err as { code?: string; settlements?: number }
+    const map: Record<string, [number, string]> = {
+      NOT_FOUND: [404, 'No such bill.'],
+      ALREADY_VOID: [409, 'This bill has already been voided.'],
+      CANNOT_VOID_RETURN: [409, 'A credit note cannot be voided.'],
+      BILL_HAS_SETTLEMENTS: [409, 'Payments have been collected against this bill. Refund them before voiding it.'],
+      BILL_HAS_RETURNS: [409, 'Goods have been returned against this bill, so it cannot be voided.']
+    }
+    if (e.code && map[e.code]) {
+      const [status, message] = map[e.code]
+      return res.status(status).json({ success: false, error: e.code, message, ...e })
+    }
     console.error(err)
     return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
   }
@@ -3280,6 +3421,8 @@ app.post('/api/v1/payments', requireActiveLicense(), requireAuth(), async (req, 
           if (!Number.isFinite(amt) || amt <= 0) {
             throw Object.assign(new Error('INVALID_ALLOCATION'), { code: 'INVALID_ALLOCATION', billId })
           }
+          // balanceDue is kept in step by recomputeBillSettlement, so it
+          // already accounts for any credit notes against this bill.
           if (amt > round2(Number(bill.balanceDue))) {
             throw Object.assign(new Error('ALLOCATION_EXCEEDS_BALANCE'), {
               code: 'ALLOCATION_EXCEEDS_BALANCE', billId,
@@ -3313,12 +3456,31 @@ app.post('/api/v1/payments', requireActiveLicense(), requireAuth(), async (req, 
         }
       }
 
+      // Lock every bill this collection touches, oldest first, before any of
+      // it is applied. A consistent order means two concurrent collections
+      // for the same customer queue rather than deadlock.
+      for (const alloc of [...plan].sort((a, b) => a.billId.localeCompare(b.billId))) {
+        await lockBill(tx, alloc.billId)
+      }
+
+      // Re-check every allocation against the balance as it stands now that
+      // the rows are locked. The plan was built from a read taken before the
+      // lock, and a concurrent collection may have settled some of it since.
+      for (const alloc of plan) {
+        const fresh = await tx.bill.findUniqueOrThrow({ where: { id: alloc.billId } })
+        if (alloc.amount > round2(Number(fresh.balanceDue))) {
+          throw Object.assign(new Error('ALLOCATION_EXCEEDS_BALANCE'), {
+            code: 'ALLOCATION_EXCEEDS_BALANCE',
+            billId: alloc.billId,
+            balanceDue: round2(Number(fresh.balanceDue)),
+            requested: alloc.amount
+          })
+        }
+      }
+
       const created: unknown[] = []
       for (const [i, alloc] of plan.entries()) {
-        const bill = openBills.find((b) => b.id === alloc.billId)!
-        const nextPaid = round2(Number(bill.paidAmount) + alloc.amount)
-        const nextBalance = round2(Number(bill.totalAmount) - nextPaid)
-
+        const bill = await tx.bill.findUniqueOrThrow({ where: { id: alloc.billId } })
         const payment = await tx.payment.create({
           data: {
             billId: bill.id,
@@ -3336,13 +3498,14 @@ app.post('/api/v1/payments', requireActiveLicense(), requireAuth(), async (req, 
           include: { bill: { select: { billNumber: true, totalAmount: true } } }
         })
 
-        const updated = await tx.bill.update({
+        // Settlement is recomputed from the rows that exist — payments and
+        // credit notes — rather than derived here from the bill total. Doing
+        // the arithmetic in two places meant this one forgot about returns,
+        // so a customer who returned goods and then paid what they owed had
+        // the value of the credit note reappear as a debt.
+        await recomputeBillSettlement(tx, bill.id)
+        const updated = await tx.bill.findUniqueOrThrow({
           where: { id: bill.id },
-          data: {
-            paidAmount: nextPaid,
-            balanceDue: Math.max(0, nextBalance),
-            status: statusFor(Number(bill.totalAmount), nextPaid)
-          },
           include: { customer: { select: { name: true } }, items: true }
         })
         await emitBillUpsert(tx, updated)
@@ -4329,7 +4492,11 @@ app.get('/api/v1/analytics/summary', requireAuth(), async (req, res) => {
     }
 
     const where = {
-      status: 'PAID',
+      // A sale is a sale whether or not the customer has paid yet. Counting
+      // only PAID bills hid every credit sale until it was settled, and then
+      // moved it into the revenue of the day it was billed — so the same
+      // day's takings read differently a week later.
+      status: { in: ['PAID', 'PARTIAL', 'CREDIT'] },
       ...(startDate ? { paidAt: { gte: startDate } } : {})
     }
 
@@ -4360,8 +4527,8 @@ app.get('/api/v1/analytics/summary', requireAuth(), async (req, res) => {
     let totalLineDiscounts = 0
     let estimatedCOGS = 0
     let cogsItemCount = 0
-    const payBreakdownAmt: Record<string, number> = { CASH: 0, UPI: 0, CARD: 0 }
-    const payBreakdownCount: Record<string, number> = { CASH: 0, UPI: 0, CARD: 0 }
+    const payBreakdownAmt: Record<string, number> = { CASH: 0, UPI: 0, CARD: 0, CHEQUE: 0 }
+    const payBreakdownCount: Record<string, number> = { CASH: 0, UPI: 0, CARD: 0, CHEQUE: 0 }
     const productMap: Record<
       string,
       { productName: string; itemCode: string; revenue: number; taxableValue: number; qty: number; cost: number }
@@ -4371,8 +4538,6 @@ app.get('/api/v1/analytics/summary', requireAuth(), async (req, res) => {
       totalRevenue += Number(bill.totalAmount)
       totalTaxableValue += Number(bill.taxableValue ?? 0)
       totalBillDiscounts += Number(bill.discountAmount)
-      payBreakdownAmt[bill.paymentMethod] = (payBreakdownAmt[bill.paymentMethod] || 0) + Number(bill.totalAmount)
-      payBreakdownCount[bill.paymentMethod] = (payBreakdownCount[bill.paymentMethod] || 0) + 1
 
       for (const item of bill.items) {
         const qty = Number(item.quantity)
@@ -4405,14 +4570,44 @@ app.get('/api/v1/analytics/summary', requireAuth(), async (req, res) => {
       }
     }
 
+    // Goods that came back are not revenue. Credit notes were excluded from
+    // the query and never subtracted, so a fully-returned sale still counted
+    // in full — and a returned credit sale, whose settlement recompute marks
+    // it PAID at zero owing, counted as revenue nobody ever paid.
+    const returnAgg = await prisma.bill.aggregate({
+      where: { status: 'RETURN', ...(startDate ? { paidAt: { gte: startDate } } : {}) },
+      _sum: { totalAmount: true, taxableValue: true },
+      _count: true
+    })
+    const totalReturns = round2(Number(returnAgg._sum.totalAmount ?? 0))
+    const returnsTaxable = round2(Number(returnAgg._sum.taxableValue ?? 0))
+    const returnCount = returnAgg._count
+
+    // The tender split comes from the payments themselves. Attributing a
+    // bill's whole total to its first tender reported a 500 cash + 500 UPI
+    // sale as 1,000 cash, dropped CHEQUE entirely, and ignored every
+    // collection made after the sale.
+    const paymentRows = await prisma.payment.groupBy({
+      by: ['method'],
+      where: startDate ? { receivedAt: { gte: startDate } } : undefined,
+      _sum: { amount: true },
+      _count: true
+    })
+    for (const row of paymentRows) {
+      payBreakdownAmt[row.method] = round2(Number(row._sum.amount ?? 0))
+      payBreakdownCount[row.method] = row._count
+    }
+
     const totalDiscounts = totalLineDiscounts + totalBillDiscounts
     const grossRevenuePlusDics = totalRevenue + totalDiscounts
     // Margin compares ex-GST revenue with ex-GST cost. Using the GST-inclusive
     // total against an ex-GST purchase rate overstated every margin by the tax.
     // Bills written before the tax breakdown existed have taxableValue 0, so
     // fall back to the gross total for those rather than reporting 100% margin.
-    const revenueExGst = totalTaxableValue > 0 ? totalTaxableValue : totalRevenue
-    const estimatedGrossProfit = revenueExGst - estimatedCOGS
+    const netRevenue = round2(totalRevenue - totalReturns)
+    const grossTaxable = totalTaxableValue > 0 ? totalTaxableValue : totalRevenue
+    const revenueExGst = round2(grossTaxable - returnsTaxable)
+    const estimatedGrossProfit = round2(revenueExGst - estimatedCOGS)
     const estimatedMarginPct = revenueExGst > 0 ? (estimatedGrossProfit / revenueExGst) * 100 : 0
     const topProducts = Object.values(productMap).sort((a, b) => b.revenue - a.revenue).slice(0, 8)
 
@@ -4421,7 +4616,11 @@ app.get('/api/v1/analytics/summary', requireAuth(), async (req, res) => {
       summary: {
         period: String(period),
         totalBills: bills.length,
+        // Gross sales, what came back, and the difference.
         totalRevenue,
+        totalReturns,
+        netRevenue,
+        returnCount,
         avgBillValue: bills.length > 0 ? totalRevenue / bills.length : 0,
         totalDiscounts,
         totalLineDiscounts,
@@ -4433,8 +4632,11 @@ app.get('/api/v1/analytics/summary', requireAuth(), async (req, res) => {
         revenueExGst,
         totalTaxableValue,
         hasCOGSData: cogsItemCount > 0,
-        paymentBreakdown: { CASH: payBreakdownAmt.CASH, UPI: payBreakdownAmt.UPI, CARD: payBreakdownAmt.CARD },
-        paymentCounts: { CASH: payBreakdownCount.CASH, UPI: payBreakdownCount.UPI, CARD: payBreakdownCount.CARD },
+        // Every method, including CHEQUE, which used to be counted in
+        // revenue but omitted here so the two never reconciled.
+        paymentBreakdown: payBreakdownAmt,
+        paymentCounts: payBreakdownCount,
+        totalCollected: round2(Object.values(payBreakdownAmt).reduce((a, b) => a + b, 0)),
         topProducts
       }
     })
@@ -4551,23 +4753,80 @@ app.post('/api/v1/system/license-refresh', requireAuth(['SUPER_ADMIN']), async (
 //
 // BigInt note: Postgres BIGSERIAL maps to JS BigInt. We serialize to string in
 // the response and accept stringified numbers in the query.
+/**
+ * The change feed terminals replay to keep their local mirror current.
+ *
+ * Two things make this less obvious than "everything after id N".
+ *
+ * A BIGSERIAL id is allocated at insert time, so it orders writes by when
+ * they started, not by when they committed. Two concurrent sales can take
+ * ids 100 and 101 and commit in the opposite order. A terminal that pulls in
+ * between is served 101, advances its cursor, and never sees 100 — a bill on
+ * the branch server that exists on no till, with nothing to indicate it went
+ * missing.
+ *
+ * So each row records the transaction that wrote it, and this endpoint does
+ * two things with it. It serves only rows whose txid is below the current
+ * snapshot's xmin, which means every transaction that could still produce a
+ * lower-numbered row has already finished. And it pages by (txid, id) rather
+ * than by id, because a filter alone is not enough: an older transaction can
+ * still hold a *higher* id, and ordering by id would step over the one it is
+ * about to commit. Under (txid, id) any row that appears later necessarily
+ * belongs to a transaction that was still running when we answered, and so
+ * sorts after everything already served.
+ *
+ * The cost is latency, not correctness: a long-running transaction holds xmin
+ * down and the feed waits for it. Sales are short, so this is a few
+ * milliseconds in practice.
+ *
+ * Cursors are "<txid>:<id>". A bare number from an older build is read as
+ * (0, n), which is exactly right — rows predating this scheme carry txid 0.
+ */
 app.get('/api/v1/sync/pull', requireAuth(), async (req, res) => {
   try {
-    const cursorStr = String(req.query.cursor ?? '0')
-    const cursor = (() => {
-      try { return BigInt(cursorStr) } catch { return 0n }
+    const raw = String(req.query.cursor ?? '0')
+    const [curTxid, curId] = (() => {
+      const parts = raw.split(':')
+      const parse = (v: string): bigint => {
+        try {
+          const n = BigInt(v)
+          return n < 0n ? 0n : n
+        } catch {
+          return 0n
+        }
+      }
+      return parts.length === 2
+        ? [parse(parts[0]), parse(parts[1])]
+        : [0n, parse(parts[0])]
     })()
+
     const limitRaw = parseInt(String(req.query.limit ?? '500'))
     const limit = Math.min(Math.max(1, isNaN(limitRaw) ? 500 : limitRaw), 2000)
 
-    const rows = await prisma.syncEvent.findMany({
-      where: { id: { gt: cursor } },
-      orderBy: { id: 'asc' },
-      take: limit + 1
-    })
+    const rows = await prisma.$queryRaw<
+      Array<{
+        id: bigint
+        txid: bigint
+        entity: string
+        entityId: string
+        op: string
+        payload: unknown
+        createdAt: Date
+      }>
+    >`
+      SELECT "id", "txid", "entity", "entityId", "op", "payload", "createdAt"
+        FROM "SyncEvent"
+       WHERE "txid" < (pg_snapshot_xmin(pg_current_snapshot()))::text::bigint
+         AND ("txid", "id") > (${curTxid}::bigint, ${curId}::bigint)
+       ORDER BY "txid" ASC, "id" ASC
+       LIMIT ${limit + 1}`
+
     const hasMore = rows.length > limit
-    const events = (hasMore ? rows.slice(0, limit) : rows).map((r) => ({
+    const page = hasMore ? rows.slice(0, limit) : rows
+    const events = page.map((r) => ({
       id: r.id.toString(),
+      // What the terminal should store once it has applied this event.
+      cursor: `${r.txid.toString()}:${r.id.toString()}`,
       entity: r.entity,
       entityId: r.entityId,
       op: r.op,
@@ -4575,7 +4834,7 @@ app.get('/api/v1/sync/pull', requireAuth(), async (req, res) => {
       createdAt: r.createdAt.toISOString()
     }))
     const nextCursor =
-      events.length > 0 ? events[events.length - 1].id : cursor.toString()
+      events.length > 0 ? events[events.length - 1].cursor : `${curTxid}:${curId}`
     return res.json({ success: true, events, nextCursor, hasMore })
   } catch (err) {
     console.error('Error in /sync/pull:', err)

@@ -263,7 +263,8 @@ async function api(path, opts = {}, token) {
     originDeviceId: device.id, paymentMethod: 'CASH', amountReceived: 500,
     items: [{ productId: cutId, quantity: 2.75, unitRate: 60, gstPercentage: 18, lineDiscountPct: 0, lineDiscountAmt: 0 }]
   })}, token)
-  t('fractional quantity billed', r.status === 201 && near(r.body.bill.items[0].quantity, 2.75), r.body.bill?.items?.[0]?.quantity)
+  t('fractional quantity billed', r.status === 201 && near(r.body.bill?.items?.[0]?.quantity, 2.75), { status: r.status, body: r.body })
+
   t('line total = 2.75 x 60', near(r.body.bill.items[0].lineTotal, 165), r.body.bill.items[0].lineTotal)
   t('invoice still foots', near(r.body.bill.taxableValue + r.body.bill.gstAmount, r.body.bill.totalAmount))
   const cutBill = r.body.bill
@@ -765,6 +766,368 @@ async function api(path, opts = {}, token) {
   const cashierUser = await prisma.user.findFirst({ where: { username: 'cashier1' } })
   r = await api(`/api/v1/users/${cashierUser.id}`, { method: 'DELETE' }, token)
   t('an account with bills is protected', r.status === 409 && r.body.error === 'USER_HAS_BILLS', r.body)
+
+
+  console.log('\n— paying after a return must not resurrect the debt —')
+  const phProd = await prisma.product.create({ data: {
+    itemCode: 'PH-TEST-001', name: 'Phantom Test', categoryId: cat.id,
+    sellingRate: 1000, gstPercentage: 0 }})
+  await prisma.productBatch.create({ data: {
+    productId: phProd.id, batchCode: 'P', uniqueStockCode: 'PH-TEST-001/P',
+    purchaseRate: 500, receivedQty: 50, currentQty: 50 }})
+  const phCust = await prisma.customer.create({ data: {
+    name: 'Phantom Buyer', phone: '9000000077', creditLimit: 100000, creditDays: 30 }})
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, customerId: phCust.id, payments: [],
+    items: [{ productId: phProd.id, quantity: 20, unitRate: 1000, gstPercentage: 0, lineDiscountPct: 0, lineDiscountAmt: 0 }] })}, token)
+  const phBill = r.body.bill
+  eqp('credit sale owes the full amount', phBill.balanceDue, 20000)
+  r = await api(`/api/v1/bills/${phBill.id}/return`, { method: 'POST', body: JSON.stringify({
+    items: [{ billItemId: phBill.items[0].id, quantity: 5 }], reasonCode: 'CHANGED_MIND' })}, token)
+  t('return accepted', r.status === 201, r.body)
+  let phAfter = await prisma.bill.findUnique({ where: { id: phBill.id } })
+  eqp('returning 5 drops the balance to 15,000', Number(phAfter.balanceDue), 15000)
+  // the customer now settles exactly what they owe
+  r = await api('/api/v1/payments', { method: 'POST', body: JSON.stringify({
+    customerId: phCust.id, amount: 15000, method: 'CASH' })}, token)
+  t('payment accepted', r.status === 201, r.body)
+  phAfter = await prisma.bill.findUnique({ where: { id: phBill.id } })
+  eqp('bill is fully settled', Number(phAfter.balanceDue), 0)
+  t('and marked PAID', phAfter.status === 'PAID', phAfter.status)
+  r = await api(`/api/v1/customers/${phCust.id}/outstanding`, {}, token)
+  eqp('customer owes nothing', r.body.outstanding, 0)
+
+
+  console.log('\n— two tills cannot sell the same last unit —')
+  const raceProd = await prisma.product.create({ data: {
+    itemCode: 'RACE-TEST-001', name: 'Last One', categoryId: cat.id,
+    sellingRate: 100, gstPercentage: 0 }})
+  const raceBatch = await prisma.productBatch.create({ data: {
+    productId: raceProd.id, batchCode: 'R', uniqueStockCode: 'RACE-TEST-001/R',
+    purchaseRate: 50, receivedQty: 1, currentQty: 1 }})
+  const raceBody = () => JSON.stringify({
+    originDeviceId: device.id, paymentMethod: 'CASH',
+    items: [{ productId: raceProd.id, quantity: 1, unitRate: 100, gstPercentage: 0, lineDiscountPct: 0, lineDiscountAmt: 0 }] })
+  // fire both at once, the way two terminals would
+  const [r1, r2] = await Promise.all([
+    api('/api/v1/bills', { method: 'POST', body: raceBody() }, token),
+    api('/api/v1/bills', { method: 'POST', body: raceBody() }, token)
+  ])
+  const wins = [r1, r2].filter((x) => x.status === 201).length
+  const refusals = [r1, r2].filter((x) => x.status === 409 && x.body?.error === 'INSUFFICIENT_STOCK').length
+  t('exactly one sale succeeds', wins === 1, { r1: r1.status, r2: r2.status })
+  t('the other is told stock ran out', refusals === 1, { r1: r1.body?.error, r2: r2.body?.error })
+  const raceQty = Number((await prisma.productBatch.findUnique({ where: { id: raceBatch.id } })).currentQty)
+  t('stock lands at zero, never negative', raceQty === 0, raceQty)
+  t('and only one bill exists for it',
+    (await prisma.billItem.count({ where: { productId: raceProd.id } })) === 1)
+
+  // ten tills against five units
+  const race2 = await prisma.product.create({ data: {
+    itemCode: 'RACE-TEST-002', name: 'Five Left', categoryId: cat.id, sellingRate: 10, gstPercentage: 0 }})
+  const batch2 = await prisma.productBatch.create({ data: {
+    productId: race2.id, batchCode: 'R2', uniqueStockCode: 'RACE-TEST-002/R2',
+    purchaseRate: 5, receivedQty: 5, currentQty: 5 }})
+  const results = await Promise.all(Array.from({ length: 10 }, () =>
+    api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+      originDeviceId: device.id, paymentMethod: 'CASH',
+      items: [{ productId: race2.id, quantity: 1, unitRate: 10, gstPercentage: 0, lineDiscountPct: 0, lineDiscountAmt: 0 }] })}, token)))
+  const sold = results.filter((x) => x.status === 201).length
+  const q2 = Number((await prisma.productBatch.findUnique({ where: { id: batch2.id } })).currentQty)
+  t('ten tills, five units: exactly five sales', sold === 5, sold)
+  t('stock exactly exhausted', q2 === 0, q2)
+
+
+  console.log('\n— concurrent void and return cannot double-count —')
+  const dupProd = await prisma.product.create({ data: {
+    itemCode: 'DUP-TEST-001', name: 'Double Test', categoryId: cat.id, sellingRate: 100, gstPercentage: 0 }})
+  const dupBatch = await prisma.productBatch.create({ data: {
+    productId: dupProd.id, batchCode: 'D', uniqueStockCode: 'DUP-TEST-001/D',
+    purchaseRate: 50, receivedQty: 20, currentQty: 20 }})
+  const mkBill = async () => (await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, paymentMethod: 'CASH',
+    items: [{ productId: dupProd.id, quantity: 4, unitRate: 100, gstPercentage: 0, lineDiscountPct: 0, lineDiscountAmt: 0 }] })}, token)).body.bill
+
+  // two voids of the same bill at once
+  let dupBill = await mkBill()
+  let dupBefore = Number((await prisma.productBatch.findUnique({ where: { id: dupBatch.id } })).currentQty)
+  const voids = await Promise.all([
+    api(`/api/v1/bills/${dupBill.id}/void`, { method: 'POST' }, token),
+    api(`/api/v1/bills/${dupBill.id}/void`, { method: 'POST' }, token)
+  ])
+  t('only one void succeeds', voids.filter((v) => v.status === 200).length === 1, voids.map(v => v.status))
+  let dupAfter = Number((await prisma.productBatch.findUnique({ where: { id: dupBatch.id } })).currentQty)
+  eqp('stock restored once, not twice', dupAfter - dupBefore, 4)
+
+  // two returns of the same line at once
+  dupBill = await mkBill()
+  dupBefore = Number((await prisma.productBatch.findUnique({ where: { id: dupBatch.id } })).currentQty)
+  const rets = await Promise.all([
+    api(`/api/v1/bills/${dupBill.id}/return`, { method: 'POST', body: JSON.stringify({
+      items: [{ billItemId: dupBill.items[0].id, quantity: 4 }], reasonCode: 'CHANGED_MIND' })}, token),
+    api(`/api/v1/bills/${dupBill.id}/return`, { method: 'POST', body: JSON.stringify({
+      items: [{ billItemId: dupBill.items[0].id, quantity: 4 }], reasonCode: 'CHANGED_MIND' })}, token)
+  ])
+  t('only one return succeeds', rets.filter((x) => x.status === 201).length === 1, rets.map(x => x.status))
+  dupAfter = Number((await prisma.productBatch.findUnique({ where: { id: dupBatch.id } })).currentQty)
+  eqp('returned goods restocked once', dupAfter - dupBefore, 4)
+
+  // two collections against the same balance at once
+  const dupCust = await prisma.customer.create({ data: {
+    name: 'Race Payer', phone: '9000000088', creditLimit: 100000, creditDays: 30 }})
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, customerId: dupCust.id, payments: [],
+    items: [{ productId: dupProd.id, quantity: 5, unitRate: 100, gstPercentage: 0, lineDiscountPct: 0, lineDiscountAmt: 0 }] })}, token)
+  const payBody = JSON.stringify({ customerId: dupCust.id, amount: 500, method: 'CASH' })
+  const pays = await Promise.all([
+    api('/api/v1/payments', { method: 'POST', body: payBody }, token),
+    api('/api/v1/payments', { method: 'POST', body: payBody }, token)
+  ])
+  t('only one collection succeeds', pays.filter((x) => x.status === 201).length === 1, pays.map(x => x.status))
+  const paidTotal = await prisma.payment.aggregate({
+    where: { customerId: dupCust.id, isSettlement: true }, _sum: { amount: true } })
+  eqp('the ledger records what was actually taken', Number(paidTotal._sum.amount ?? 0), 500)
+  r = await api(`/api/v1/customers/${dupCust.id}/outstanding`, {}, token)
+  eqp('and the customer owes nothing more', r.body.outstanding, 0)
+
+
+  console.log('\n— an exchange records only the money that moved —')
+  const exProd = await prisma.product.create({ data: {
+    itemCode: 'EX-CHEAP-001', name: 'Cheap Item', categoryId: cat.id, sellingRate: 200, gstPercentage: 0 }})
+  const exDear = await prisma.product.create({ data: {
+    itemCode: 'EX-DEAR-001', name: 'Dear Item', categoryId: cat.id, sellingRate: 1200, gstPercentage: 0 }})
+  for (const pr of [exProd, exDear]) {
+    await prisma.productBatch.create({ data: {
+      productId: pr.id, batchCode: 'E', uniqueStockCode: `${pr.itemCode}/E`,
+      purchaseRate: 100, receivedQty: 30, currentQty: 30 }})
+  }
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, paymentMethod: 'CASH',
+    items: [{ productId: exProd.id, quantity: 1, unitRate: 200, gstPercentage: 0, lineDiscountPct: 0, lineDiscountAmt: 0 }] })}, token)
+  const exBill = r.body.bill
+  const tenderBefore = Number((await prisma.payment.aggregate({ _sum: { amount: true } }))._sum.amount ?? 0)
+  // swap a 200 item for a 1200 one; the customer hands over 1000
+  r = await api(`/api/v1/bills/${exBill.id}/exchange`, { method: 'POST', body: JSON.stringify({
+    returnItems: [{ billItemId: exBill.items[0].id, quantity: 1 }],
+    replacementItems: [{ productId: exDear.id, quantity: 1 }],
+    amountReceived: 1000, reasonCode: 'WRONG_ITEM' })}, token)
+  t('exchange accepted', r.status === 201, r.body)
+  eqp('net difference reported', r.body.netDifference, 1000)
+  t('replacement is fully settled', r.body.replacementBill.balanceDue === 0, r.body.replacementBill?.balanceDue)
+  const tenderAfter = Number((await prisma.payment.aggregate({ _sum: { amount: true } }))._sum.amount ?? 0)
+  eqp('only the 1,000 difference enters the ledger', tenderAfter - tenderBefore, 1000)
+
+
+  console.log('\n— mixed whole and fractional quantities —')
+  // Guards a bind-format regression: Prisma binds 3 and 2.75 as different
+  // types, and a prepared statement keeps whichever it saw first, so mixing
+  // them against one connection pool used to fail intermittently.
+  const mixProd = await prisma.product.create({ data: {
+    itemCode: 'MIX-TEST-001', name: 'Mixed Units', categoryId: cat.id,
+    sellMode: 'LENGTH', unitOfMeasure: 'm', sellingRate: 10, gstPercentage: 0 }})
+  await prisma.productBatch.create({ data: {
+    productId: mixProd.id, batchCode: 'M', uniqueStockCode: 'MIX-TEST-001/M',
+    purchaseRate: 5, receivedQty: 100, currentQty: 100 }})
+  for (const qty of [2.75, 1, 0.25, 3, 0.001, 10]) {
+    r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+      originDeviceId: device.id, paymentMethod: 'CASH',
+      items: [{ productId: mixProd.id, quantity: qty, unitRate: 10, gstPercentage: 0, lineDiscountPct: 0, lineDiscountAmt: 0 }] })}, token)
+    t(`billing ${qty} works`, r.status === 201, { qty, status: r.status, body: r.body })
+  }
+  const mixLeft = Number((await prisma.productBatch.findFirst({ where: { productId: mixProd.id } })).currentQty)
+  eqp('stock reduced by the exact total', 100 - mixLeft, 16.999 + 0.002)
+
+
+  console.log('\n— analytics counts the right money —')
+  const anProd = await prisma.product.create({ data: {
+    itemCode: 'AN-TEST-001', name: 'Analytics Item', categoryId: cat.id, sellingRate: 1000, gstPercentage: 0 }})
+  await prisma.productBatch.create({ data: {
+    productId: anProd.id, batchCode: 'A', uniqueStockCode: 'AN-TEST-001/A',
+    purchaseRate: 400, receivedQty: 100, currentQty: 100 }})
+  const anCust = await prisma.customer.create({ data: {
+    name: 'Analytics Buyer', phone: '9000000099', creditLimit: 100000, creditDays: 30 }})
+  const anBefore = (await api('/api/v1/analytics/summary?period=today', {}, token)).body.summary
+
+  // a credit sale must count as revenue immediately
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, customerId: anCust.id, payments: [],
+    items: [{ productId: anProd.id, quantity: 5, unitRate: 1000, gstPercentage: 0, lineDiscountPct: 0, lineDiscountAmt: 0 }] })}, token)
+  const creditBill = r.body.bill
+  let anAfter = (await api('/api/v1/analytics/summary?period=today', {}, token)).body.summary
+  eqp('an unpaid credit sale still counts as revenue', anAfter.totalRevenue - anBefore.totalRevenue, 5000)
+
+  // a split tender must be attributed to both methods
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, paymentMethod: 'CASH',
+    payments: [{ method: 'CASH', amount: 400 }, { method: 'UPI', amount: 600 }],
+    items: [{ productId: anProd.id, quantity: 1, unitRate: 1000, gstPercentage: 0, lineDiscountPct: 0, lineDiscountAmt: 0 }] })}, token)
+  t('split-tender sale created', r.status === 201, r.body)
+  const afterSplit = (await api('/api/v1/analytics/summary?period=today', {}, token)).body.summary
+  eqp('cash half attributed to cash', afterSplit.paymentBreakdown.CASH - anAfter.paymentBreakdown.CASH, 400)
+  eqp('upi half attributed to upi', afterSplit.paymentBreakdown.UPI - anAfter.paymentBreakdown.UPI, 600)
+  t('cheque is reported, not silently dropped', typeof afterSplit.paymentBreakdown.CHEQUE === 'number', afterSplit.paymentBreakdown)
+
+  // returned goods come off revenue
+  r = await api(`/api/v1/bills/${creditBill.id}/return`, { method: 'POST', body: JSON.stringify({
+    items: [{ billItemId: creditBill.items[0].id, quantity: 5 }], reasonCode: 'CHANGED_MIND' })}, token)
+  t('full return accepted', r.status === 201, r.body)
+  const afterReturn = (await api('/api/v1/analytics/summary?period=today', {}, token)).body.summary
+  eqp('returns are subtracted from net revenue',
+    afterReturn.netRevenue - afterSplit.netRevenue, -5000)
+  t('gross and net are both reported',
+    afterReturn.totalRevenue > afterReturn.netRevenue, { g: afterReturn.totalRevenue, n: afterReturn.netRevenue })
+  t('margin stays a believable percentage',
+    afterReturn.estimatedMarginPct < 100, afterReturn.estimatedMarginPct)
+
+
+  console.log('\n— the same sale submitted twice is one sale —')
+  {
+    const idemProd = await prisma.product.create({ data: {
+      itemCode: 'IDEM-TEST-001', name: 'Idempotency Item', categoryId: cat.id,
+      sellingRate: 100, gstPercentage: 0 }})
+    await prisma.productBatch.create({ data: {
+      productId: idemProd.id, batchCode: 'I', uniqueStockCode: 'IDEM-TEST-001/I',
+      purchaseRate: 40, receivedQty: 100, currentQty: 100 }})
+    const mkBody = (key) => JSON.stringify({
+      originDeviceId: device.id, paymentMethod: 'CASH', clientLocalId: key,
+      payments: [{ method: 'CASH', amount: 300 }],
+      items: [{ productId: idemProd.id, quantity: 3, unitRate: 100, gstPercentage: 0, lineDiscountPct: 0, lineDiscountAmt: 0 }] })
+
+    const stockOf = async () =>
+      Number((await prisma.productBatch.findFirst({ where: { productId: idemProd.id } })).currentQty)
+
+    // Sequential retry — a response that went missing.
+    const before = await stockOf()
+    const first = await api('/api/v1/bills', { method: 'POST', body: mkBody('idem-key-1') }, token)
+    const retry = await api('/api/v1/bills', { method: 'POST', body: mkBody('idem-key-1') }, token)
+    t('the first submit creates the bill', first.status === 201, first.body)
+    t('the retry is answered, not refused', retry.status === 200, retry.body)
+    eqp('...with the same bill', retry.body.bill.id === first.body.bill.id ? 1 : 0, 1)
+    eqp('...and the goods leave the shelf once', before - (await stockOf()), 3)
+
+    // Simultaneous submits — a double-click, both past the lookup.
+    const beforeRace = await stockOf()
+    const [a1, b1] = await Promise.all([
+      api('/api/v1/bills', { method: 'POST', body: mkBody('idem-key-2') }, token),
+      api('/api/v1/bills', { method: 'POST', body: mkBody('idem-key-2') }, token)
+    ])
+    t('neither simultaneous submit errors',
+      [200, 201].includes(a1.status) && [200, 201].includes(b1.status), { a: a1.status, b: b1.status })
+    eqp('both are told about the same bill', a1.body.bill.id === b1.body.bill.id ? 1 : 0, 1)
+    eqp('the customer is billed once', beforeRace - (await stockOf()), 3)
+    eqp('and one bill exists for that key',
+      await prisma.bill.count({ where: { clientLocalId: 'idem-key-2' } }), 1)
+
+    // A different key is a different sale.
+    const beforeThird = await stockOf()
+    const other = await api('/api/v1/bills', { method: 'POST', body: mkBody('idem-key-3') }, token)
+    t('a fresh key is a fresh sale', other.status === 201 && other.body.bill.id !== first.body.bill.id, other.body)
+    eqp('...and deducts its own stock', beforeThird - (await stockOf()), 3)
+  }
+
+  console.log('\n— a sale is dated when it happened —')
+  {
+    // Its own product: earlier blocks deactivate and drain the shared ones.
+    const dateProd = await prisma.product.create({ data: {
+      itemCode: 'DATE-TEST-001', name: 'Dating Item', categoryId: cat.id,
+      sellingRate: 118, gstPercentage: 18 }})
+    await prisma.productBatch.create({ data: {
+      productId: dateProd.id, batchCode: 'D', uniqueStockCode: 'DATE-TEST-001/D',
+      purchaseRate: 60, receivedQty: 100, currentQty: 100 }})
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000)
+    r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+      originDeviceId: device.id, paymentMethod: 'CASH', soldAt: twoHoursAgo.toISOString(),
+      payments: [{ method: 'CASH', amount: 118 }],
+      items: [{ productId: dateProd.id, quantity: 1, unitRate: 118, gstPercentage: 18, lineDiscountPct: 0, lineDiscountAmt: 0 }] })}, token)
+    t('a backdated sale is accepted', r.status === 201, r.body)
+    const stored = await prisma.bill.findUnique({ where: { id: r.body.bill.id } })
+    t('the sale keeps the time the till reported',
+      Math.abs(stored.paidAt.getTime() - twoHoursAgo.getTime()) < 2000,
+      { stored: stored.paidAt, sent: twoHoursAgo })
+
+    // A till with a broken clock must not be able to write into next year's
+    // books, or into a month already closed and filed.
+    for (const [label, when] of [
+      ['a future date', new Date(Date.now() + 48 * 60 * 60 * 1000)],
+      ['a date beyond the backdating window', new Date(Date.now() - 90 * 24 * 60 * 60 * 1000)],
+      ['a nonsense date', 'not-a-date']
+    ]) {
+      const resp = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+        originDeviceId: device.id, paymentMethod: 'CASH',
+        soldAt: when instanceof Date ? when.toISOString() : when,
+        payments: [{ method: 'CASH', amount: 118 }],
+        items: [{ productId: dateProd.id, quantity: 1, unitRate: 118, gstPercentage: 18, lineDiscountPct: 0, lineDiscountAmt: 0 }] })}, token)
+      t(`${label} is accepted, not rejected`, resp.status === 201, resp.body)
+      const row = await prisma.bill.findUnique({ where: { id: resp.body.bill.id } })
+      t(`${label} is clamped to now`, Math.abs(row.paidAt.getTime() - Date.now()) < 60000, row.paidAt)
+    }
+
+    // Credit ageing has to run from the sale, not from the sync.
+    const backCust = await prisma.customer.create({ data: {
+      name: 'Backdated Buyer', phone: '9000000078', creditLimit: 50000, creditDays: 10 }})
+    const threeDaysAgo = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000)
+    r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+      originDeviceId: device.id, customerId: backCust.id, payments: [],
+      soldAt: threeDaysAgo.toISOString(),
+      items: [{ productId: dateProd.id, quantity: 1, unitRate: 118, gstPercentage: 18, lineDiscountPct: 0, lineDiscountAmt: 0 }] })}, token)
+    t('a backdated credit sale is accepted', r.status === 201, r.body)
+    const credit = await prisma.bill.findUnique({ where: { id: r.body.bill.id } })
+    const expectedDue = new Date(threeDaysAgo.getTime() + 10 * 24 * 60 * 60 * 1000)
+    t('the due date counts from the sale, not the sync',
+      Math.abs(credit.dueDate.getTime() - expectedDue.getTime()) < 2000,
+      { due: credit.dueDate, expected: expectedDue })
+  }
+
+  console.log('\n— the change feed cannot skip a commit —')
+  {
+    // Drain whatever the earlier tests generated so the window is clean.
+    let cursor = '0'
+    for (let i = 0; i < 50; i++) {
+      const page = (await api(`/api/v1/sync/pull?cursor=${encodeURIComponent(cursor)}&limit=500`, {}, token)).body
+      if (!page.events.length) break
+      cursor = page.nextCursor
+      if (!page.hasMore) break
+    }
+    t('cursors are (txid, id) pairs', /^\d+:\d+$/.test(cursor) || cursor === '0', cursor)
+
+    // Hold a transaction open with an unsent event in it, exactly as a slow
+    // sale would. Then commit a *later* event from another connection.
+    let release
+    const gate = new Promise((r) => { release = r })
+    const held = prisma.$transaction(async (tx) => {
+      await tx.syncEvent.create({ data: {
+        entity: 'product', entityId: 'held-by-open-txn', op: 'upsert', payload: { name: 'Held' } }})
+      await gate
+    }, { timeout: 30000, maxWait: 30000 })
+
+    await new Promise((r) => setTimeout(r, 300))
+    await prisma.syncEvent.create({ data: {
+      entity: 'product', entityId: 'committed-after', op: 'upsert', payload: { name: 'After' } }})
+
+    const during = (await api(`/api/v1/sync/pull?cursor=${encodeURIComponent(cursor)}&limit=500`, {}, token)).body
+    const idsDuring = during.events.map((e) => e.entityId)
+    t('the later commit waits for the earlier one',
+      !idsDuring.includes('committed-after'), idsDuring)
+    t('...and so does the one still in flight',
+      !idsDuring.includes('held-by-open-txn'), idsDuring)
+
+    release()
+    await held
+
+    const after = (await api(`/api/v1/sync/pull?cursor=${encodeURIComponent(cursor)}&limit=500`, {}, token)).body
+    const idsAfter = after.events.map((e) => e.entityId)
+    t('both arrive once the slow write lands', idsAfter.includes('held-by-open-txn') && idsAfter.includes('committed-after'), idsAfter)
+    t('in commit order, oldest first',
+      idsAfter.indexOf('held-by-open-txn') < idsAfter.indexOf('committed-after'), idsAfter)
+    t('every event carries a resume token',
+      after.events.every((e) => /^\d+:\d+$/.test(e.cursor)), after.events[0])
+
+    // A bare id from an older terminal build still means something.
+    const legacy = (await api('/api/v1/sync/pull?cursor=0&limit=5', {}, token)).body
+    t('a legacy id-only cursor is accepted', legacy.events.length > 0, legacy)
+    const resumed = (await api(`/api/v1/sync/pull?cursor=${encodeURIComponent(after.nextCursor)}&limit=500`, {}, token)).body
+    eqp('resuming from nextCursor returns nothing new', resumed.events.length, 0)
+  }
 
   console.log(`\n${pass} passed, ${fail} failed`)
   await prisma.$disconnect()

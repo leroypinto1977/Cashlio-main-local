@@ -18,6 +18,15 @@ const LOCAL_API = (import.meta.env.VITE_LOCAL_API_URL as string) || 'http://127.
 
 type Period = 'today' | 'week' | 'month' | 'year' | 'all'
 
+// One row per tender the server can report. A bill can be settled with more
+// than one of these, so these are amounts of money taken, not counts of bills.
+const TENDERS = [
+  { key: 'CASH', label: 'Cash', icon: Banknote, bar: 'bg-emerald-500', chip: 'bg-emerald-50', fg: 'text-emerald-600' },
+  { key: 'UPI', label: 'UPI', icon: Smartphone, bar: 'bg-blue-500', chip: 'bg-blue-50', fg: 'text-blue-600' },
+  { key: 'CARD', label: 'Card', icon: CreditCard, bar: 'bg-purple-500', chip: 'bg-purple-50', fg: 'text-purple-600' },
+  { key: 'CHEQUE', label: 'Cheque', icon: Receipt, bar: 'bg-amber-500', chip: 'bg-amber-50', fg: 'text-amber-600' }
+] as const
+
 type TopProduct = {
   productId: string
   productName: string
@@ -40,9 +49,13 @@ type AnalyticsSummary = {
   estimatedMarginPct: number
   revenueExGst: number
   totalTaxableValue: number
+  totalReturns: number
+  netRevenue: number
+  returnCount: number
+  totalCollected: number
   hasCOGSData: boolean
-  paymentBreakdown: { CASH: number; UPI: number; CARD: number }
-  paymentCounts: { CASH: number; UPI: number; CARD: number }
+  paymentBreakdown: Record<string, number>
+  paymentCounts: Record<string, number>
   topProducts: TopProduct[]
 }
 
@@ -94,13 +107,22 @@ export function AnalyticsScreen({ token }: { token: string | null }): React.JSX.
     setPeriod(p)
   }
 
-  // Payment bar widths
+  // Payment bar widths. The server reports whatever tenders it actually saw,
+  // so read every key back rather than assuming the old three.
   const totalPaymentAmt = summary
-    ? summary.paymentBreakdown.CASH + summary.paymentBreakdown.UPI + summary.paymentBreakdown.CARD
+    ? Object.values(summary.paymentBreakdown).reduce((a, b) => a + b, 0)
     : 0
-  const cashPct = totalPaymentAmt > 0 ? (summary!.paymentBreakdown.CASH / totalPaymentAmt) * 100 : 0
-  const upiPct = totalPaymentAmt > 0 ? (summary!.paymentBreakdown.UPI / totalPaymentAmt) * 100 : 0
-  const cardPct = totalPaymentAmt > 0 ? (summary!.paymentBreakdown.CARD / totalPaymentAmt) * 100 : 0
+  const tenders = summary
+    ? TENDERS.map((t) => {
+        const amount = summary.paymentBreakdown[t.key] ?? 0
+        return {
+          ...t,
+          amount,
+          count: summary.paymentCounts[t.key] ?? 0,
+          pct: totalPaymentAmt > 0 ? (amount / totalPaymentAmt) * 100 : 0
+        }
+      }).filter((t) => t.amount > 0 || t.count > 0)
+    : []
 
   const topRevProduct = summary?.topProducts[0]
   const topRevAmt = topRevProduct?.totalRevenue ?? 0
@@ -178,8 +200,15 @@ export function AnalyticsScreen({ token }: { token: string | null }): React.JSX.
                   <TrendingUp className="w-4 h-4 text-emerald-600" />
                 </div>
               </div>
-              <p className="text-2xl font-bold text-zinc-900">₹{fmt(summary.totalRevenue)}</p>
-              <p className="text-xs text-zinc-400 mt-1">{PERIOD_LABELS[period]}</p>
+              <p className="text-2xl font-bold text-zinc-900">₹{fmt(summary.netRevenue)}</p>
+              {summary.totalReturns > 0 ? (
+                <p className="text-xs text-zinc-400 mt-1">
+                  {PERIOD_LABELS[period]} · ₹{fmt(summary.totalRevenue)} sold less ₹
+                  {fmt(summary.totalReturns)} returned
+                </p>
+              ) : (
+                <p className="text-xs text-zinc-400 mt-1">{PERIOD_LABELS[period]}</p>
+              )}
             </div>
 
             {/* Bills */}
@@ -358,87 +387,56 @@ export function AnalyticsScreen({ token }: { token: string | null }): React.JSX.
           <div className="grid grid-cols-5 gap-4">
             {/* Payment breakdown */}
             <div className="col-span-2 p-5 rounded-xl bg-card border shadow-sm">
-              <p className="text-xs font-semibold text-zinc-500 uppercase tracking-wide mb-4">
-                Payment Methods
-              </p>
+              <div className="flex items-baseline justify-between mb-4">
+                <p className="text-xs font-semibold text-zinc-500 uppercase tracking-wide">
+                  Money Collected
+                </p>
+                <p className="text-xs text-zinc-400">₹{fmt(summary.totalCollected)}</p>
+              </div>
               {summary.totalBills === 0 ? (
                 <p className="text-sm text-zinc-400 italic">No bills yet.</p>
               ) : (
                 <div className="space-y-4">
                   {/* Stacked bar */}
                   <div className="h-3 bg-zinc-100 rounded-full overflow-hidden flex">
-                    {cashPct > 0 && (
-                      <div
-                        className="h-full bg-emerald-500 transition-all"
-                        style={{ width: `${cashPct}%` }}
-                      />
-                    )}
-                    {upiPct > 0 && (
-                      <div
-                        className="h-full bg-blue-500 transition-all"
-                        style={{ width: `${upiPct}%` }}
-                      />
-                    )}
-                    {cardPct > 0 && (
-                      <div
-                        className="h-full bg-purple-500 transition-all"
-                        style={{ width: `${cardPct}%` }}
-                      />
+                    {tenders.map((t) =>
+                      t.pct > 0 ? (
+                        <div
+                          key={t.key}
+                          className={`h-full transition-all ${t.bar}`}
+                          style={{ width: `${t.pct}%` }}
+                        />
+                      ) : null
                     )}
                   </div>
 
                   <div className="space-y-3">
-                    {/* CASH */}
-                    <div className="flex items-center gap-3">
-                      <div className="w-7 h-7 rounded-lg bg-emerald-50 flex items-center justify-center shrink-0">
-                        <Banknote className="w-3.5 h-3.5 text-emerald-600" />
-                      </div>
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center justify-between">
-                          <span className="text-sm font-medium text-zinc-700">Cash</span>
-                          <span className="text-sm font-semibold text-zinc-900">
-                            ₹{fmt(summary.paymentBreakdown.CASH)}
-                          </span>
+                    {tenders.map((t) => {
+                      const Icon = t.icon
+                      return (
+                        <div key={t.key} className="flex items-center gap-3">
+                          <div className={`w-7 h-7 rounded-lg flex items-center justify-center shrink-0 ${t.chip}`}>
+                            <Icon className={`w-3.5 h-3.5 ${t.fg}`} />
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center justify-between">
+                              <span className="text-sm font-medium text-zinc-700">{t.label}</span>
+                              <span className="text-sm font-semibold text-zinc-900">
+                                ₹{fmt(t.amount)}
+                              </span>
+                            </div>
+                            <p className="text-xs text-zinc-400">
+                              {fmtInt(t.count)} payment{t.count !== 1 ? 's' : ''} · {t.pct.toFixed(1)}%
+                            </p>
+                          </div>
                         </div>
-                        <p className="text-xs text-zinc-400">
-                          {summary.paymentCounts.CASH} bill{summary.paymentCounts.CASH !== 1 ? 's' : ''} · {cashPct.toFixed(1)}%
-                        </p>
-                      </div>
-                    </div>
-                    {/* UPI */}
-                    <div className="flex items-center gap-3">
-                      <div className="w-7 h-7 rounded-lg bg-blue-50 flex items-center justify-center shrink-0">
-                        <Smartphone className="w-3.5 h-3.5 text-blue-600" />
-                      </div>
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center justify-between">
-                          <span className="text-sm font-medium text-zinc-700">UPI</span>
-                          <span className="text-sm font-semibold text-zinc-900">
-                            ₹{fmt(summary.paymentBreakdown.UPI)}
-                          </span>
-                        </div>
-                        <p className="text-xs text-zinc-400">
-                          {summary.paymentCounts.UPI} bill{summary.paymentCounts.UPI !== 1 ? 's' : ''} · {upiPct.toFixed(1)}%
-                        </p>
-                      </div>
-                    </div>
-                    {/* CARD */}
-                    <div className="flex items-center gap-3">
-                      <div className="w-7 h-7 rounded-lg bg-purple-50 flex items-center justify-center shrink-0">
-                        <CreditCard className="w-3.5 h-3.5 text-purple-600" />
-                      </div>
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center justify-between">
-                          <span className="text-sm font-medium text-zinc-700">Card</span>
-                          <span className="text-sm font-semibold text-zinc-900">
-                            ₹{fmt(summary.paymentBreakdown.CARD)}
-                          </span>
-                        </div>
-                        <p className="text-xs text-zinc-400">
-                          {summary.paymentCounts.CARD} bill{summary.paymentCounts.CARD !== 1 ? 's' : ''} · {cardPct.toFixed(1)}%
-                        </p>
-                      </div>
-                    </div>
+                      )
+                    })}
+                    {tenders.length === 0 && (
+                      <p className="text-sm text-zinc-400 italic">
+                        Nothing collected yet — every sale in this period is on credit.
+                      </p>
+                    )}
                   </div>
                 </div>
               )}
