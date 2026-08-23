@@ -83,6 +83,7 @@ model User {
   bills        Bill[]
   payments     Payment[]
   followUps    CustomerFollowUp[]
+  purchaseOrders PurchaseOrder[]
 }
 
 model Warehouse {
@@ -125,6 +126,7 @@ model Supplier {
   updatedAt     DateTime          @updatedAt
   batches       ProductBatch[]
   products      ProductSupplier[]
+  purchaseOrders PurchaseOrder[]
 }
 
 model ProductSupplier {
@@ -163,6 +165,7 @@ model Product {
   updatedAt          DateTime          @updatedAt
   sellingRate        Decimal           @default(0) @db.Decimal(10, 2)
   billItems          BillItem[]
+  orderItems         PurchaseOrderItem[]
   category           Category          @relation(fields: [categoryId], references: [id])
   batches            ProductBatch[]
   suppliers          ProductSupplier[]
@@ -192,8 +195,72 @@ model ProductBatch {
   product         Product    @relation(fields: [productId], references: [id])
   supplier        Supplier?  @relation(fields: [supplierId], references: [id])
   warehouse       Warehouse? @relation(fields: [warehouseId], references: [id])
+  allocations     BillItemBatch[]
 
   @@unique([productId, batchCode])
+}
+
+/// Which batch each sold unit actually came from.
+///
+/// Sales deduct oldest-first across batches, so without this a return has to
+/// guess where to put the goods back — the old code always chose the newest
+/// batch, which drifted batch quantities away from reality and made per-batch
+/// cost meaningless. Recording the split makes returns and voids exact, and
+/// gives true cost of goods instead of assuming the latest purchase rate.
+model BillItemBatch {
+  id         String       @id @default(uuid())
+  billItemId String
+  billItem   BillItem     @relation(fields: [billItemId], references: [id], onDelete: Cascade)
+  batchId    String
+  batch      ProductBatch @relation(fields: [batchId], references: [id])
+  quantity   Decimal      @db.Decimal(12, 3)
+  /// Ex-GST cost of this batch at the moment of sale, so historic margin does
+  /// not move when a batch is later re-rated.
+  unitCost   Decimal      @default(0) @db.Decimal(10, 2)
+  createdAt  DateTime     @default(now())
+
+  @@index([billItemId])
+  @@index([batchId])
+}
+
+// ─── Procurement ─────────────────────────────────────────────────────────────
+
+/// A restock order placed with a supplier. Receiving one creates the batches,
+/// which is why the goods-in form and the batch form ask the same questions.
+model PurchaseOrder {
+  id          String              @id @default(uuid())
+  orderNumber String              @unique
+  supplierId  String
+  supplier    Supplier            @relation(fields: [supplierId], references: [id])
+  /// DRAFT — still being built. PLACED — sent to the supplier. PARTIAL — some
+  /// goods arrived. RECEIVED — complete. CANCELLED — abandoned.
+  status      String              @default("DRAFT")
+  expectedAt  DateTime?
+  placedAt    DateTime?
+  notes       String?
+  createdById String
+  createdBy   User                @relation(fields: [createdById], references: [id])
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+  items       PurchaseOrderItem[]
+
+  @@index([status])
+  @@index([supplierId])
+}
+
+model PurchaseOrderItem {
+  id              String        @id @default(uuid())
+  purchaseOrderId String
+  purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  productId       String
+  product         Product       @relation(fields: [productId], references: [id])
+  orderedQty      Decimal       @db.Decimal(12, 3)
+  receivedQty     Decimal       @default(0) @db.Decimal(12, 3)
+  /// What the supplier quoted, excluding GST.
+  expectedRate    Decimal       @default(0) @db.Decimal(10, 2)
+  gstPercentage   Decimal       @default(0) @db.Decimal(5, 2)
+
+  @@index([purchaseOrderId])
 }
 
 model Customer {
@@ -302,6 +369,8 @@ model Bill {
   originalBill   Bill?            @relation("BillReturns", fields: [originalBillId], references: [id])
   returns        Bill[]           @relation("BillReturns")
   returnReason   String?
+  /// One of the shared RETURN_REASONS codes; `returnReason` keeps the note.
+  returnReasonCode String?
   cashier        User             @relation(fields: [cashierId], references: [id])
   customer       Customer?        @relation(fields: [customerId], references: [id])
   originDevice   AuthorizedClient @relation(fields: [originDeviceId], references: [id])
@@ -337,6 +406,7 @@ model BillItem {
   originalBillItemId String?
   originalBillItem   BillItem?  @relation("BillItemReturns", fields: [originalBillItemId], references: [id])
   returnedAs         BillItem[] @relation("BillItemReturns")
+  batchAllocations   BillItemBatch[]
   bill               Bill       @relation(fields: [billId], references: [id], onDelete: Cascade)
   product            Product    @relation(fields: [productId], references: [id])
 }

@@ -35,6 +35,10 @@ import {
   settle, statusFor, checkCredit, isPaymentMethod, dueDateFor, ageBucketOf,
   daysBetween, UNSETTLED_STATUSES, type Tender
 } from '../shared/credit'
+import {
+  isReturnReasonCode, shouldRestock, isPurchaseOrderStatus,
+  canReceive, canCancel, isEditable, statusAfterReceipt
+} from '../shared/procurement'
 
 declare global {
   namespace Express {
@@ -128,7 +132,7 @@ function istMidnight(base: Date = new Date(), offset = 0): Date {
  * `BT` for stock batches — deliberately distinct prefixes so a bill number can
  * never be mistaken for a batch code. Series reset each IST calendar month.
  */
-type Series = 'INV' | 'CN' | 'BT'
+type Series = 'INV' | 'CN' | 'BT' | 'PO'
 
 function currentPeriod(now: Date = new Date()): string {
   const ist = new Date(now.getTime() + IST_OFFSET_MS)
@@ -1899,6 +1903,7 @@ app.get('/api/v1/bills/:id', requireAuth(), async (req, res) => {
         },
         items: {
           include: {
+            batchAllocations: { select: { quantity: true, unitCost: true } },
             product: {
               select: {
                 itemCode: true, name: true,
@@ -1943,7 +1948,17 @@ app.get('/api/v1/bills/:id', requireAuth(), async (req, res) => {
         })),
         items: bill.items.map((it) => ({
           ...serializeBillItem(it),
-          purchaseRate: it.product.batches[0] ? Number(it.product.batches[0].purchaseRate) : null,
+          // Cost of the exact units sold, where we recorded it; older bills
+          // fall back to the latest purchase rate.
+          purchaseRate:
+            it.batchAllocations.length > 0 && Number(it.quantity) > 0
+              ? round2(
+                  it.batchAllocations.reduce((s2, a) => s2 + Number(a.quantity) * Number(a.unitCost), 0) /
+                    Number(it.quantity)
+                )
+              : it.product.batches[0]
+                ? Number(it.product.batches[0].purchaseRate)
+                : null,
           alreadyReturnedQty: returnedByLineId.get(it.id) ?? 0
         }))
       }
@@ -1998,6 +2013,8 @@ async function createBillCore(tx: TxClient, args: CreateBillArgs, billNumber?: s
     lineGstAmount: number; lineTotal: number
     billDiscountAmt: number; taxableValue: number
     cgstAmount: number; sgstAmount: number; igstAmount: number
+    /** Which batches this line was taken from, oldest first. */
+    allocations: { batchId: string; quantity: number; unitCost: number }[]
   }
   const lines: FinalLine[] = []
 
@@ -2031,6 +2048,7 @@ async function createBillCore(tx: TxClient, args: CreateBillArgs, billNumber?: s
       orderBy: { receivedDate: 'asc' }
     })
     let remaining = item.quantity
+    const allocations: { batchId: string; quantity: number; unitCost: number }[] = []
     for (const batch of batches) {
       if (remaining <= 0) break
       const batchQty = Number(batch.currentQty)
@@ -2038,6 +2056,13 @@ async function createBillCore(tx: TxClient, args: CreateBillArgs, billNumber?: s
       await tx.productBatch.update({
         where: { id: batch.id },
         data: { currentQty: roundQty(batchQty - deduct) }
+      })
+      // Remembering the split is what lets a later return put the goods back
+      // where they came from, and gives this line a true cost of goods.
+      allocations.push({
+        batchId: batch.id,
+        quantity: deduct,
+        unitCost: round2(Number(batch.purchaseRate))
       })
       remaining = roundQty(remaining - deduct)
     }
@@ -2064,7 +2089,8 @@ async function createBillCore(tx: TxClient, args: CreateBillArgs, billNumber?: s
       taxableValue: 0,
       cgstAmount: 0,
       sgstAmount: 0,
-      igstAmount: 0
+      igstAmount: 0,
+      allocations
     })
   }
 
@@ -2152,7 +2178,12 @@ async function createBillCore(tx: TxClient, args: CreateBillArgs, billNumber?: s
           collectedById: args.cashierId
         }))
       },
-      items: { create: lines }
+      items: {
+        create: lines.map(({ allocations, ...line }) => ({
+          ...line,
+          batchAllocations: { create: allocations }
+        }))
+      }
     },
     include: { customer: { select: { name: true } }, items: true }
   })
@@ -2168,9 +2199,72 @@ type ProcessReturnArgs = {
   originalBillId: string
   returnItems: ReturnLineRequest[]
   reason: string | null
+  reasonCode: string | null
   cashierId: string
   originDeviceId: string
   billNumber?: string
+}
+
+/**
+ * Works out which batches returned goods belong back in.
+ *
+ * A sale records the batches it took from, so a return can reverse exactly
+ * that split rather than guessing. Quantities already returned against the
+ * same line are subtracted first, so returning three units twice cannot put
+ * six back into a batch that only gave three.
+ *
+ * Bills written before allocations were recorded have nothing to reverse; for
+ * those we fall back to the newest active batch, which is what the old code
+ * always did.
+ */
+async function planRestock(
+  tx: TxClient,
+  originalBillItemId: string,
+  productId: string,
+  quantity: number
+): Promise<{ batchId: string; quantity: number; unitCost: number }[]> {
+  const taken = await tx.billItemBatch.findMany({
+    where: { billItemId: originalBillItemId },
+    orderBy: { createdAt: 'asc' }
+  })
+
+  if (taken.length === 0) {
+    const batch = await tx.productBatch.findFirst({
+      where: { productId, isActive: true },
+      orderBy: { receivedDate: 'desc' }
+    })
+    return batch
+      ? [{ batchId: batch.id, quantity, unitCost: round2(Number(batch.purchaseRate)) }]
+      : []
+  }
+
+  // How much has already gone back into each batch for this line.
+  const priorReturns = await tx.billItemBatch.findMany({
+    where: { billItem: { originalBillItemId, bill: { status: 'RETURN' } } },
+    select: { batchId: true, quantity: true }
+  })
+  const returnedByBatch = new Map<string, number>()
+  for (const r of priorReturns) {
+    returnedByBatch.set(r.batchId, roundQty((returnedByBatch.get(r.batchId) ?? 0) + Number(r.quantity)))
+  }
+
+  const plan: { batchId: string; quantity: number; unitCost: number }[] = []
+  let left = roundQty(quantity)
+  for (const alloc of taken) {
+    if (left <= 0) break
+    const capacity = roundQty(Number(alloc.quantity) - (returnedByBatch.get(alloc.batchId) ?? 0))
+    if (capacity <= 0) continue
+    const put = roundQty(Math.min(capacity, left))
+    plan.push({ batchId: alloc.batchId, quantity: put, unitCost: round2(Number(alloc.unitCost)) })
+    left = roundQty(left - put)
+  }
+
+  // Anything left over (only possible if the sale's own records are short)
+  // goes back into the batch it was most likely taken from.
+  if (left > 0 && plan.length > 0) {
+    plan[plan.length - 1].quantity = roundQty(plan[plan.length - 1].quantity + left)
+  }
+  return plan
 }
 
 // Performs the return half of a refund/exchange inside a tx. Validates against
@@ -2226,6 +2320,8 @@ async function processReturnCore(tx: TxClient, args: ProcessReturnArgs) {
     cgstAmount: number
     sgstAmount: number
     igstAmount: number
+    /** Where the goods were put back, mirroring the sale's own split. */
+    restockPlan: { batchId: string; quantity: number; unitCost: number }[]
   }
   const returnLines: FinalReturnLine[] = []
 
@@ -2255,21 +2351,25 @@ async function processReturnCore(tx: TxClient, args: ProcessReturnArgs) {
       taxableValue: 0,
       cgstAmount: 0,
       sgstAmount: 0,
-      igstAmount: 0
+      igstAmount: 0,
+      restockPlan: []
     })
   }
 
-  // Restock: most-recently-received active batch per product
-  for (const l of returnLines) {
-    const batch = await tx.productBatch.findFirst({
-      where: { productId: l.originalItem.productId, isActive: true },
-      orderBy: { receivedDate: 'desc' }
-    })
-    if (batch) {
-      await tx.productBatch.update({
-        where: { id: batch.id },
-        data: { currentQty: { increment: l.quantity } }
-      })
+  // Goods that came back broken must not go back on the shelf — they would
+  // only be sold again. The credit note still records the quantity, which is
+  // what makes the loss visible in reporting.
+  const restock = shouldRestock(args.reasonCode)
+
+  if (restock) {
+    for (const l of returnLines) {
+      l.restockPlan = await planRestock(tx, l.originalItem.id, l.originalItem.productId, l.quantity)
+      for (const put of l.restockPlan) {
+        await tx.productBatch.update({
+          where: { id: put.batchId },
+          data: { currentQty: { increment: put.quantity } }
+        })
+      }
     }
   }
 
@@ -2323,6 +2423,7 @@ async function processReturnCore(tx: TxClient, args: ProcessReturnArgs) {
       notes: args.reason ? `Return: ${args.reason}` : 'Return',
       originalBillId: original.id,
       returnReason: args.reason || null,
+      returnReasonCode: args.reasonCode || null,
       items: {
         create: returnLines.map((l) => ({
           productId: l.originalItem.productId,
@@ -2341,7 +2442,8 @@ async function processReturnCore(tx: TxClient, args: ProcessReturnArgs) {
           cgstAmount: l.cgstAmount,
           sgstAmount: l.sgstAmount,
           igstAmount: l.igstAmount,
-          originalBillItemId: l.originalItem.id
+          originalBillItemId: l.originalItem.id,
+          batchAllocations: { create: l.restockPlan }
         }))
       }
     },
@@ -2473,7 +2575,9 @@ app.post('/api/v1/bills', requireActiveLicense(), requireAuth(), async (req, res
 //     reason?: string,
 //     originDeviceId?: string  // optional, falls back to the original bill's device
 //   }
-app.post('/api/v1/bills/:id/return', requireActiveLicense(), requireAuth(['SUPER_ADMIN']), async (req, res) => {
+// A cashier can process a return at the counter — that is the whole point of
+// having one — but voiding a bill outright stays with a super admin.
+app.post('/api/v1/bills/:id/return', requireActiveLicense(), requireAuth(), async (req, res) => {
   try {
     const billId = String(req.params.id)
     const { items, reason, originDeviceId } = req.body as {
@@ -2489,10 +2593,19 @@ app.post('/api/v1/bills/:id/return', requireActiveLicense(), requireAuth(['SUPER
     const original = await prisma.bill.findUnique({ where: { id: billId } })
     if (!original) return res.status(404).json({ success: false, error: 'NOT_FOUND' })
 
+    const reasonCode = req.body?.reasonCode
+    if (reasonCode != null && !isReturnReasonCode(reasonCode)) {
+      return res.status(400).json({
+        success: false, error: 'INVALID_RETURN_REASON',
+        message: 'Pick one of the listed return reasons.'
+      })
+    }
+
     const result = await prisma.$transaction((tx) => processReturnCore(tx, {
       originalBillId: billId,
       returnItems: items,
       reason: reason || null,
+      reasonCode: reasonCode ?? null,
       cashierId: req.user!.userId,
       originDeviceId: originDeviceId || original.originDeviceId
     }))
@@ -2585,6 +2698,7 @@ app.post('/api/v1/bills/:id/exchange', requireActiveLicense(), requireAuth(['SUP
         originalBillId,
         returnItems,
         reason: reason ? `Exchange: ${reason}` : 'Exchange',
+        reasonCode: isReturnReasonCode(req.body?.reasonCode) ? req.body.reasonCode : null,
         cashierId,
         originDeviceId: deviceId
       })
@@ -2699,17 +2813,13 @@ app.post('/api/v1/bills/:id/void', requireAuth(['SUPER_ADMIN']), async (req, res
     }
 
     await prisma.$transaction(async (tx) => {
-      // Restore stock FIFO (add back to most-recent batch per product)
+      // Put every unit back exactly where the sale took it from.
       for (const item of bill.items) {
-        const batches = await tx.productBatch.findMany({
-          where: { productId: item.productId, isActive: true },
-          orderBy: { receivedDate: 'desc' },
-          take: 1
-        })
-        if (batches.length > 0) {
+        const plan = await planRestock(tx, item.id, item.productId, Number(item.quantity))
+        for (const put of plan) {
           await tx.productBatch.update({
-            where: { id: batches[0].id },
-            data: { currentQty: { increment: item.quantity } }
+            where: { id: put.batchId },
+            data: { currentQty: { increment: put.quantity } }
           })
         }
       }
@@ -3101,6 +3211,485 @@ app.put('/api/v1/followups/:id', requireAuth(), async (req, res) => {
   }
 })
 
+// ─── Phase 4 — Purchase orders ────────────────────────────────────────────────
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+function serializePurchaseOrder(po: any): any {
+  const items = (po.items ?? []).map((i: any) => ({
+    ...i,
+    orderedQty: Number(i.orderedQty),
+    receivedQty: Number(i.receivedQty),
+    pendingQty: roundQty(Number(i.orderedQty) - Number(i.receivedQty)),
+    expectedRate: Number(i.expectedRate),
+    gstPercentage: Number(i.gstPercentage),
+    lineTotal: round2(Number(i.orderedQty) * Number(i.expectedRate))
+  }))
+  return {
+    ...po,
+    items,
+    itemCount: items.length,
+    orderTotal: round2(items.reduce((s: number, i: any) => s + i.lineTotal, 0))
+  }
+}
+/* eslint-enable @typescript-eslint/no-explicit-any */
+
+/**
+ * Products at or below their minimum stock level, grouped by the supplier they
+ * are normally bought from. This is what turns "we're low on cable" into an
+ * order without anyone having to remember who supplies it.
+ */
+app.get('/api/v1/purchase-orders/suggestions', requireAuth(['SUPER_ADMIN']), async (_req, res) => {
+  try {
+    const products = await prisma.product.findMany({
+      where: { isActive: true },
+      include: {
+        batches: { where: { isActive: true }, select: { currentQty: true, purchaseRate: true, receivedDate: true } },
+        suppliers: {
+          include: { supplier: { select: { id: true, name: true, isActive: true } } },
+          orderBy: { isDefault: 'desc' }
+        }
+      }
+    })
+
+    type Row = {
+      productId: string; itemCode: string; name: string; unitOfMeasure: string
+      sellMode: string; totalStock: number; minStockLevel: number
+      suggestedQty: number; lastRate: number; gstPercentage: number
+    }
+    const bySupplier = new Map<string, { supplierId: string | null; supplierName: string; items: Row[] }>()
+
+    for (const p of products) {
+      const totalStock = roundQty(p.batches.reduce((s, b) => s + Number(b.currentQty), 0))
+      const minLevel = Number(p.minStockLevel)
+      if (minLevel <= 0 || totalStock > minLevel) continue
+
+      // Order back up to the minimum, with the same again as headroom, so a
+      // shop is not re-ordering the same item every other day.
+      const suggestedQty = roundQty(Math.max(minLevel * 2 - totalStock, minLevel))
+      const latest = [...p.batches].sort(
+        (a, b) => new Date(b.receivedDate).getTime() - new Date(a.receivedDate).getTime()
+      )[0]
+      const link = p.suppliers[0]
+      const key = link?.supplier.id ?? 'none'
+
+      const row: Row = {
+        productId: p.id, itemCode: p.itemCode, name: p.name,
+        unitOfMeasure: p.unitOfMeasure, sellMode: p.sellMode,
+        totalStock, minStockLevel: minLevel, suggestedQty,
+        lastRate: latest ? round2(Number(latest.purchaseRate)) : 0,
+        gstPercentage: Number(p.gstPercentage)
+      }
+      const group = bySupplier.get(key) ?? {
+        supplierId: link?.supplier.id ?? null,
+        supplierName: link?.supplier.name ?? 'No default supplier',
+        items: []
+      }
+      group.items.push(row)
+      bySupplier.set(key, group)
+    }
+
+    const groups = [...bySupplier.values()].sort((a, b) => b.items.length - a.items.length)
+    return res.json({
+      success: true,
+      groups,
+      lowStockCount: groups.reduce((s, g) => s + g.items.length, 0)
+    })
+  } catch (err) {
+    console.error(err)
+    return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
+  }
+})
+
+app.get('/api/v1/purchase-orders', requireAuth(['SUPER_ADMIN']), async (req, res) => {
+  try {
+    const { status, supplierId, limit = '50', offset = '0' } = req.query
+    const where = {
+      status: status && isPurchaseOrderStatus(status) ? String(status) : undefined,
+      supplierId: supplierId ? String(supplierId) : undefined
+    }
+    const [orders, total] = await Promise.all([
+      prisma.purchaseOrder.findMany({
+        where,
+        include: {
+          supplier: { select: { name: true, phone: true } },
+          createdBy: { select: { username: true } },
+          items: { include: { product: { select: { itemCode: true, name: true, unitOfMeasure: true } } } }
+        },
+        orderBy: { createdAt: 'desc' },
+        take: parseInt(String(limit)),
+        skip: parseInt(String(offset))
+      }),
+      prisma.purchaseOrder.count({ where })
+    ])
+    return res.json({ success: true, orders: orders.map(serializePurchaseOrder), total })
+  } catch (err) {
+    console.error(err)
+    return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
+  }
+})
+
+app.get('/api/v1/purchase-orders/:id', requireAuth(['SUPER_ADMIN']), async (req, res) => {
+  try {
+    const order = await prisma.purchaseOrder.findUnique({
+      where: { id: String(req.params.id) },
+      include: {
+        supplier: true,
+        createdBy: { select: { username: true } },
+        items: {
+          include: {
+            product: {
+              select: { itemCode: true, name: true, unitOfMeasure: true, sellMode: true, gstPercentage: true }
+            }
+          }
+        }
+      }
+    })
+    if (!order) return res.status(404).json({ success: false, error: 'NOT_FOUND' })
+    return res.json({ success: true, order: serializePurchaseOrder(order) })
+  } catch (err) {
+    console.error(err)
+    return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
+  }
+})
+
+app.post('/api/v1/purchase-orders', requireAuth(['SUPER_ADMIN']), async (req, res) => {
+  try {
+    const { supplierId, items, expectedAt, notes, place } = req.body
+
+    if (!supplierId) {
+      return res.status(400).json({ success: false, error: 'SUPPLIER_REQUIRED' })
+    }
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ success: false, error: 'ORDER_ITEMS_REQUIRED' })
+    }
+    const supplier = await prisma.supplier.findUnique({ where: { id: String(supplierId) } })
+    if (!supplier) return res.status(404).json({ success: false, error: 'SUPPLIER_NOT_FOUND' })
+
+    const productIds = items.map((i: { productId?: unknown }) => String(i.productId ?? ''))
+    const products = await prisma.product.findMany({ where: { id: { in: productIds } } })
+    const byId = new Map(products.map((p) => [p.id, p]))
+
+    const lines: {
+      productId: string; orderedQty: number; expectedRate: number; gstPercentage: number
+    }[] = []
+    for (const raw of items) {
+      const i = raw as {
+        productId?: unknown; quantity?: unknown; expectedRate?: unknown; gstPercentage?: unknown
+      }
+      const product = byId.get(String(i.productId ?? ''))
+      if (!product) {
+        return res.status(404).json({
+          success: false, error: 'PRODUCT_NOT_FOUND', productId: String(i.productId ?? '')
+        })
+      }
+      const qty = parseQty(Number(i.quantity ?? 0), product.sellMode)
+      if (qty <= 0) {
+        return res.status(400).json({
+          success: false, error: 'INVALID_ORDER_QUANTITY',
+          message: `Enter how much of "${product.name}" to order.`, productId: product.id
+        })
+      }
+      lines.push({
+        productId: product.id,
+        orderedQty: qty,
+        expectedRate: round2(Number(i.expectedRate) || 0),
+        gstPercentage:
+          i.gstPercentage !== undefined ? round2(Number(i.gstPercentage) || 0) : Number(product.gstPercentage)
+      })
+    }
+
+    const order = await prisma.$transaction(async (tx) => {
+      const orderNumber = await allocateNumber(tx, 'PO')
+      return tx.purchaseOrder.create({
+        data: {
+          orderNumber,
+          supplierId: supplier.id,
+          status: place ? 'PLACED' : 'DRAFT',
+          placedAt: place ? new Date() : null,
+          expectedAt: expectedAt ? new Date(expectedAt) : null,
+          notes: notes ? String(notes).trim() : null,
+          createdById: req.user!.userId,
+          items: { create: lines }
+        },
+        include: {
+          supplier: { select: { name: true, phone: true } },
+          items: { include: { product: { select: { itemCode: true, name: true, unitOfMeasure: true } } } }
+        }
+      })
+    })
+
+    return res.status(201).json({ success: true, order: serializePurchaseOrder(order) })
+  } catch (err) {
+    console.error(err)
+    return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
+  }
+})
+
+app.put('/api/v1/purchase-orders/:id', requireAuth(['SUPER_ADMIN']), async (req, res) => {
+  try {
+    const id = String(req.params.id)
+    const existing = await prisma.purchaseOrder.findUnique({ where: { id } })
+    if (!existing) return res.status(404).json({ success: false, error: 'NOT_FOUND' })
+    if (!isEditable(existing.status)) {
+      return res.status(409).json({
+        success: false, error: 'ORDER_NOT_EDITABLE',
+        message: 'Only a draft order can be changed. Cancel it and raise a new one.',
+        status: existing.status
+      })
+    }
+
+    const { expectedAt, notes, items } = req.body
+    const order = await prisma.$transaction(async (tx) => {
+      if (Array.isArray(items)) {
+        // A draft has never been sent, so replacing its lines wholesale is
+        // simpler and safer than diffing them.
+        await tx.purchaseOrderItem.deleteMany({ where: { purchaseOrderId: id } })
+        for (const raw of items) {
+          const i = raw as {
+            productId?: unknown; quantity?: unknown; expectedRate?: unknown; gstPercentage?: unknown
+          }
+          const product = await tx.product.findUnique({ where: { id: String(i.productId ?? '') } })
+          if (!product) throw Object.assign(new Error('PRODUCT_NOT_FOUND'), { code: 'PRODUCT_NOT_FOUND' })
+          const qty = parseQty(Number(i.quantity ?? 0), product.sellMode)
+          if (qty <= 0) throw Object.assign(new Error('INVALID_ORDER_QUANTITY'), { code: 'INVALID_ORDER_QUANTITY' })
+          await tx.purchaseOrderItem.create({
+            data: {
+              purchaseOrderId: id,
+              productId: product.id,
+              orderedQty: qty,
+              expectedRate: round2(Number(i.expectedRate) || 0),
+              gstPercentage:
+                i.gstPercentage !== undefined
+                  ? round2(Number(i.gstPercentage) || 0)
+                  : Number(product.gstPercentage)
+            }
+          })
+        }
+      }
+      return tx.purchaseOrder.update({
+        where: { id },
+        data: {
+          expectedAt: expectedAt !== undefined ? (expectedAt ? new Date(expectedAt) : null) : undefined,
+          notes: notes !== undefined ? (notes ? String(notes).trim() : null) : undefined
+        },
+        include: {
+          supplier: { select: { name: true, phone: true } },
+          items: { include: { product: { select: { itemCode: true, name: true, unitOfMeasure: true } } } }
+        }
+      })
+    })
+    return res.json({ success: true, order: serializePurchaseOrder(order) })
+  } catch (err: unknown) {
+    const code = (err as { code?: string }).code
+    if (code === 'PRODUCT_NOT_FOUND') return res.status(404).json({ success: false, error: 'PRODUCT_NOT_FOUND' })
+    if (code === 'INVALID_ORDER_QUANTITY') return res.status(400).json({ success: false, error: 'INVALID_ORDER_QUANTITY' })
+    console.error(err)
+    return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
+  }
+})
+
+app.post('/api/v1/purchase-orders/:id/place', requireAuth(['SUPER_ADMIN']), async (req, res) => {
+  try {
+    const existing = await prisma.purchaseOrder.findUnique({
+      where: { id: String(req.params.id) },
+      include: { items: true }
+    })
+    if (!existing) return res.status(404).json({ success: false, error: 'NOT_FOUND' })
+    if (existing.status !== 'DRAFT') {
+      return res.status(409).json({
+        success: false, error: 'ORDER_ALREADY_PLACED',
+        message: 'This order has already been sent to the supplier.', status: existing.status
+      })
+    }
+    if (existing.items.length === 0) {
+      return res.status(400).json({
+        success: false, error: 'ORDER_ITEMS_REQUIRED',
+        message: 'Add at least one item before placing the order.'
+      })
+    }
+    const order = await prisma.purchaseOrder.update({
+      where: { id: existing.id },
+      data: { status: 'PLACED', placedAt: new Date() },
+      include: {
+        supplier: { select: { name: true, phone: true } },
+        items: { include: { product: { select: { itemCode: true, name: true, unitOfMeasure: true } } } }
+      }
+    })
+    return res.json({ success: true, order: serializePurchaseOrder(order) })
+  } catch (err) {
+    console.error(err)
+    return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
+  }
+})
+
+app.post('/api/v1/purchase-orders/:id/cancel', requireAuth(['SUPER_ADMIN']), async (req, res) => {
+  try {
+    const existing = await prisma.purchaseOrder.findUnique({ where: { id: String(req.params.id) } })
+    if (!existing) return res.status(404).json({ success: false, error: 'NOT_FOUND' })
+    if (!canCancel(existing.status)) {
+      return res.status(409).json({
+        success: false, error: 'ORDER_NOT_CANCELLABLE',
+        message:
+          existing.status === 'CANCELLED'
+            ? 'This order is already cancelled.'
+            : 'Goods have already arrived against this order, so it cannot be cancelled.',
+        status: existing.status
+      })
+    }
+    const order = await prisma.purchaseOrder.update({
+      where: { id: existing.id },
+      data: { status: 'CANCELLED', notes: req.body?.reason ? String(req.body.reason).trim() : existing.notes },
+      include: {
+        supplier: { select: { name: true, phone: true } },
+        items: { include: { product: { select: { itemCode: true, name: true, unitOfMeasure: true } } } }
+      }
+    })
+    return res.json({ success: true, order: serializePurchaseOrder(order) })
+  } catch (err) {
+    console.error(err)
+    return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
+  }
+})
+
+/**
+ * Goods in. Each received line becomes a stock batch, which is why this asks
+ * the same questions the batch form does — including whether the supplier's
+ * rate includes GST.
+ *
+ * Partial deliveries are normal, so the order stays open until every line is
+ * complete. Receiving is one transaction: either all the batches are created
+ * and the order moves on, or nothing does.
+ */
+app.post('/api/v1/purchase-orders/:id/receive', requireAuth(['SUPER_ADMIN']), async (req, res) => {
+  try {
+    const id = String(req.params.id)
+    const { items, receivedDate, warehouseId, notes } = req.body
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({
+        success: false, error: 'RECEIVE_ITEMS_REQUIRED',
+        message: 'Enter what actually arrived.'
+      })
+    }
+
+    const result = await prisma.$transaction(async (tx) => {
+      const order = await tx.purchaseOrder.findUnique({
+        where: { id },
+        include: { items: { include: { product: true } } }
+      })
+      if (!order) throw Object.assign(new Error('NOT_FOUND'), { code: 'NOT_FOUND' })
+      if (!canReceive(order.status)) {
+        throw Object.assign(new Error('ORDER_NOT_RECEIVABLE'), {
+          code: 'ORDER_NOT_RECEIVABLE', status: order.status
+        })
+      }
+
+      const touchedProducts: string[] = []
+      const createdBatches: Awaited<ReturnType<typeof tx.productBatch.create>>[] = []
+
+      for (const raw of items) {
+        const line = raw as {
+          itemId?: unknown; quantity?: unknown; purchaseRate?: unknown
+          purchaseGstPct?: unknown; rateIncludesGst?: unknown; batchCode?: unknown
+        }
+        const orderItem = order.items.find((i) => i.id === String(line.itemId ?? ''))
+        if (!orderItem) {
+          throw Object.assign(new Error('ITEM_NOT_IN_ORDER'), {
+            code: 'ITEM_NOT_IN_ORDER', itemId: String(line.itemId ?? '')
+          })
+        }
+        const qty = parseQty(Number(line.quantity ?? 0), orderItem.product.sellMode)
+        if (qty <= 0) continue
+
+        const cost = computePurchaseCost(
+          line.purchaseRate !== undefined ? Number(line.purchaseRate) : Number(orderItem.expectedRate),
+          line.purchaseGstPct !== undefined ? Number(line.purchaseGstPct) : Number(orderItem.gstPercentage),
+          Boolean(line.rateIncludesGst)
+        )
+
+        const batchCode =
+          typeof line.batchCode === 'string' && line.batchCode.trim()
+            ? line.batchCode.trim()
+            : await allocateNumber(tx, 'BT')
+
+        const batch = await tx.productBatch.create({
+          data: {
+            productId: orderItem.productId,
+            batchCode,
+            uniqueStockCode: `${orderItem.product.itemCode}/${batchCode}`,
+            purchaseRate: cost.rateExGst,
+            purchaseGstPct: cost.gstPct,
+            purchaseGstAmount: cost.gstAmount,
+            purchaseRateInclGst: cost.rateInclGst,
+            receivedQty: qty,
+            currentQty: qty,
+            supplierId: order.supplierId,
+            warehouseId: warehouseId || null,
+            receivedDate: receivedDate ? new Date(receivedDate) : new Date(),
+            notes: `Received against ${order.orderNumber}${notes ? ` — ${String(notes).trim()}` : ''}`
+          },
+          include: { warehouse: true, supplier: true }
+        })
+
+        await tx.purchaseOrderItem.update({
+          where: { id: orderItem.id },
+          data: { receivedQty: roundQty(Number(orderItem.receivedQty) + qty) }
+        })
+        touchedProducts.push(orderItem.productId)
+        createdBatches.push(batch)
+      }
+
+      if (createdBatches.length === 0) {
+        throw Object.assign(new Error('NOTHING_RECEIVED'), { code: 'NOTHING_RECEIVED' })
+      }
+
+      const after = await tx.purchaseOrderItem.findMany({ where: { purchaseOrderId: id } })
+      const nextStatus = statusAfterReceipt(
+        after.map((i) => ({ orderedQty: Number(i.orderedQty), receivedQty: Number(i.receivedQty) }))
+      )
+
+      const updated = await tx.purchaseOrder.update({
+        where: { id },
+        data: { status: nextStatus },
+        include: {
+          supplier: { select: { name: true, phone: true } },
+          items: { include: { product: { select: { itemCode: true, name: true, unitOfMeasure: true } } } }
+        }
+      })
+
+      // Stock moved, so terminals need the new totals.
+      await emitProductUpsertBulk(tx, touchedProducts)
+      return { order: updated, batches: createdBatches }
+    })
+
+    return res.status(201).json({
+      success: true,
+      order: serializePurchaseOrder(result.order),
+      batches: result.batches.map(serializeBatch)
+    })
+  } catch (err: unknown) {
+    const e = err as { code?: string; status?: string; itemId?: string }
+    const map: Record<string, [number, string]> = {
+      NOT_FOUND: [404, 'No such order.'],
+      ORDER_NOT_RECEIVABLE: [409, 'Goods can only be received against an order that has been placed.'],
+      ITEM_NOT_IN_ORDER: [400, 'That line is not part of this order.'],
+      NOTHING_RECEIVED: [400, 'Enter a quantity for at least one line.']
+    }
+    if (e.code && map[e.code]) {
+      const [status, message] = map[e.code]
+      return res.status(status).json({ success: false, error: e.code, message, ...e })
+    }
+    if (e.code === 'P2002') {
+      return res.status(409).json({
+        success: false, error: 'BATCH_CODE_EXISTS_FOR_PRODUCT',
+        message: 'A batch with that code already exists for this product.'
+      })
+    }
+    console.error(err)
+    return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
+  }
+})
+
 app.get('/api/v1/analytics/summary', requireAuth(), async (req, res) => {
   try {
     const { period = 'today' } = req.query
@@ -3142,6 +3731,7 @@ app.get('/api/v1/analytics/summary', requireAuth(), async (req, res) => {
       include: {
         items: {
           include: {
+            batchAllocations: { select: { quantity: true, unitCost: true } },
             product: {
               select: {
                 batches: {
@@ -3182,11 +3772,21 @@ app.get('/api/v1/analytics/summary', requireAuth(), async (req, res) => {
         const gross = qty * Number(item.unitRate)
         totalLineDiscounts += gross - Number(item.lineTotal)
 
-        // Cost basis is the ex-GST purchase rate, compared against taxable
-        // value below, so margin is not inflated by tax on either side.
-        const pr = item.product.batches[0]?.purchaseRate
-        const cost = pr ? qty * Number(pr) : 0
-        if (pr) { estimatedCOGS += cost; cogsItemCount++ }
+        // True cost of goods: what these exact units cost when they were
+        // bought, taken from the batches the sale actually consumed. Only
+        // bills written before allocations existed fall back to assuming the
+        // latest purchase rate. Both bases are ex-GST, matching taxable value.
+        const allocated = item.batchAllocations ?? []
+        let cost = 0
+        let costed = false
+        if (allocated.length > 0) {
+          cost = round2(allocated.reduce((s2, a) => s2 + Number(a.quantity) * Number(a.unitCost), 0))
+          costed = true
+        } else {
+          const pr = item.product.batches[0]?.purchaseRate
+          if (pr) { cost = qty * Number(pr); costed = true }
+        }
+        if (costed) { estimatedCOGS += cost; cogsItemCount++ }
 
         if (!productMap[item.productId]) {
           productMap[item.productId] = { productName: item.productName, itemCode: item.itemCode, revenue: 0, taxableValue: 0, qty: 0, cost: 0 }

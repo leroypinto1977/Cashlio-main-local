@@ -4,6 +4,7 @@ const { computeInvoiceTotals, splitGst, apportionDiscount, round2 } = require('.
 const V = require('../.test-build/validation.js')
 const U = require('../.test-build/units.js')
 const C = require('../.test-build/credit.js')
+const P = require('../.test-build/procurement.js')
 
 let pass = 0, fail = 0
 function check(name, cond, detail) {
@@ -208,6 +209,41 @@ check('no due date falls back to bill date', C.ageBucketOf(null, new Date('2026-
 eq('daysBetween', C.daysBetween(new Date('2026-08-01'), new Date('2026-08-22')), 21)
 check('dueDateFor adds credit days', C.dueDateFor(new Date('2026-08-01'), 30).toISOString().startsWith('2026-08-31'))
 check('no credit days means no due date', C.dueDateFor(new Date('2026-08-01'), 0) === null)
+
+
+console.log('— Return reasons —')
+check('known code accepted', P.isReturnReasonCode('DAMAGED'))
+check('unknown code rejected', !P.isReturnReasonCode('SOMETHING'))
+check('label resolves', P.returnReasonLabel('DEFECTIVE').length > 0)
+check('missing code has a label', P.returnReasonLabel(null) === 'Not recorded')
+check('damaged goods do not go back on the shelf', !P.shouldRestock('DAMAGED'))
+check('faulty goods do not go back', !P.shouldRestock('DEFECTIVE'))
+check('changed mind does go back', P.shouldRestock('CHANGED_MIND'))
+check('wrong item goes back', P.shouldRestock('WRONG_ITEM'))
+check('no reason still restocks', P.shouldRestock(null))
+
+console.log('— Purchase order state —')
+check('draft is editable', P.isEditable('DRAFT'))
+check('placed is not editable', !P.isEditable('PLACED'))
+check('placed can receive', P.canReceive('PLACED'))
+check('partial can receive', P.canReceive('PARTIAL'))
+check('draft cannot receive', !P.canReceive('DRAFT'))
+check('received cannot receive again', !P.canReceive('RECEIVED'))
+check('draft cancellable', P.canCancel('DRAFT'))
+check('placed cancellable', P.canCancel('PLACED'))
+check('partially received not cancellable', !P.canCancel('PARTIAL'))
+check('short delivery stays PARTIAL',
+  P.statusAfterReceipt([{ orderedQty: 10, receivedQty: 4 }]) === 'PARTIAL')
+check('complete delivery is RECEIVED',
+  P.statusAfterReceipt([{ orderedQty: 10, receivedQty: 10 }]) === 'RECEIVED')
+check('over-delivery still completes',
+  P.statusAfterReceipt([{ orderedQty: 10, receivedQty: 12 }]) === 'RECEIVED')
+check('one short line holds the order open',
+  P.statusAfterReceipt([{ orderedQty: 5, receivedQty: 5 }, { orderedQty: 5, receivedQty: 1 }]) === 'PARTIAL')
+let out = P.outstandingLines([{ orderedQty: 10, receivedQty: 4 }, { orderedQty: 3, receivedQty: 3 }])
+check('only short lines are outstanding', out.length === 1 && out[0].pendingQty === 6, out)
+check('valid status accepted', P.isPurchaseOrderStatus('RECEIVED'))
+check('junk status rejected', !P.isPurchaseOrderStatus('SHIPPED'))
 
 console.log(`\n${pass} passed, ${fail} failed\n`)
 process.exit(fail ? 1 : 0)

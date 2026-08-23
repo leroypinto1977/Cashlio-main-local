@@ -454,6 +454,158 @@ async function api(path, opts = {}, token) {
   t('cashier override flag is ignored when over limit',
     r.status === 201 || (r.status === 409 && r.body.reason === 'LIMIT_EXCEEDED'), r.body)
 
+
+  console.log('\n— returns put stock back where it came from —')
+  // Two batches, so a sale spans both and the return has somewhere to get wrong.
+  const fifoProd = await prisma.product.create({ data: {
+    itemCode: 'FIFO-TEST-001', name: 'FIFO Test', categoryId: cat.id,
+    sellingRate: 100, gstPercentage: 0 }})
+  const older = await prisma.productBatch.create({ data: {
+    productId: fifoProd.id, batchCode: 'OLD', uniqueStockCode: 'FIFO-TEST-001/OLD',
+    purchaseRate: 40, receivedQty: 6, currentQty: 6,
+    receivedDate: new Date('2026-01-01') }})
+  const newer = await prisma.productBatch.create({ data: {
+    productId: fifoProd.id, batchCode: 'NEW', uniqueStockCode: 'FIFO-TEST-001/NEW',
+    purchaseRate: 70, receivedQty: 10, currentQty: 10,
+    receivedDate: new Date('2026-06-01') }})
+
+  // Sell 8: takes all 6 from the older batch and 2 from the newer one.
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, paymentMethod: 'CASH',
+    items: [{ productId: fifoProd.id, quantity: 8, unitRate: 100, gstPercentage: 0, lineDiscountPct: 0, lineDiscountAmt: 0 }]
+  })}, token)
+  const fifoBill = r.body.bill
+  t('sale spanning two batches created', r.status === 201, r.body)
+  let oldQty = Number((await prisma.productBatch.findUnique({ where: { id: older.id } })).currentQty)
+  let newQty = Number((await prisma.productBatch.findUnique({ where: { id: newer.id } })).currentQty)
+  t('oldest batch drained first', oldQty === 0, oldQty)
+  t('remainder taken from the newer batch', newQty === 8, newQty)
+  const allocs = await prisma.billItemBatch.findMany({ where: { billItemId: fifoBill.items[0].id } })
+  t('the split was recorded', allocs.length === 2, allocs.length)
+
+  // Return 7: six belong to the older batch, one to the newer.
+  r = await api(`/api/v1/bills/${fifoBill.id}/return`, { method: 'POST', body: JSON.stringify({
+    items: [{ billItemId: fifoBill.items[0].id, quantity: 7 }],
+    reasonCode: 'CHANGED_MIND', reason: 'Not needed' })}, token)
+  t('return accepted', r.status === 201, r.body)
+  oldQty = Number((await prisma.productBatch.findUnique({ where: { id: older.id } })).currentQty)
+  newQty = Number((await prisma.productBatch.findUnique({ where: { id: newer.id } })).currentQty)
+  t('older batch got its 6 back', oldQty === 6, oldQty)
+  t('newer batch got exactly 1 back', newQty === 9, newQty)
+  t('reason code stored', (await prisma.bill.findUnique({ where: { id: r.body.bill.id } })).returnReasonCode === 'CHANGED_MIND')
+
+  // Returning the last unit must not overfill the older batch.
+  r = await api(`/api/v1/bills/${fifoBill.id}/return`, { method: 'POST', body: JSON.stringify({
+    items: [{ billItemId: fifoBill.items[0].id, quantity: 1 }], reasonCode: 'CHANGED_MIND' })}, token)
+  t('second return accepted', r.status === 201, r.body)
+  oldQty = Number((await prisma.productBatch.findUnique({ where: { id: older.id } })).currentQty)
+  newQty = Number((await prisma.productBatch.findUnique({ where: { id: newer.id } })).currentQty)
+  t('older batch not overfilled', oldQty === 6, oldQty)
+  t('newer batch fully restored', newQty === 10, newQty)
+  t('stock is back exactly where it started', oldQty + newQty === 16, oldQty + newQty)
+
+  console.log('\n— damaged goods do not go back on the shelf —')
+  const dmgProd = await prisma.product.create({ data: {
+    itemCode: 'DMG-TEST-001', name: 'Damage Test', categoryId: cat.id, sellingRate: 50, gstPercentage: 0 }})
+  const dmgBatch = await prisma.productBatch.create({ data: {
+    productId: dmgProd.id, batchCode: 'D1', uniqueStockCode: 'DMG-TEST-001/D1',
+    purchaseRate: 20, receivedQty: 5, currentQty: 5 }})
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, paymentMethod: 'CASH',
+    items: [{ productId: dmgProd.id, quantity: 3, unitRate: 50, gstPercentage: 0, lineDiscountPct: 0, lineDiscountAmt: 0 }]
+  })}, token)
+  const dmgBill = r.body.bill
+  r = await api(`/api/v1/bills/${dmgBill.id}/return`, { method: 'POST', body: JSON.stringify({
+    items: [{ billItemId: dmgBill.items[0].id, quantity: 2 }], reasonCode: 'DAMAGED' })}, token)
+  t('damaged return accepted', r.status === 201, r.body)
+  t('customer still refunded', Number(r.body.bill.totalAmount) === 100, r.body.bill.totalAmount)
+  const dmgQty = Number((await prisma.productBatch.findUnique({ where: { id: dmgBatch.id } })).currentQty)
+  t('broken stock NOT put back', dmgQty === 2, dmgQty)
+  r = await api(`/api/v1/bills/${dmgBill.id}/return`, { method: 'POST', body: JSON.stringify({
+    items: [{ billItemId: dmgBill.items[0].id, quantity: 1 }], reasonCode: 'NOPE' })}, token)
+  t('unknown reason rejected', r.status === 400 && r.body.error === 'INVALID_RETURN_REASON', r.body)
+
+  console.log('\n— a cashier can process a return, not a void —')
+  r = await api(`/api/v1/bills/${dmgBill.id}/return`, { method: 'POST', body: JSON.stringify({
+    items: [{ billItemId: dmgBill.items[0].id, quantity: 1 }], reasonCode: 'WRONG_ITEM' })}, cashierToken)
+  t('cashier may return', r.status === 201, r.body)
+  r = await api(`/api/v1/bills/${dmgBill.id}/void`, { method: 'POST' }, cashierToken)
+  t('cashier may not void', r.status === 403, r.body)
+
+  console.log('\n— void reverses the real split —')
+  const voidProd = await prisma.product.create({ data: {
+    itemCode: 'VOID-TEST-001', name: 'Void Test', categoryId: cat.id, sellingRate: 10, gstPercentage: 0 }})
+  const vOld = await prisma.productBatch.create({ data: {
+    productId: voidProd.id, batchCode: 'VO', uniqueStockCode: 'VOID-TEST-001/VO',
+    purchaseRate: 3, receivedQty: 4, currentQty: 4, receivedDate: new Date('2026-01-01') }})
+  const vNew = await prisma.productBatch.create({ data: {
+    productId: voidProd.id, batchCode: 'VN', uniqueStockCode: 'VOID-TEST-001/VN',
+    purchaseRate: 5, receivedQty: 4, currentQty: 4, receivedDate: new Date('2026-06-01') }})
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, paymentMethod: 'CASH',
+    items: [{ productId: voidProd.id, quantity: 6, unitRate: 10, gstPercentage: 0, lineDiscountPct: 0, lineDiscountAmt: 0 }]
+  })}, token)
+  r = await api(`/api/v1/bills/${r.body.bill.id}/void`, { method: 'POST' }, token)
+  t('void accepted', r.status === 200, r.body)
+  t('older batch restored', Number((await prisma.productBatch.findUnique({ where: { id: vOld.id } })).currentQty) === 4)
+  t('newer batch restored', Number((await prisma.productBatch.findUnique({ where: { id: vNew.id } })).currentQty) === 4)
+
+  console.log('\n— true cost of goods —')
+  // The FIFO sale took 6 @40 and 2 @70 = 380, not 8 x the latest rate (560).
+  const fifoDetail = await api(`/api/v1/bills/${fifoBill.id}`, {}, token)
+  eqp('cost is the weighted average of the batches used', fifoDetail.body.bill.items[0].purchaseRate, 47.5)
+
+  console.log('\n— purchase orders —')
+  r = await api('/api/v1/purchase-orders/suggestions', {}, token)
+  t('low-stock suggestions grouped by supplier', Array.isArray(r.body.groups), r.body)
+  const poSupplier = await prisma.supplier.create({ data: { name: 'Acme Supplies', phone: '9000000099' }})
+  r = await api('/api/v1/purchase-orders', { method: 'POST', body: JSON.stringify({
+    supplierId: poSupplier.id,
+    items: [{ productId: fifoProd.id, quantity: 20, expectedRate: 45 }] })}, token)
+  t('draft order created', r.status === 201 && r.body.order.status === 'DRAFT', r.body)
+  t('order number uses PO- prefix', /^PO-\d{4}-\d{4}$/.test(r.body.order.orderNumber), r.body.order?.orderNumber)
+  eqp('order total computed', r.body.order.orderTotal, 900)
+  const po = r.body.order
+
+  r = await api(`/api/v1/purchase-orders/${po.id}/receive`, { method: 'POST', body: JSON.stringify({
+    items: [{ itemId: po.items[0].id, quantity: 5 }] })}, token)
+  t('cannot receive against a draft', r.status === 409 && r.body.error === 'ORDER_NOT_RECEIVABLE', r.body)
+
+  r = await api(`/api/v1/purchase-orders/${po.id}/place`, { method: 'POST' }, token)
+  t('order placed', r.status === 200 && r.body.order.status === 'PLACED', r.body)
+  r = await api(`/api/v1/purchase-orders/${po.id}`, { method: 'PUT', body: JSON.stringify({ notes: 'nope' }) }, token)
+  t('a placed order cannot be edited', r.status === 409 && r.body.error === 'ORDER_NOT_EDITABLE', r.body)
+
+  const stockBefore = (await api(`/api/v1/products/${fifoProd.id}`, {}, token)).body.product.totalStock
+  r = await api(`/api/v1/purchase-orders/${po.id}/receive`, { method: 'POST', body: JSON.stringify({
+    items: [{ itemId: po.items[0].id, quantity: 12, purchaseRate: 53.1, rateIncludesGst: true, purchaseGstPct: 18 }] })}, token)
+  t('partial delivery accepted', r.status === 201, r.body)
+  t('order stays open', r.body.order.status === 'PARTIAL', r.body.order?.status)
+  t('a batch was created', r.body.batches.length === 1, r.body.batches?.length)
+  eqp('supplier rate split out of GST', r.body.batches[0].purchaseRate, 45)
+  const stockAfter = (await api(`/api/v1/products/${fifoProd.id}`, {}, token)).body.product.totalStock
+  eqp('stock increased by what arrived', stockAfter - stockBefore, 12)
+  t('order cannot be cancelled once goods arrived',
+    (await api(`/api/v1/purchase-orders/${po.id}/cancel`, { method: 'POST' }, token)).status === 409)
+
+  r = await api(`/api/v1/purchase-orders/${po.id}/receive`, { method: 'POST', body: JSON.stringify({
+    items: [{ itemId: po.items[0].id, quantity: 8 }] })}, token)
+  t('final delivery completes the order', r.body.order?.status === 'RECEIVED', r.body.order?.status)
+  r = await api(`/api/v1/purchase-orders/${po.id}/receive`, { method: 'POST', body: JSON.stringify({
+    items: [{ itemId: po.items[0].id, quantity: 1 }] })}, token)
+  t('a completed order refuses more goods', r.status === 409, r.body)
+
+  // A cancelled draft
+  r = await api('/api/v1/purchase-orders', { method: 'POST', body: JSON.stringify({
+    supplierId: poSupplier.id, items: [{ productId: fifoProd.id, quantity: 1 }] })}, token)
+  r = await api(`/api/v1/purchase-orders/${r.body.order.id}/cancel`, { method: 'POST', body: JSON.stringify({ reason: 'Ordered elsewhere' }) }, token)
+  t('draft can be cancelled', r.status === 200 && r.body.order.status === 'CANCELLED', r.body)
+  r = await api('/api/v1/purchase-orders', { method: 'POST', body: JSON.stringify({
+    supplierId: poSupplier.id, items: [] })}, token)
+  t('empty order refused', r.status === 400 && r.body.error === 'ORDER_ITEMS_REQUIRED', r.body)
+  r = await api('/api/v1/purchase-orders?status=RECEIVED', {}, token)
+  t('orders filterable by status', r.body.orders.every(o => o.status === 'RECEIVED'), r.body.orders?.length)
+
   console.log(`\n${pass} passed, ${fail} failed`)
   await prisma.$disconnect()
   process.exit(fail ? 1 : 0)
