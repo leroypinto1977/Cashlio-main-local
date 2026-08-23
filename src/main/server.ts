@@ -32,7 +32,7 @@ import {
 import { round2, computeInvoiceTotals } from '../shared/money'
 import { parseQty, roundQty, computePurchaseCost, defaultMeasureFor, measuresFor } from '../shared/units'
 import {
-  settle, statusFor, checkCredit, isPaymentMethod, dueDateFor, ageBucketOf,
+  settle, checkCredit, isPaymentMethod, dueDateFor, ageBucketOf,
   daysBetween, UNSETTLED_STATUSES, type Tender
 } from '../shared/credit'
 import {
@@ -377,6 +377,19 @@ function serializePayment(p: any): any {
   }
 }
 /* eslint-enable @typescript-eslint/no-explicit-any */
+
+/**
+ * Takes an exclusive lock on a bill for the rest of the transaction.
+ *
+ * Void, return and payment all used to read their preconditions outside the
+ * transaction that enforced them, so two concurrent requests could both pass
+ * the same check: stock restocked twice by a double void, two credit notes
+ * for one return, or two payments where the second silently overwrote the
+ * first and the shop lost the record of money it had taken.
+ */
+async function lockBill(tx: TxClient, billId: string): Promise<void> {
+  await tx.$executeRaw`SELECT "id" FROM "Bill" WHERE "id" = ${billId} FOR UPDATE`
+}
 
 /**
  * Recomputes a bill's settlement from the records that actually exist: what
@@ -2326,19 +2339,47 @@ async function createBillCore(tx: TxClient, args: CreateBillArgs, billNumber?: s
     for (const batch of batches) {
       if (remaining <= 0) break
       const batchQty = Number(batch.currentQty)
-      const deduct = roundQty(Math.min(batchQty, remaining))
-      await tx.productBatch.update({
-        where: { id: batch.id },
-        data: { currentQty: roundQty(batchQty - deduct) }
-      })
+      const want = roundQty(Math.min(batchQty, remaining))
+      if (want <= 0) continue
+
+      // Deduct conditionally, in one statement, so the database decides
+      // whether the stock was there.
+      //
+      // Reading the quantity and then writing back the difference let two
+      // tills selling the last unit both pass the availability check and both
+      // write the same result: two bills, one unit, no error, and a
+      // discrepancy nobody sees until a stock count. The WHERE clause makes
+      // that impossible — the loser simply updates no rows.
+      const taken = await tx.$executeRaw`
+        UPDATE "ProductBatch"
+           SET "currentQty" = "currentQty" - ${want}::numeric,
+               "updatedAt"  = NOW()
+         WHERE "id" = ${batch.id}
+           AND "currentQty" >= ${want}::numeric
+      `
+      if (taken === 0) continue // another till took it first; try the next batch
+
       // Remembering the split is what lets a later return put the goods back
       // where they came from, and gives this line a true cost of goods.
       allocations.push({
         batchId: batch.id,
-        quantity: deduct,
+        quantity: want,
         unitCost: round2(Number(batch.purchaseRate))
       })
-      remaining = roundQty(remaining - deduct)
+      remaining = roundQty(remaining - want)
+    }
+
+    // The pre-check above is advisory; this is the authoritative one. If a
+    // concurrent sale drained the batches between the two, we get here short
+    // and the whole transaction rolls back rather than shipping goods that
+    // were never in stock.
+    if (remaining > 0) {
+      throw Object.assign(new Error('INSUFFICIENT_STOCK'), {
+        code: 'INSUFFICIENT_STOCK',
+        productName: product.name,
+        available: roundQty(item.quantity - remaining),
+        requested: item.quantity
+      })
     }
 
     const base = item.quantity * item.unitRate
@@ -2567,6 +2608,10 @@ async function planRestock(
 // already-returned qty per line; restocks; creates a RETURN bill.
 // Throws { code: 'ORIGINAL_NOT_PAID' | 'BILL_ITEM_NOT_IN_ORIGINAL' | 'RETURN_QTY_EXCEEDS_REMAINING' | 'NO_RETURN_LINES', ... }.
 async function processReturnCore(tx: TxClient, args: ProcessReturnArgs) {
+  // Lock first: the already-returned tally below decides how much may still
+  // come back, and two concurrent returns reading it unlocked both passed.
+  await lockBill(tx, args.originalBillId)
+
   const original = await tx.bill.findUnique({
     where: { id: args.originalBillId },
     include: { items: true }
@@ -3157,37 +3202,36 @@ app.post('/api/v1/bills/:id/exchange', requireActiveLicense(), requireAuth(['SUP
 app.post('/api/v1/bills/:id/void', requireAuth(['SUPER_ADMIN']), async (req, res) => {
   try {
     const billId = String(req.params.id)
-    const bill = await prisma.bill.findUnique({
-      where: { id: billId },
-      include: { items: true }
-    })
-    if (!bill) return res.status(404).json({ success: false, error: 'NOT_FOUND' })
-    if (bill.status === 'VOID') {
-      return res.status(409).json({ success: false, error: 'ALREADY_VOID' })
-    }
-    if (bill.status === 'RETURN') {
-      return res.status(409).json({ success: false, error: 'CANNOT_VOID_RETURN' })
-    }
-    // If any item has been returned, restocking on void would double-count.
-    // Money collected after the sale cannot be un-collected by voiding the
-    // bill it was paid against — that would leave the cash drawer unexplained.
-    const settlements = await prisma.payment.count({
-      where: { billId, isSettlement: true }
-    })
-    if (settlements > 0) {
-      return res.status(409).json({
-        success: false, error: 'BILL_HAS_SETTLEMENTS',
-        message: 'Payments have been collected against this bill. Refund them before voiding it.',
-        settlements
-      })
-    }
 
-    const returnsExist = await prisma.bill.count({ where: { originalBillId: billId, status: 'RETURN' } })
-    if (returnsExist > 0) {
-      return res.status(409).json({ success: false, error: 'BILL_HAS_RETURNS' })
-    }
-
+    // Every check runs inside the transaction, behind the lock that enforces
+    // it. Read outside, two concurrent voids both passed and both restocked.
     await prisma.$transaction(async (tx) => {
+      await lockBill(tx, billId)
+
+      const bill = await tx.bill.findUnique({
+        where: { id: billId },
+        include: { items: true }
+      })
+      if (!bill) throw Object.assign(new Error('NOT_FOUND'), { code: 'NOT_FOUND' })
+      if (bill.status === 'VOID') throw Object.assign(new Error('ALREADY_VOID'), { code: 'ALREADY_VOID' })
+      if (bill.status === 'RETURN') {
+        throw Object.assign(new Error('CANNOT_VOID_RETURN'), { code: 'CANNOT_VOID_RETURN' })
+      }
+
+      // Money collected after the sale cannot be un-collected by voiding the
+      // bill it was paid against — that would leave the cash drawer unexplained.
+      const settlements = await tx.payment.count({ where: { billId, isSettlement: true } })
+      if (settlements > 0) {
+        throw Object.assign(new Error('BILL_HAS_SETTLEMENTS'), {
+          code: 'BILL_HAS_SETTLEMENTS', settlements
+        })
+      }
+      // If any item has been returned, restocking on void would double-count.
+      const returnsExist = await tx.bill.count({ where: { originalBillId: billId, status: 'RETURN' } })
+      if (returnsExist > 0) {
+        throw Object.assign(new Error('BILL_HAS_RETURNS'), { code: 'BILL_HAS_RETURNS' })
+      }
+
       // Put every unit back exactly where the sale took it from.
       for (const item of bill.items) {
         const plan = await planRestock(tx, item.id, item.productId, Number(item.quantity))
@@ -3198,16 +3242,35 @@ app.post('/api/v1/bills/:id/void', requireAuth(['SUPER_ADMIN']), async (req, res
           })
         }
       }
+
+      // A voided sale never happened: its cover and its tender go with it.
+      // Leaving them behind showed live warranties on a cancelled sale and
+      // counted the tender in the payments ledger.
+      await tx.warranty.deleteMany({ where: { billId } })
+      await tx.payment.deleteMany({ where: { billId, isSettlement: false } })
+
       const voided = await tx.bill.update({
         where: { id: billId },
-        data: { status: 'VOID', balanceDue: 0 }
+        data: { status: 'VOID', balanceDue: 0, paidAmount: 0 }
       })
       await emitBillUpsert(tx, voided)
       await emitProductUpsertBulk(tx, bill.items.map((it) => it.productId))
     })
 
     return res.json({ success: true })
-  } catch (err) {
+  } catch (err: unknown) {
+    const e = err as { code?: string; settlements?: number }
+    const map: Record<string, [number, string]> = {
+      NOT_FOUND: [404, 'No such bill.'],
+      ALREADY_VOID: [409, 'This bill has already been voided.'],
+      CANNOT_VOID_RETURN: [409, 'A credit note cannot be voided.'],
+      BILL_HAS_SETTLEMENTS: [409, 'Payments have been collected against this bill. Refund them before voiding it.'],
+      BILL_HAS_RETURNS: [409, 'Goods have been returned against this bill, so it cannot be voided.']
+    }
+    if (e.code && map[e.code]) {
+      const [status, message] = map[e.code]
+      return res.status(status).json({ success: false, error: e.code, message, ...e })
+    }
     console.error(err)
     return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
   }
@@ -3280,6 +3343,8 @@ app.post('/api/v1/payments', requireActiveLicense(), requireAuth(), async (req, 
           if (!Number.isFinite(amt) || amt <= 0) {
             throw Object.assign(new Error('INVALID_ALLOCATION'), { code: 'INVALID_ALLOCATION', billId })
           }
+          // balanceDue is kept in step by recomputeBillSettlement, so it
+          // already accounts for any credit notes against this bill.
           if (amt > round2(Number(bill.balanceDue))) {
             throw Object.assign(new Error('ALLOCATION_EXCEEDS_BALANCE'), {
               code: 'ALLOCATION_EXCEEDS_BALANCE', billId,
@@ -3313,12 +3378,31 @@ app.post('/api/v1/payments', requireActiveLicense(), requireAuth(), async (req, 
         }
       }
 
+      // Lock every bill this collection touches, oldest first, before any of
+      // it is applied. A consistent order means two concurrent collections
+      // for the same customer queue rather than deadlock.
+      for (const alloc of [...plan].sort((a, b) => a.billId.localeCompare(b.billId))) {
+        await lockBill(tx, alloc.billId)
+      }
+
+      // Re-check every allocation against the balance as it stands now that
+      // the rows are locked. The plan was built from a read taken before the
+      // lock, and a concurrent collection may have settled some of it since.
+      for (const alloc of plan) {
+        const fresh = await tx.bill.findUniqueOrThrow({ where: { id: alloc.billId } })
+        if (alloc.amount > round2(Number(fresh.balanceDue))) {
+          throw Object.assign(new Error('ALLOCATION_EXCEEDS_BALANCE'), {
+            code: 'ALLOCATION_EXCEEDS_BALANCE',
+            billId: alloc.billId,
+            balanceDue: round2(Number(fresh.balanceDue)),
+            requested: alloc.amount
+          })
+        }
+      }
+
       const created: unknown[] = []
       for (const [i, alloc] of plan.entries()) {
-        const bill = openBills.find((b) => b.id === alloc.billId)!
-        const nextPaid = round2(Number(bill.paidAmount) + alloc.amount)
-        const nextBalance = round2(Number(bill.totalAmount) - nextPaid)
-
+        const bill = await tx.bill.findUniqueOrThrow({ where: { id: alloc.billId } })
         const payment = await tx.payment.create({
           data: {
             billId: bill.id,
@@ -3336,13 +3420,14 @@ app.post('/api/v1/payments', requireActiveLicense(), requireAuth(), async (req, 
           include: { bill: { select: { billNumber: true, totalAmount: true } } }
         })
 
-        const updated = await tx.bill.update({
+        // Settlement is recomputed from the rows that exist — payments and
+        // credit notes — rather than derived here from the bill total. Doing
+        // the arithmetic in two places meant this one forgot about returns,
+        // so a customer who returned goods and then paid what they owed had
+        // the value of the credit note reappear as a debt.
+        await recomputeBillSettlement(tx, bill.id)
+        const updated = await tx.bill.findUniqueOrThrow({
           where: { id: bill.id },
-          data: {
-            paidAmount: nextPaid,
-            balanceDue: Math.max(0, nextBalance),
-            status: statusFor(Number(bill.totalAmount), nextPaid)
-          },
           include: { customer: { select: { name: true } }, items: true }
         })
         await emitBillUpsert(tx, updated)
