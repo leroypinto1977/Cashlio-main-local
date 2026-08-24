@@ -140,3 +140,22 @@ export function getMachineId(userDataDir?: string): string {
 export function resetMachineIdCache(): void {
   cached = null
 }
+
+/**
+ * This machine's MAC, as the shop's network sees it.
+ *
+ * Distinct from `getMachineId` above and not a substitute for it: this says
+ * which box on the LAN, which is what a till is paired against. Licensing
+ * uses the machine identity instead, because a MAC moves when a network card
+ * does.
+ */
+export function getServerMac(): string {
+  for (const iface of Object.values(networkInterfaces())) {
+    for (const info of iface ?? []) {
+      if (!info.internal && info.mac && info.mac !== '00:00:00:00:00:00') {
+        return info.mac
+      }
+    }
+  }
+  return '00:00:00:00:00:00'
+}
