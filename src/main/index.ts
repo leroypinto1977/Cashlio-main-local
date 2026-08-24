@@ -8,6 +8,7 @@ import icon from '../../resources/icon.png?asset'
 import { startExpressServer, startSyncEventPruning } from './server'
 import { runBackup, listBackups, getBackupStatus, getBackupDir, startBackupSchedule } from './backup'
 import { startRefreshLoop, checkClockTamper } from './licenseGuard'
+import { getMachineId } from './machineId'
 import { randomBytes } from 'crypto'
 import { dirname } from 'path'
 
@@ -164,8 +165,11 @@ app.whenReady().then(async () => {
   // IPC test
   ipcMain.on('ping', () => console.log('pong'))
 
-  // Expose real MAC address to the renderer securely via IPC
+  // The MAC identifies this box on the shop's own network — it is what a till
+  // is paired against. Licensing uses `get-machine-id` instead, which is tied
+  // to the machine rather than to whichever adapter happened to come up first.
   ipcMain.handle('get-mac-address', () => getMacAddress())
+  ipcMain.handle('get-machine-id', () => getMachineId(app.getPath('userData')))
 
   // Print a receipt: renderer hands us the full HTML, we render it in a
   // hidden BrowserWindow and trigger printing via webContents.print.
@@ -270,7 +274,7 @@ app.whenReady().then(async () => {
   if (process.env.SAAS_API_URL) {
     startRefreshLoop({
       saasBaseUrl: process.env.SAAS_API_URL,
-      hardwareId: getMacAddress()
+      hardwareId: getMachineId(app.getPath('userData'))
     })
   } else {
     console.warn('[license] SAAS_API_URL not set — refresh loop disabled')

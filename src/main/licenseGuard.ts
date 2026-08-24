@@ -86,6 +86,8 @@ function reasonForError(code: unknown): string {
       return 'This licence has expired. Renew it to start billing again.'
     case 'LICENSE_HARDWARE_MISMATCH':
       return 'This licence is registered to a different machine. Contact your supplier to move it.'
+    case 'LICENSE_SEAT_LIMIT':
+      return 'Every machine this licence covers is already in use. Contact your supplier to release one or add another.'
     default:
       return 'Billing is blocked by the licence server. Contact your supplier.'
   }
@@ -228,7 +230,15 @@ export async function refreshLicenseOnce(saasBaseUrl: string, hardwareId: string
     const isTerminal =
       resp.status === 403 &&
       typeof data?.error === 'string' &&
-      ['LICENSE_REVOKED', 'LICENSE_EXPIRED', 'LICENSE_HARDWARE_MISMATCH'].includes(data.error)
+      [
+        'LICENSE_REVOKED',
+        'LICENSE_EXPIRED',
+        'LICENSE_HARDWARE_MISMATCH',
+        // Every seat on the licence is taken by another machine. Retrying will
+        // not free one, so this locks rather than sitting in the grace window
+        // pretending it might come good.
+        'LICENSE_SEAT_LIMIT'
+      ].includes(data.error)
     await prisma.shopConfig.update({
       where: { id: config.id },
       data: {
@@ -239,10 +249,15 @@ export async function refreshLicenseOnce(saasBaseUrl: string, hardwareId: string
               // Keep the server's own words. A shop told only that its licence
               // is locked cannot act; told that the subscription is unpaid, it
               // can.
+              // The server's own words where it gave any — a seat refusal
+              // names how many machines are in use, which is more use than
+              // anything this end could compose.
               licenseLockReason:
                 typeof data?.revokeReason === 'string' && data.revokeReason.trim()
                   ? data.revokeReason.trim()
-                  : reasonForError(data?.error)
+                  : typeof data?.message === 'string' && data.message.trim()
+                    ? data.message.trim()
+                    : reasonForError(data?.error)
             }
           : {})
       }

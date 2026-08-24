@@ -587,7 +587,19 @@ app.get('/api/v1/system/status', async (_req, res) => {
 
 app.post('/api/v1/system/save-config', async (req, res) => {
   try {
-    const { licenseKey, hardwareId = 'STATIC-MAC-FOR-MVP', branchName = 'PENDING_SETUP', shopName = 'My Shop' } = req.body
+    const { licenseKey, hardwareId, branchName = 'PENDING_SETUP', shopName = 'My Shop' } = req.body
+
+    // This used to fall back to a fixed placeholder, which would have given
+    // every installation in the world the same identity — collapsing the
+    // licence server's per-machine seat counting into a single shared row.
+    // Better to refuse to activate than to activate as somebody else.
+    if (typeof hardwareId !== 'string' || hardwareId.trim().length < 8) {
+      return res.status(400).json({
+        success: false,
+        error: 'HARDWARE_ID_REQUIRED',
+        message: 'This machine could not be identified, so the licence cannot be activated.'
+      })
+    }
 
     const existingConfig = await prisma.shopConfig.findUnique({ where: { licenseKey } })
     if (existingConfig) {

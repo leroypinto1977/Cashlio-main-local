@@ -120,7 +120,10 @@ function App(): React.JSX.Element {
     setLoading(true)
     setErrorMsg('')
     try {
-      const hardwareId = (await window.electron.ipcRenderer.invoke('get-mac-address')) as string
+      // Licensing binds to the machine, not to a network adapter — a laptop
+      // with Wi-Fi and Ethernet could otherwise report a different identity
+      // per boot and fail its own hardware check.
+      const hardwareId = (await window.electron.ipcRenderer.invoke('get-machine-id')) as string
       await axios.post(`${LOCAL_API}/api/v1/system/save-config`, {
         licenseKey: licenseData.licenseKey,
         hardwareId,
