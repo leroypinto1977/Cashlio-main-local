@@ -161,6 +161,21 @@ export function validatePincode(raw: string, { required = false } = {}): FieldRe
   return ok(d)
 }
 
+/**
+ * A MAC address in one canonical spelling.
+ *
+ * A till reports whatever its operating system hands it, and that is not
+ * consistent about case — the same adapter reads `de:ad:be:ef:99:01` on one
+ * machine and `DE:AD:BE:EF:99:01` on another, or with dashes instead of
+ * colons. Stored raw, the same physical till pairs twice: two terminal codes,
+ * two rows in the device list, and two of the licence's seats gone.
+ */
+export function normalizeMac(raw: string): string {
+  const hex = (raw || '').replace(/[^0-9a-fA-F]/g, '').toUpperCase()
+  if (hex.length !== 12) return (raw || '').trim().toUpperCase()
+  return (hex.match(/.{2}/g) ?? []).join(':')
+}
+
 // ─── Item code ────────────────────────────────────────────────────────────────
 
 /**

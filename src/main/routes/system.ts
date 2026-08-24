@@ -1,6 +1,7 @@
 import { Router } from 'express'
 import { getBranchCertFingerprint } from '../branchCert'
 import { validateUsername, validatePassword } from '../domain/accounts'
+import { normalizeMac } from '../../shared/validation'
 import jwt from 'jsonwebtoken'
 import bcrypt from 'bcryptjs'
 import { prisma } from '../prisma'
@@ -213,7 +214,16 @@ router.post('/api/v1/system/setup-profile', async (req, res) => {
  */
 router.post('/api/v1/system/pair-client', requireAuth(['SUPER_ADMIN']), async (req, res) => {
   try {
-    const { macAddress, friendlyName } = req.body
+    const { friendlyName } = req.body
+    // One canonical spelling, or the same physical till pairs twice and takes
+    // two of the licence's seats with it.
+    const macAddress = normalizeMac(String(req.body?.macAddress ?? ''))
+    if (!macAddress) {
+      return res.status(400).json({
+        success: false, error: 'MAC_REQUIRED',
+        message: 'This terminal could not identify itself on the network.'
+      })
+    }
 
     const config = await prisma.shopConfig.findFirst()
     if (!config?.licenseJwt) {
@@ -361,7 +371,11 @@ function clearLoginFailures(keys: string[]): void {
 
 router.post('/api/v1/auth/login', async (req, res) => {
   try {
-    const username = String(req.body?.username ?? '')
+    // Accounts are stored lower-case, so "Manager" and "MANAGER" are the same
+    // account as "manager". Looking the raw string up meant a cashier whose
+    // keyboard capitalised the first letter was told their password was wrong
+    // — and each attempt counted toward the ten that lock them out.
+    const username = String(req.body?.username ?? '').trim().toLowerCase()
     const password = String(req.body?.password ?? '')
     const keys = loginKeys(username, req.ip ?? 'unknown')
 
