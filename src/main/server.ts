@@ -25,7 +25,6 @@ import {
   validateGstin,
   validateName,
   validateItemCode,
-  normalizeItemCode,
   stateCodeOf,
   codeStub,
   type FieldResult
@@ -1910,10 +1909,14 @@ app.put('/api/v1/products/:id', requireAuth(['SUPER_ADMIN']), async (req, res) =
       })
       if (!current) return res.status(404).json({ success: false, error: 'NOT_FOUND' })
 
-      if (normalizeItemCode(String(itemCode)) !== current.itemCode) {
-        const codeCheck = validateItemCode(String(itemCode))
-        if (!codeCheck.ok) return fieldError(res, codeCheck)
+      // Validate before comparing. Comparing the *normalised* form first meant
+      // a lowercase or space-ridden version of the existing code matched it and
+      // slipped through as a no-op, so bad input was quietly accepted rather
+      // than answered.
+      const codeCheck = validateItemCode(String(itemCode))
+      if (!codeCheck.ok) return fieldError(res, codeCheck)
 
+      if (codeCheck.value !== current.itemCode) {
         const [batchCount, billItemCount] = await Promise.all([
           prisma.productBatch.count({ where: { productId: id } }),
           prisma.billItem.count({ where: { productId: id } })

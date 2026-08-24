@@ -8,7 +8,7 @@ import { Button } from '../components/ui/button'
 import { Input } from '../components/ui/input'
 import { Modal } from '../components/Modal'
 import { apiFetch } from '../lib/api'
-import { validateItemCode, normalizeItemCode, ITEM_CODE_HINT, validateName } from '@shared/validation'
+import { validateItemCode, suggestItemCodeFix, ITEM_CODE_HINT, validateName } from '@shared/validation'
 import {
   type SellMode, measuresFor, defaultMeasureFor, isLengthMode,
   qtyStep, parseQty, formatQty, formatQtyWithUnit, computePurchaseCost
@@ -394,7 +394,8 @@ export function ProductsScreen({ token }: { token: string | null }) {
       const data = await apiFetch<{ itemCode: string }>(
         `/api/v1/system/suggest-item-code?${qs.toString()}`, token
       )
-      setProductForm((f) => ({ ...f, itemCode: normalizeItemCode(data.itemCode) }))
+      // The server generates these, so they arrive already in shape.
+      setProductForm((f) => ({ ...f, itemCode: data.itemCode }))
     } catch (err: unknown) {
       const e = err as { data?: { message?: string } }
       setProductFormError(e.data?.message || 'Could not suggest an item code.')
@@ -1535,6 +1536,16 @@ function ProductFormFields({
   const [newBrandError, setNewBrandError] = useState('')
   const [newBrandLoading, setNewBrandLoading] = useState(false)
 
+  // The code is checked as it is typed, but never rewritten: it goes on
+  // receipts and batch labels, so it should be the code the person meant.
+  // Nothing is said until they have typed enough for a verdict to be fair,
+  // and where there is an obvious valid form of what they typed it is offered
+  // as something to accept rather than applied behind them.
+  const codeTouched = form.itemCode.trim().length >= 2
+  const codeCheck = validateItemCode(form.itemCode)
+  const codeProblem = !itemCodeLocked && codeTouched && !codeCheck.ok ? codeCheck.message : ''
+  const codeFix = codeProblem ? suggestItemCodeFix(form.itemCode) : null
+
   const submitNewBrand = async () => {
     setNewBrandLoading(true)
     setNewBrandError('')
@@ -1580,10 +1591,12 @@ function ProductFormFields({
             <div className="flex gap-2">
               <Input
                 value={form.itemCode}
-                onChange={(e) => set('itemCode', normalizeItemCode(e.target.value))}
+                onChange={(e) => set('itemCode', e.target.value)}
                 placeholder="e.g. FIN-WIRE-1.5-RED"
-                className="h-11 flex-1 font-mono"
+                className={`h-11 flex-1 font-mono ${codeProblem ? 'border-red-400 focus-visible:ring-red-300' : ''}`}
                 disabled={itemCodeLocked}
+                aria-invalid={codeProblem ? true : undefined}
+                aria-describedby="item-code-hint"
               />
               {!isEdit && (
                 <Button
@@ -1597,9 +1610,24 @@ function ProductFormFields({
                 </Button>
               )}
             </div>
-            <p className="text-xs text-muted-foreground mt-1 ml-1">
-              {itemCodeLocked ? 'Locked — this product already has stock or sales history' : ITEM_CODE_HINT}
-            </p>
+            {codeProblem ? (
+              <div className="mt-1 ml-1 space-y-1" id="item-code-hint">
+                <p className="text-xs text-red-600">{codeProblem}</p>
+                {codeFix && (
+                  <button
+                    type="button"
+                    onClick={() => set('itemCode', codeFix)}
+                    className="text-xs font-medium text-zinc-700 underline underline-offset-2 hover:text-zinc-900 font-mono"
+                  >
+                    Use {codeFix}
+                  </button>
+                )}
+              </div>
+            ) : (
+              <p className="text-xs text-muted-foreground mt-1 ml-1" id="item-code-hint">
+                {itemCodeLocked ? 'Locked — this product already has stock or sales history' : ITEM_CODE_HINT}
+              </p>
+            )}
           </div>
           <div>
             <label className="block text-sm font-semibold mb-1.5 ml-1">Brand</label>
@@ -1773,7 +1801,8 @@ function ProductFormFields({
 
       <div className="flex justify-end gap-3 pt-2 border-t">
         <Button variant="outline" onClick={onCancel}>Cancel</Button>
-        <Button onClick={onSave} disabled={loading}>
+        {/* A code that would be rejected shouldn't cost a round trip to find out. */}
+        <Button onClick={onSave} disabled={loading || Boolean(codeProblem)}>
           {loading ? 'Saving...' : 'Save Product'}
         </Button>
       </div>

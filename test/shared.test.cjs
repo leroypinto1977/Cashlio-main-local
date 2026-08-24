@@ -105,10 +105,47 @@ check('landline ok for supplier', V.validateContactNumber('0224 2345678').ok)
 check('landline rejected for customer', !V.validateMobile('02242345678').ok)
 check('email lowercased', V.validateEmail('A@B.COM').value === 'a@b.com')
 check('bad email rejected', !V.validateEmail('nope@').ok)
-check('item code normalized', V.normalizeItemCode('pvc fin 25mm') === 'PVC-FIN-25MM')
 check('item code valid', V.validateItemCode('WIRE-HAV-1.5-RED').ok)
-check('item code with space normalizes then passes', V.validateItemCode('pvc fin 25mm').ok)
 check('single char item code rejected', !V.validateItemCode('A').ok)
+
+// A code goes on receipts and batch labels, so what was typed is what is
+// judged — nothing is rewritten under the cursor. Each rejection names the
+// thing at fault rather than restating the pattern.
+check('a typed code is not silently corrected', !V.validateItemCode('pvc fin 25mm').ok)
+check('spaces are called out', /space/i.test(V.validateItemCode('PVC FIN 25MM').message))
+check('lowercase is called out', /uppercase/i.test(V.validateItemCode('pvc-fin-25mm').message))
+check('lowercase message shows the fix', V.validateItemCode('pvc-fin-25mm').message.includes('PVC-FIN-25MM'))
+check('a stray character is named', V.validateItemCode('PVC#FIN').message.includes('"#"'))
+check('several stray characters are all named', (() => {
+  const m = V.validateItemCode('PVC#FIN@25').message
+  return m.includes('"#"') && m.includes('"@"')
+})())
+check('a leading hyphen is rejected', !V.validateItemCode('-PVC-FIN').ok)
+check('a trailing hyphen is rejected', !V.validateItemCode('PVC-FIN-').ok)
+check('a double hyphen is rejected', !V.validateItemCode('PVC--FIN').ok)
+check('an over-long code is rejected', !V.validateItemCode('A'.repeat(33)).ok)
+check('a valid code passes through unchanged', V.validateItemCode('PVC-FIN-25MM').value === 'PVC-FIN-25MM')
+check('surrounding whitespace is trimmed, not treated as a space', V.validateItemCode('  PVC-FIN-25MM  ').ok)
+
+// The fix is offered, never applied on the caller's behalf.
+check('a fix is offered for a messy code', V.suggestItemCodeFix('pvc fin 25mm') === 'PVC-FIN-25MM')
+check('a fix is offered for lowercase', V.suggestItemCodeFix('pvc-fin-25mm') === 'PVC-FIN-25MM')
+check('no fix is offered when the code is already valid', V.suggestItemCodeFix('PVC-FIN-25MM') === null)
+check('no fix is offered for an empty code', V.suggestItemCodeFix('') === null)
+check('no fix is offered when nothing salvageable remains', V.suggestItemCodeFix('!!') === null)
+check('a stray character is read as a separator', V.suggestItemCodeFix('PVC#PIPE') === 'PVC-PIPE')
+check('a slash is read as a separator', V.suggestItemCodeFix('PVC/PIPE/25') === 'PVC-PIPE-25')
+check('every offered fix would itself validate', (() => {
+  const messy = ['pvc fin 25mm', 'a b', 'wire__hav__1.5', '  led-panel 18w  ', 'X#Y', 'pipe--32']
+  return messy.every((m) => {
+    const fix = V.suggestItemCodeFix(m)
+    return fix === null || V.validateItemCode(fix).ok
+  })
+})())
+
+// The generator is still allowed to shape a string — that is its job.
+check('the generator still normalises', V.normalizeItemCode('pvc fin 25mm') === 'PVC-FIN-25MM')
+check('the generator drops a trailing hyphen', V.normalizeItemCode('pvc fin ') === 'PVC-FIN')
 check('stateCodeOf', V.stateCodeOf('27AAPFU0939F1ZV') === '27')
 check('stateCodeOf null on junk', V.stateCodeOf('nonsense') === null)
 check('name with & allowed', V.validateName("Sharma & Sons").ok)

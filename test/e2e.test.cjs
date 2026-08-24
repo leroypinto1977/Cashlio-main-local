@@ -980,6 +980,40 @@ async function api(path, opts = {}, token) {
     afterReturn.estimatedMarginPct < 100, afterReturn.estimatedMarginPct)
 
 
+  console.log('\n— a bad item code is refused, not tidied up —')
+  {
+    const mk = (code) => api('/api/v1/products', { method: 'POST', body: JSON.stringify({
+      itemCode: code, name: 'Code Test', categoryId: cat.id, sellingRate: 10, gstPercentage: 0 }) }, token)
+
+    for (const [label, code, needle] of [
+      ['a code with spaces', 'PVC FIN 25MM', 'space'],
+      ['a lowercase code', 'pvc-fin-25mm', 'uppercase'],
+      ['a code with a stray character', 'PVC#FIN', '"#"'],
+      ['a code ending in a hyphen', 'PVC-FIN-', 'hyphen']
+    ]) {
+      const r = await mk(code)
+      eqp(`${label} is rejected`, r.status, 400)
+      t(`...and the reason names the problem`,
+        new RegExp(needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i').test(r.body.message ?? ''), r.body)
+      const made = await prisma.product.findFirst({ where: { name: 'Code Test' } })
+      t(`...and nothing was created`, made === null, made)
+    }
+
+    // The valid form of the same code is accepted and stored verbatim.
+    const good = await mk('PVC-FIN-25MM')
+    eqp('the valid form is accepted', good.status, 201)
+    t('...and stored exactly as typed', good.body.product.itemCode === 'PVC-FIN-25MM', good.body.product.itemCode)
+
+    // Editing: a lowercase spelling of the current code used to compare equal
+    // after normalising, so it slipped through as a no-op instead of an answer.
+    const id = good.body.product.id
+    const sneak = await api(`/api/v1/products/${id}`, { method: 'PUT', body: JSON.stringify({
+      itemCode: 'pvc-fin-25mm' }) }, token)
+    eqp('a lowercase spelling of the current code is refused', sneak.status, 400)
+    const after = await prisma.product.findUnique({ where: { id } })
+    t('...and the stored code is untouched', after.itemCode === 'PVC-FIN-25MM', after.itemCode)
+  }
+
   console.log('\n— the API answers in JSON even when it fails —')
   {
     const missing = await api('/api/v1/no-such-thing', {}, token)

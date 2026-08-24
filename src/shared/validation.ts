@@ -171,7 +171,14 @@ export function validatePincode(raw: string, { required = false } = {}): FieldRe
 export const ITEM_CODE_RE = /^[A-Z0-9]{2,}(?:-[A-Z0-9.]+)*$/
 export const ITEM_CODE_HINT = 'Uppercase letters, digits and hyphens — e.g. PVC-FIN-25MM'
 
-/** Coerces user input toward a valid code as they type. */
+/**
+ * Shapes a string into a valid code. This is for *generating* codes — the
+ * "Suggest" button, and building one from a brand and a product name. It is
+ * deliberately not applied to what somebody types: rewriting an entry under
+ * the cursor leaves them unsure what was actually saved, and a code that gets
+ * printed on receipts and batch labels should be the one they meant.
+ * `validateItemCode` rejects and explains instead.
+ */
 export function normalizeItemCode(raw: string): string {
   return (raw || '')
     .toUpperCase()
@@ -179,15 +186,69 @@ export function normalizeItemCode(raw: string): string {
     .replace(/[\s_]+/g, '-')
     .replace(/-{2,}/g, '-')
     .replace(/^-+/, '')
+    .replace(/-+$/, '')
 }
 
+/**
+ * Checks a typed item code and says precisely what is wrong with it.
+ *
+ * The checks run in the order somebody reads their own typing, and each names
+ * the characters at fault — so "PVC PIPE 25" is told about the spaces rather
+ * than handed a pattern to decipher. Nothing is corrected here;
+ * `suggestItemCodeFix` offers a candidate the caller can present as a choice.
+ */
 export function validateItemCode(raw: string): FieldResult {
-  const v = normalizeItemCode(raw).replace(/-+$/, '')
+  const v = (raw || '').trim()
   if (!v) return bad('ITEM_CODE_REQUIRED', 'Item code is required.')
+
+  if (/\s/.test(v)) {
+    return bad(
+      'ITEM_CODE_HAS_SPACE',
+      'Item codes cannot contain spaces — join the parts with a hyphen, e.g. PVC-FIN-25MM.'
+    )
+  }
+
+  const stray = [...new Set(v.replace(/[A-Za-z0-9.\-]/g, '').split(''))]
+  if (stray.length > 0) {
+    const list = stray.map((c) => `"${c}"`).join(', ')
+    return bad(
+      'ITEM_CODE_BAD_CHAR',
+      `${list} cannot be used in an item code. Use letters, digits, hyphens and full stops only.`
+    )
+  }
+
+  if (/[a-z]/.test(v)) {
+    return bad(
+      'ITEM_CODE_NOT_UPPERCASE',
+      `Item codes are uppercase — did you mean ${v.toUpperCase()}?`
+    )
+  }
+
   if (v.length < 3) return bad('ITEM_CODE_TOO_SHORT', 'Item code must be at least 3 characters.')
   if (v.length > 32) return bad('ITEM_CODE_TOO_LONG', 'Item code must be 32 characters or fewer.')
+
+  if (/^-/.test(v)) return bad('ITEM_CODE_INVALID', 'Item code cannot start with a hyphen.')
+  if (/-$/.test(v)) return bad('ITEM_CODE_INVALID', 'Item code cannot end with a hyphen.')
+  if (/--/.test(v)) return bad('ITEM_CODE_INVALID', 'Item code cannot contain two hyphens in a row.')
   if (!ITEM_CODE_RE.test(v)) return bad('ITEM_CODE_INVALID', ITEM_CODE_HINT + '.')
+
   return ok(v)
+}
+
+/**
+ * A valid code close to what was typed, or null when there isn't one worth
+ * offering. Callers show it as something to accept — never apply it silently.
+ */
+export function suggestItemCodeFix(raw: string): string | null {
+  const typed = (raw || '').trim()
+  if (!typed) return null
+  // A stray character between two words is a separator somebody reached for —
+  // "PVC/PIPE" and "PVC#PIPE" mean PVC-PIPE, not PVCPIPE. Turn them into
+  // hyphens before shaping, rather than deleting them and running the words
+  // together.
+  const candidate = normalizeItemCode(typed.replace(/[^A-Za-z0-9.\-]+/g, '-'))
+  if (!candidate || candidate === typed) return null
+  return validateItemCode(candidate).ok ? candidate : null
 }
 
 /** Builds the alphabetic stub used in generated item codes: "Finolex" -> "FIN". */
