@@ -18,6 +18,7 @@ import {
   TrendingUp,
   Wallet,
   ShieldCheck,
+  FileText,
   ClipboardList
 } from 'lucide-react'
 import { Button } from './components/ui/button'
@@ -27,6 +28,7 @@ import { SuppliersScreen } from './screens/SuppliersScreen'
 import { CustomersScreen } from './screens/CustomersScreen'
 import { ReceivablesScreen } from './screens/ReceivablesScreen'
 import { WarrantiesScreen } from './screens/WarrantiesScreen'
+import { GstReturnScreen } from './screens/GstReturnScreen'
 import { OrdersScreen } from './screens/OrdersScreen'
 import { BillingScreen } from './screens/BillingScreen'
 import { SalesScreen } from './screens/SalesScreen'
@@ -658,6 +660,7 @@ function App(): React.JSX.Element {
               ['customers',  <Users className="w-4 h-4" />,            'Customers'],
               ['receivables', <Wallet className="w-4 h-4" />,           'Receivables'],
               ['warranties', <ShieldCheck className="w-4 h-4" />,        'Warranties'],
+              ['gst',        <FileText className="w-4 h-4" />,          'GST return'],
               ['devices',    <MonitorSmartphone className="w-4 h-4" />, 'Devices'],
               ['settings',   <Settings className="w-4 h-4" />,         'Settings'],
             ] as [string, React.ReactNode, string][]
@@ -694,6 +697,7 @@ function App(): React.JSX.Element {
         {activeTab === 'customers' && <CustomersScreen token={authToken} />}
         {activeTab === 'receivables' && <ReceivablesScreen token={authToken} />}
         {activeTab === 'warranties' && <WarrantiesScreen token={authToken} />}
+        {activeTab === 'gst' && <GstReturnScreen token={authToken} />}
 
         {/* Phase 3 billing screens */}
         {activeTab === 'billing' && (

@@ -248,6 +248,29 @@ app.whenReady().then(async () => {
     return { ok: true, dir }
   })
 
+  /**
+   * Write a prepared GST return somewhere the shop can find it.
+   *
+   * Through the main process rather than a browser download: this file goes
+   * to an accountant or straight to the portal, and the shopkeeper needs to
+   * know where it landed. A save dialog answers that; a silent drop into
+   * Downloads does not.
+   */
+  ipcMain.handle('gst:save-return', async (_e, input: { filename: string; contents: string }) => {
+    const { canceled, filePath } = await dialog.showSaveDialog({
+      title: 'Save GST return',
+      defaultPath: join(app.getPath('documents'), input.filename),
+      filters: [{ name: 'GST return (JSON)', extensions: ['json'] }]
+    })
+    if (canceled || !filePath) return { ok: false, canceled: true }
+    try {
+      fs.writeFileSync(filePath, input.contents, 'utf8')
+      return { ok: true, path: filePath }
+    } catch (e) {
+      return { ok: false, error: (e as Error).message }
+    }
+  })
+
   // Refuse to run half-configured. A missing licence key in particular would
   // otherwise hit the licence guard's deliberate fail-open and leave the shop
   // running unlicensed with nothing to notice.
