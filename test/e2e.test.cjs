@@ -1245,6 +1245,51 @@ async function api(path, opts = {}, token) {
     eqp('a till that cannot identify itself is refused', nonsense.status, 400)
   }
 
+  console.log('\n— HSN codes, so the shop can file —')
+  {
+    const bad = await api('/api/v1/products', { method: 'POST', body: JSON.stringify({
+      itemCode: 'HSN-BAD-01', name: 'Bad HSN', categoryId: cat.id,
+      sellingRate: 10, gstPercentage: 0, hsnCode: '854' })}, token)
+    eqp('a three-digit HSN is refused', bad.status, 400)
+    t('...and says what lengths are allowed', /4, 6 or 8/.test(bad.body.message ?? ''), bad.body)
+
+    const made = await api('/api/v1/products', { method: 'POST', body: JSON.stringify({
+      itemCode: 'HSN-GOOD-01', name: 'Cable', categoryId: cat.id, unitOfMeasure: 'm',
+      sellMode: 'LENGTH', sellingRate: 100, gstPercentage: 18, hsnCode: '85 44 42' })}, token)
+    eqp('a valid HSN is accepted', made.status, 201)
+    t('...stored without the spaces', made.body.product.hsnCode === '854442', made.body.product.hsnCode)
+
+    await prisma.productBatch.create({ data: {
+      productId: made.body.product.id, batchCode: 'H', uniqueStockCode: 'HSN-GOOD-01/H',
+      purchaseRate: 40, receivedQty: 100, currentQty: 100 }})
+
+    // The code has to travel onto the line, because the return is filed from
+    // the invoice as issued.
+    const sale = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+      originDeviceId: device.id, paymentMethod: 'CASH', payments: [{ method: 'CASH', amount: 500 }],
+      items: [{ productId: made.body.product.id, quantity: 5, unitRate: 100, gstPercentage: 18, lineDiscountPct: 0, lineDiscountAmt: 0 }] })}, token)
+    eqp('a sale of it goes through', sale.status, 201)
+    t('the line carries the HSN', sale.body.bill.items[0].hsnCode === '854442', sale.body.bill.items[0].hsnCode)
+
+    // Correcting the product later must not rewrite an invoice already issued.
+    await api(`/api/v1/products/${made.body.product.id}`, { method: 'PUT', body: JSON.stringify({
+      hsnCode: '85444290' })}, token)
+    const reread = await api(`/api/v1/bills/${sale.body.bill.id}`, {}, token)
+    t('...and the issued invoice keeps the code it was issued with',
+      reread.body.bill.items[0].hsnCode === '854442', reread.body.bill.items[0].hsnCode)
+
+    // A credit note is filed against the same classification.
+    const ret = await api(`/api/v1/bills/${sale.body.bill.id}/return`, { method: 'POST', body: JSON.stringify({
+      items: [{ billItemId: sale.body.bill.items[0].id, quantity: 2 }], reasonCode: 'CHANGED_MIND' })}, token)
+    eqp('a return against it is accepted', ret.status, 201)
+    t('...and the credit note carries the same HSN',
+      ret.body.bill.items[0].hsnCode === '854442', ret.body.bill.items[0].hsnCode)
+
+    const cleared = await api(`/api/v1/products/${made.body.product.id}`, { method: 'PUT', body: JSON.stringify({
+      hsnCode: '' })}, token)
+    t('an HSN can be cleared', cleared.status === 200 && cleared.body.product.hsnCode === null, cleared.body.product?.hsnCode)
+  }
+
   console.log('\n— a brand list that cannot drift —')
   {
     const made = await api('/api/v1/brands', { method: 'POST', body: JSON.stringify({ name: 'Finolex' }) }, token)

@@ -176,6 +176,39 @@ export function normalizeMac(raw: string): string {
   return (hex.match(/.{2}/g) ?? []).join(':')
 }
 
+// ─── HSN ──────────────────────────────────────────────────────────────────────
+
+/**
+ * The classification code a GST invoice carries for each line.
+ *
+ * Four, six or eight digits — the length depends on the seller's turnover, and
+ * a shop growing past a threshold reports more of them, so all three are
+ * accepted rather than one being imposed. Services use a SAC instead, which is
+ * six digits and passes the same test.
+ *
+ * Optional on a product, because a shop can trade before it needs to file; the
+ * GSTR-1 export is where its absence is felt, and that is where it is
+ * reported rather than blocking a sale at the counter.
+ */
+export function validateHsn(raw: string, { required = false } = {}): FieldResult {
+  const v = (raw || '').replace(/\s/g, '')
+  if (!v) {
+    return required
+      ? bad('HSN_REQUIRED', 'An HSN code is required to file a GST return for this product.')
+      : ok('')
+  }
+  if (!/^\d+$/.test(v)) {
+    return bad('HSN_INVALID', 'An HSN code is digits only — no letters or punctuation.')
+  }
+  if (![4, 6, 8].includes(v.length)) {
+    return bad(
+      'HSN_INVALID',
+      `An HSN code is 4, 6 or 8 digits (you entered ${v.length}).`
+    )
+  }
+  return ok(v)
+}
+
 // ─── Item code ────────────────────────────────────────────────────────────────
 
 /**

@@ -205,6 +205,11 @@ model Product {
   categoryId         String
   productType        String?
   unitOfMeasure      String            @default("pcs")
+  /// The classification code a GST invoice carries for this product, and the
+  /// key the HSN summary of a GSTR-1 return is grouped by. Optional, because a
+  /// shop can trade before it needs to file; the return reports what is
+  /// missing rather than the counter refusing a sale.
+  hsnCode            String?
   /// UNIT = sold in whole pieces. LENGTH = cut to size (pipe, wire, tube), so
   /// stock and bill quantities carry three decimal places.
   sellMode           String            @default("UNIT")
@@ -494,6 +499,10 @@ model BillItem {
   itemCode           String
   productName        String
   unitOfMeasure      String
+  /// Snapshotted from the product at the moment of sale, like the code and
+  /// name beside it. A product's HSN can be corrected later; the invoice that
+  /// was issued, and the return filed from it, must not change underneath.
+  hsnCode            String?
   quantity           Decimal    @db.Decimal(12, 3)
   unitRate           Decimal    @db.Decimal(10, 2)
   gstPercentage      Decimal    @db.Decimal(5, 2)

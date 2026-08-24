@@ -246,6 +246,7 @@ export async function createBillCore(tx: TxClient, args: CreateBillArgs, billNum
   const soldAt = args.soldAt ?? new Date()
   type FinalLine = {
     productId: string; itemCode: string; productName: string; unitOfMeasure: string
+    hsnCode: string | null
     quantity: number; unitRate: number; gstPercentage: number
     lineDiscountPct: number; lineDiscountAmt: number
     lineGstAmount: number; lineTotal: number
@@ -409,6 +410,10 @@ export async function createBillCore(tx: TxClient, args: CreateBillArgs, billNum
       itemCode: product.itemCode,
       productName: product.name,
       unitOfMeasure: product.unitOfMeasure,
+      // Copied at the moment of sale, like the code and name above it: the
+      // return is filed from the invoice as issued, not from what the product
+      // record says months later.
+      hsnCode: product.hsnCode,
       quantity: item.quantity,
       unitRate: item.unitRate,
       gstPercentage: item.gstPercentage,
@@ -792,6 +797,9 @@ export async function processReturnCore(tx: TxClient, args: ProcessReturnArgs) {
           itemCode: l.originalItem.itemCode,
           productName: l.originalItem.productName,
           unitOfMeasure: l.originalItem.unitOfMeasure,
+          // A credit note is filed against the same classification the sale
+          // was, so it carries the code the original line carried.
+          hsnCode: l.originalItem.hsnCode,
           quantity: l.quantity,
           unitRate: l.originalItem.unitRate,
           gstPercentage: l.originalItem.gstPercentage,

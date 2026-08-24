@@ -13,6 +13,7 @@ export type ReceiptShop = {
 
 export type ReceiptItem = {
   itemCode: string
+  hsnCode?: string | null
   productName: string
   quantity: number
   unitRate: number
@@ -145,11 +146,15 @@ export function buildReceiptHtml(
   const itemsHtml = bill.items
     .map((it) => {
       const lineRate = `${it.quantity} × ₹${fmt(it.unitRate)}`
+      // A tax invoice carries the classification per line. Shown only when the
+      // product has one, so a shop below the threshold isn't given a blank
+      // label to wonder about.
+      const hsn = it.hsnCode ? ` · HSN ${esc(it.hsnCode)}` : ''
       return `<tr class="item">
   <td colspan="2" class="name">${esc(it.productName)}</td>
 </tr>
 <tr class="item-meta">
-  <td class="sm">${esc(it.itemCode)} · ${esc(lineRate)}</td>
+  <td class="sm">${esc(it.itemCode)}${hsn} · ${esc(lineRate)}</td>
   <td class="tot">₹${fmt(it.lineTotal)}</td>
 </tr>`
     })

@@ -107,7 +107,30 @@ check('email lowercased', V.validateEmail('A@B.COM').value === 'a@b.com')
 check('bad email rejected', !V.validateEmail('nope@').ok)
 check('item code valid', V.validateItemCode('WIRE-HAV-1.5-RED').ok)
 
+// HSN: four, six or eight digits, because which one depends on the shop's
+// turnover and a growing shop reports more of them.
+for (const good of ['8544', '854442', '85444290']) {
+  check(`HSN ${good} (${good.length} digits) is accepted`, V.validateHsn(good).ok)
+}
+for (const bad of ['854', '85444', '8544429012', 'ABCD', '8544-42']) {
+  check(`HSN ${bad} is refused`, !V.validateHsn(bad).ok)
+}
+check('spaces inside an HSN are ignored', V.validateHsn('85 44 42').value === '854442')
+check('an HSN is optional by default', V.validateHsn('').ok)
+check('...but can be demanded', !V.validateHsn('', { required: true }).ok)
+check('the wrong length says how many were typed', /3/.test(V.validateHsn('854').message))
+check('letters are named as the problem', /digits only/i.test(V.validateHsn('ABCD').message))
+
 // A MAC comes back from the operating system in whatever spelling it likes.
+// GSTR-1 will not accept "m" or "pcs" — it wants the government's unit codes.
+check('metres map to MTR', U.uqcFor('m') === 'MTR')
+check('pieces map to PCS', U.uqcFor('pcs') === 'PCS')
+check('a pair maps to PRS', U.uqcFor('pair') === 'PRS')
+check('kilograms map to KGS', U.uqcFor('kg') === 'KGS')
+check('a unit with no official code falls to OTH', U.uqcFor('ft') === 'OTH')
+check('an unknown unit falls to OTH', U.uqcFor('bananas') === 'OTH')
+check('case does not matter', U.uqcFor('M') === 'MTR')
+
 check('a MAC is canonicalised', V.normalizeMac('de:ad:be:ef:99:01') === 'DE:AD:BE:EF:99:01')
 check('...from dashes', V.normalizeMac('de-ad-be-ef-99-01') === 'DE:AD:BE:EF:99:01')
 check('...from no separators', V.normalizeMac('deadbeef9901') === 'DE:AD:BE:EF:99:01')

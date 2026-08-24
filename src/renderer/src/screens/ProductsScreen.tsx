@@ -8,7 +8,7 @@ import { Button } from '../components/ui/button'
 import { Input } from '../components/ui/input'
 import { Modal } from '../components/Modal'
 import { apiFetch } from '../lib/api'
-import { validateItemCode, suggestItemCodeFix, ITEM_CODE_HINT, validateName } from '@shared/validation'
+import { validateItemCode, suggestItemCodeFix, validateHsn, ITEM_CODE_HINT, validateName } from '@shared/validation'
 import {
   type SellMode, measuresFor, defaultMeasureFor, isLengthMode,
   qtyStep, parseQty, formatQty, formatQtyWithUnit, computePurchaseCost
@@ -57,6 +57,7 @@ type Product = {
   sellingRate: number
   gstPercentage: number
   warrantyPeriodDays: number
+  hsnCode?: string | null
   minStockLevel: number
   isActive: boolean
   totalStock: number
@@ -78,6 +79,7 @@ type ProductForm = {
   sellMode: SellMode
   sellingRate: string
   gstPercentage: string
+  hsnCode: string
   warrantyValue: string
   warrantyUnit: WarrantyUnit
   minStockLevel: string
@@ -100,7 +102,7 @@ type BatchForm = {
 const emptyProductForm = (): ProductForm => ({
   itemCode: '', brandId: '', name: '', specification: '',
   categoryId: '', productType: '', unitOfMeasure: defaultMeasureFor('UNIT'),
-  sellMode: 'UNIT', sellingRate: '0', gstPercentage: '0',
+  sellMode: 'UNIT', sellingRate: '0', gstPercentage: '0', hsnCode: '',
   warrantyValue: '0', warrantyUnit: 'days', minStockLevel: '0'
 })
 
@@ -368,6 +370,7 @@ export function ProductsScreen({ token }: { token: string | null }) {
     const mode: SellMode = p.sellMode === 'LENGTH' ? 'LENGTH' : 'UNIT'
     setProductForm({
       itemCode: p.itemCode, brandId: p.brandId || '', name: p.name,
+      hsnCode: p.hsnCode || '',
       specification: p.specification || '', categoryId: p.categoryId,
       productType: p.productType || '',
       unitOfMeasure: measuresFor(mode).includes(p.unitOfMeasure)
@@ -434,6 +437,7 @@ export function ProductsScreen({ token }: { token: string | null }) {
         sellMode: productForm.sellMode,
         sellingRate: parseFloat(productForm.sellingRate) || 0,
         gstPercentage: parseFloat(productForm.gstPercentage) || 0,
+        hsnCode: productForm.hsnCode.trim(),
         warrantyPeriodDays: warrantyToDays(productForm.warrantyValue, productForm.warrantyUnit),
         minStockLevel: parseQty(productForm.minStockLevel, productForm.sellMode)
       }
@@ -1546,6 +1550,11 @@ function ProductFormFields({
   const codeProblem = !itemCodeLocked && codeTouched && !codeCheck.ok ? codeCheck.message : ''
   const codeFix = codeProblem ? suggestItemCodeFix(form.itemCode) : null
 
+  // Blank is allowed — a shop can trade before it files — so only say
+  // something once there is something wrong with what was typed.
+  const hsnCheck = validateHsn(form.hsnCode)
+  const hsnProblem = form.hsnCode.trim() && !hsnCheck.ok ? hsnCheck.message : ''
+
   const submitNewBrand = async () => {
     setNewBrandLoading(true)
     setNewBrandError('')
@@ -1750,6 +1759,24 @@ function ProductFormFields({
               <span className="absolute right-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground">%</span>
             </div>
           </div>
+        </div>
+        <div>
+          <label className="block text-sm font-semibold mb-1.5 ml-1">HSN code</label>
+          <Input
+            value={form.hsnCode}
+            onChange={(e) => set('hsnCode', e.target.value)}
+            placeholder="e.g. 8544"
+            className={`h-11 font-mono ${hsnProblem ? 'border-red-400 focus-visible:ring-red-300' : ''}`}
+            aria-invalid={hsnProblem ? true : undefined}
+          />
+          {hsnProblem ? (
+            <p className="text-xs text-red-600 mt-1 ml-1">{hsnProblem}</p>
+          ) : (
+            <p className="text-xs text-muted-foreground mt-1 ml-1">
+              4, 6 or 8 digits. Needed to file a GST return — a product without one is
+              reported as missing when the return is prepared.
+            </p>
+          )}
         </div>
         <div className="grid grid-cols-2 gap-3">
           <div>
