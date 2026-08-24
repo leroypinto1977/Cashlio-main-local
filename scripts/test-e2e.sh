@@ -23,8 +23,9 @@ npx prisma migrate deploy >/dev/null
 
 echo "▸ bundling server"
 mkdir -p .test-build
-npx esbuild src/main/server.ts --bundle --platform=node --format=cjs \
-  --outfile=.test-build/server.cjs \
+npx esbuild src/main/server.ts src/main/licenseGuard.ts --bundle --platform=node --format=cjs \
+  --outdir=.test-build \
+  --out-extension:.js=.cjs \
   --external:@prisma/client --external:bcryptjs --external:jsonwebtoken \
   --external:express --external:cors --external:jose --log-level=error
 

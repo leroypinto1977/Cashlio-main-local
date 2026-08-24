@@ -1,5 +1,7 @@
 import express, { Request, Response, NextFunction } from 'express'
 import cors from 'cors'
+import http from 'http'
+import https from 'https'
 import jwt from 'jsonwebtoken'
 import bcrypt from 'bcryptjs'
 import { Prisma } from '@prisma/client'
@@ -16,7 +18,8 @@ import {
   verifyLicenseJwt,
   getLicenseStatus,
   checkClockTamper,
-  refreshLicenseOnce
+  refreshLicenseOnce,
+  refreshIfStale
 } from './licenseGuard'
 import {
   validateMobile,
@@ -58,6 +61,21 @@ declare global {
  * no longer a way to walk stock out of the door.
  */
 const MAX_LINE_DISCOUNT_PCT = 90
+
+/**
+ * The fingerprint of the certificate this server is presenting, set at boot.
+ *
+ * There is no certificate authority in a shop, so a till cannot check this
+ * server the way a browser checks a bank. Instead it is told the fingerprint
+ * once, at pairing — a moment a manager is standing there authorising it —
+ * and from then on accepts that certificate and nothing else. Pinning is a
+ * stronger promise than the public web's: the till trusts *that* certificate,
+ * rather than trusting whoever vouched for it.
+ */
+let branchCertFingerprint: string | null = null
+export function setBranchCertFingerprint(fp: string | null): void {
+  branchCertFingerprint = fp
+}
 
 const app = express()
 
@@ -110,12 +128,21 @@ app.use(express.json({ limit: '2mb' }))
 function requireActiveLicense() {
   return async (_req: Request, res: Response, next: NextFunction) => {
     try {
+      // Ride the licence check along with the shop's own trading, so a licence
+      // withdrawn overnight is noticed on the first sale of the day rather
+      // than whenever the four-hourly loop next happens to fire. It does not
+      // block: a shop on a bad line has to keep billing.
+      if (process.env.SAAS_API_URL) {
+        refreshIfStale(process.env.SAAS_API_URL, getServerMac())
+      }
       const status = await getLicenseStatus()
       if (status.locked) {
         return res.status(402).json({
           success: false,
           error: 'LICENSE_LOCKED',
           reason: status.reason,
+          // What to tell the person standing at the till.
+          message: status.message,
           daysUntilExpiry: status.daysUntilExpiry,
           daysUntilGraceEnd: status.daysUntilGraceEnd
         })
@@ -577,7 +604,19 @@ app.get('/api/v1/system/status', async (_req, res) => {
 
 app.post('/api/v1/system/save-config', async (req, res) => {
   try {
-    const { licenseKey, hardwareId = 'STATIC-MAC-FOR-MVP', branchName = 'PENDING_SETUP', shopName = 'My Shop' } = req.body
+    const { licenseKey, hardwareId, branchName = 'PENDING_SETUP', shopName = 'My Shop' } = req.body
+
+    // This used to fall back to a fixed placeholder, which would have given
+    // every installation in the world the same identity — collapsing the
+    // licence server's per-machine seat counting into a single shared row.
+    // Better to refuse to activate than to activate as somebody else.
+    if (typeof hardwareId !== 'string' || hardwareId.trim().length < 8) {
+      return res.status(400).json({
+        success: false,
+        error: 'HARDWARE_ID_REQUIRED',
+        message: 'This machine could not be identified, so the licence cannot be activated.'
+      })
+    }
 
     const existingConfig = await prisma.shopConfig.findUnique({ where: { licenseKey } })
     if (existingConfig) {
@@ -817,6 +856,10 @@ app.post('/api/v1/system/pair-client', requireAuth(['SUPER_ADMIN']), async (req,
       success: true,
       clientId: client.id,
       terminalCode: client.terminalCode,
+      // The one moment this can be handed over safely: a manager has just
+      // authorised this till in person. From here the till accepts only this
+      // certificate, so nothing on the network can answer in our place.
+      certFingerprint: branchCertFingerprint,
       message: `Authorized successfully. Slots remaining: ${slotsRemaining}`
     })
   } catch (err) {
@@ -5307,10 +5350,29 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
 
 // ─── Server Export ────────────────────────────────────────────────────────────
 
-export function startExpressServer(port: number = parseInt(process.env.LOCAL_SERVER_PORT || '52001')): Promise<number> {
+/**
+ * Start the branch API.
+ *
+ * Given a certificate this serves HTTPS, which is how it runs in the shop:
+ * everything between a till and here used to cross the Wi-Fi in plain text,
+ * including the cashier's session token on every single request. Without one
+ * — the test harness, and a first boot before the certificate exists — it
+ * falls back to HTTP so the server still comes up rather than leaving the
+ * shop with nothing.
+ */
+export function startExpressServer(
+  port: number = parseInt(process.env.LOCAL_SERVER_PORT || '52001'),
+  tls?: { cert: string; key: string }
+): Promise<number> {
   return new Promise((resolve, reject) => {
-    const server = app.listen(port, '0.0.0.0', () => {
-      console.log(`Local Express server running on port ${port} (all interfaces)`)
+    const server = tls
+      ? https.createServer({ cert: tls.cert, key: tls.key }, app)
+      : http.createServer(app)
+
+    server.listen(port, '0.0.0.0', () => {
+      console.log(
+        `Local ${tls ? 'HTTPS' : 'HTTP'} server running on port ${port} (all interfaces)`
+      )
       resolve(port)
     })
     server.on('error', (err) => {

@@ -64,7 +64,11 @@ export type LicenseStatus = {
   ok: boolean
   // Hard-locked: bills must be blocked. Reads still allowed.
   locked: boolean
+  /// Machine-readable code — what the guard decided.
   reason: string | null
+  /// The same thing in words somebody at a counter can act on, taken from the
+  /// licence server where it gave one.
+  message: string | null
   // Soft-warning levels surfaced to the manager UI.
   warning: 'NONE' | 'REFRESH_OVERDUE' | 'NEAR_GRACE_END' | 'EXPIRED'
   daysUntilExpiry: number | null
@@ -73,11 +77,28 @@ export type LicenseStatus = {
   hardwareIdMismatch: boolean
 }
 
+/** Plain words for the codes the licence server can refuse with. */
+function reasonForError(code: unknown): string {
+  switch (code) {
+    case 'LICENSE_REVOKED':
+      return 'This licence has been withdrawn. Contact your supplier.'
+    case 'LICENSE_EXPIRED':
+      return 'This licence has expired. Renew it to start billing again.'
+    case 'LICENSE_HARDWARE_MISMATCH':
+      return 'This licence is registered to a different machine. Contact your supplier to move it.'
+    case 'LICENSE_SEAT_LIMIT':
+      return 'Every machine this licence covers is already in use. Contact your supplier to release one or add another.'
+    default:
+      return 'Billing is blocked by the licence server. Contact your supplier.'
+  }
+}
+
 export async function getLicenseStatus(): Promise<LicenseStatus> {
   const config = await prisma.shopConfig.findFirst()
   if (!config) {
     return {
       ok: false, locked: true, reason: 'NO_LICENSE',
+      message: 'This installation has no licence yet. Complete setup to start billing.',
       warning: 'EXPIRED', daysUntilExpiry: null, daysUntilGraceEnd: null,
       lastRefreshAt: null, hardwareIdMismatch: false
     }
@@ -90,17 +111,26 @@ export async function getLicenseStatus(): Promise<LicenseStatus> {
   const refreshDeadline = lastRefresh ? lastRefresh + grace : null
 
   let locked = config.licenseLocked
-  let reason: string | null = null
+  // A lock set by the licence server carries its explanation with it; the
+  // cases decided locally below supply their own.
+  let reason: string | null = config.licenseLocked ? 'LICENSE_BLOCKED' : null
+  let message: string | null = config.licenseLocked
+    ? config.licenseLockReason ?? 'Billing is blocked by the licence server. Contact your supplier.'
+    : null
   let warning: LicenseStatus['warning'] = 'NONE'
 
   if (expiresAt != null && expiresAt <= now) {
     locked = true
     reason = 'LICENSE_EXPIRED'
+    message = 'This licence has expired. Renew it to start billing again.'
     warning = 'EXPIRED'
   } else if (refreshDeadline != null && refreshDeadline <= now) {
     // No successful refresh inside the grace window
     locked = true
     reason = 'REFRESH_OVERDUE_GRACE_EXCEEDED'
+    message =
+      'This shop has been offline too long for its licence to be confirmed. ' +
+      'Reconnect it to the internet to start billing again.'
     warning = 'EXPIRED'
   } else if (lastRefresh != null) {
     const oneDay = 24 * 60 * 60 * 1000
@@ -122,6 +152,7 @@ export async function getLicenseStatus(): Promise<LicenseStatus> {
     ok: !locked,
     locked,
     reason,
+    message,
     warning,
     daysUntilExpiry,
     daysUntilGraceEnd,
@@ -199,12 +230,36 @@ export async function refreshLicenseOnce(saasBaseUrl: string, hardwareId: string
     const isTerminal =
       resp.status === 403 &&
       typeof data?.error === 'string' &&
-      ['LICENSE_REVOKED', 'LICENSE_EXPIRED', 'LICENSE_HARDWARE_MISMATCH'].includes(data.error)
+      [
+        'LICENSE_REVOKED',
+        'LICENSE_EXPIRED',
+        'LICENSE_HARDWARE_MISMATCH',
+        // Every seat on the licence is taken by another machine. Retrying will
+        // not free one, so this locks rather than sitting in the grace window
+        // pretending it might come good.
+        'LICENSE_SEAT_LIMIT'
+      ].includes(data.error)
     await prisma.shopConfig.update({
       where: { id: config.id },
       data: {
         lastRefreshError: error,
-        ...(isTerminal ? { licenseLocked: true } : {})
+        ...(isTerminal
+          ? {
+              licenseLocked: true,
+              // Keep the server's own words. A shop told only that its licence
+              // is locked cannot act; told that the subscription is unpaid, it
+              // can.
+              // The server's own words where it gave any — a seat refusal
+              // names how many machines are in use, which is more use than
+              // anything this end could compose.
+              licenseLockReason:
+                typeof data?.revokeReason === 'string' && data.revokeReason.trim()
+                  ? data.revokeReason.trim()
+                  : typeof data?.message === 'string' && data.message.trim()
+                    ? data.message.trim()
+                    : reasonForError(data?.error)
+            }
+          : {})
       }
     })
     return { ok: false, error }
@@ -219,6 +274,24 @@ export async function refreshLicenseOnce(saasBaseUrl: string, hardwareId: string
       data: { lastRefreshError: 'INVALID_JWT_SIGNATURE' }
     })
     return { ok: false, error: 'INVALID_JWT_SIGNATURE' }
+  }
+
+  // The licence server bumps refreshTokenSeq when a licence is revoked or
+  // transferred. A token carrying a number *below* the highest this shop has
+  // already seen was minted before that happened — either a replay of the copy
+  // on disk, or a response from something standing in for the licence server.
+  // Either way it is not evidence of a live licence.
+  if (typeof claims.refreshTokenSeq === 'number' && claims.refreshTokenSeq < config.refreshTokenSeq) {
+    await prisma.shopConfig.update({
+      where: { id: config.id },
+      data: {
+        lastRefreshError: 'STALE_LICENSE_TOKEN',
+        licenseLocked: true,
+        licenseLockReason:
+          'This licence was withdrawn or moved to another machine. Contact your supplier.'
+      }
+    })
+    return { ok: false, error: 'STALE_LICENSE_TOKEN' }
   }
 
   // Defensive: server's hardwareId in the claims must match what we sent
@@ -239,10 +312,52 @@ export async function refreshLicenseOnce(saasBaseUrl: string, hardwareId: string
       lastRefreshAt: new Date(),
       lastRefreshError: null,
       licenseLocked: false,
+      licenseLockReason: null,
+      // The licence server decides how long this shop may run offline and how
+      // current its token must be. Both used to be read from whatever was
+      // stored at activation, so shortening a tenant's grace period had no
+      // effect on the shop it was shortened for.
+      gracePeriodDays: claims.gracePeriodDays ?? config.gracePeriodDays,
+      refreshTokenSeq: Math.max(config.refreshTokenSeq, claims.refreshTokenSeq ?? 0),
       hardwareId
     }
   })
   return { ok: true }
+}
+
+export const REFRESH_INTERVAL_MS = 4 * 60 * 60 * 1000
+
+/**
+ * Check the licence if it hasn't been checked lately, without making anybody
+ * wait for it.
+ *
+ * The periodic loop alone leaves a gap: a shop that opens at nine has no
+ * reason to have refreshed since the small hours, so a licence revoked
+ * overnight goes unnoticed until the next tick. Calling this as bills are
+ * written means the check rides along with the shop's own activity — the
+ * first sale of the day triggers it.
+ *
+ * Deliberately fire-and-forget. A shop on a bad line must be able to keep
+ * billing while this fails in the background; blocking a sale on a network
+ * call to decide whether the sale is allowed would take the shop down every
+ * time the internet did.
+ */
+let refreshInFlight = false
+export function refreshIfStale(saasBaseUrl: string, hardwareId: string): void {
+  if (refreshInFlight) return
+  refreshInFlight = true
+  void (async () => {
+    try {
+      const config = await prisma.shopConfig.findFirst()
+      const last = config?.lastRefreshAt?.getTime() ?? 0
+      if (Date.now() - last < REFRESH_INTERVAL_MS) return
+      await refreshLicenseOnce(saasBaseUrl, hardwareId)
+    } catch (e) {
+      console.error('[license] opportunistic refresh failed:', e)
+    } finally {
+      refreshInFlight = false
+    }
+  })()
 }
 
 /**
@@ -255,7 +370,11 @@ export function startRefreshLoop(opts: {
   hardwareId: string
   intervalMs?: number
 }): { stop: () => void } {
-  const baseInterval = opts.intervalMs ?? 12 * 60 * 60 * 1000  // 12h default
+  // Twice a day meant a revoked shop could keep billing for half a day before
+  // its own server heard about it. Four-hourly costs the licence server six
+  // calls per shop per day and closes most of that window; `refreshIfStale`
+  // below closes the rest by checking when a shop actually starts trading.
+  const baseInterval = opts.intervalMs ?? REFRESH_INTERVAL_MS
   let consecutiveFailures = 0
   let timer: NodeJS.Timeout | null = null
   let stopped = false

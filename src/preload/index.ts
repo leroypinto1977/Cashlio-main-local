@@ -15,6 +15,8 @@ import { contextBridge, ipcRenderer } from 'electron'
  */
 const INVOKE_CHANNELS = [
   'get-mac-address',
+  'get-machine-id',
+  'get-cert-fingerprint',
   'print-receipt',
   'backup:status',
   'backup:list',

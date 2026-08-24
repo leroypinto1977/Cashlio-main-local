@@ -1,4 +1,4 @@
-export const API_BASE = 'http://localhost:52001'
+export const API_BASE = 'https://127.0.0.1:52001'
 
 export function authHeaders(token: string | null): Record<string, string> {
   return token ? { Authorization: `Bearer ${token}` } : {}

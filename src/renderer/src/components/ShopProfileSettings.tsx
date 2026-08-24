@@ -9,7 +9,7 @@ import {
   stateCodeOf
 } from '@shared/validation'
 
-const LOCAL_API = (import.meta.env.VITE_LOCAL_API_URL as string) || 'http://127.0.0.1:52001'
+const LOCAL_API = (import.meta.env.VITE_LOCAL_API_URL as string) || 'https://127.0.0.1:52001'
 
 type Profile = {
   shopName: string
