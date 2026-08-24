@@ -14,7 +14,7 @@ import {
   Smartphone,
 } from 'lucide-react'
 
-const LOCAL_API = (import.meta.env.VITE_LOCAL_API_URL as string) || 'http://127.0.0.1:52001'
+const LOCAL_API = (import.meta.env.VITE_LOCAL_API_URL as string) || 'https://127.0.0.1:52001'
 
 type Period = 'today' | 'week' | 'month' | 'year' | 'all'
 

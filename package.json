@@ -21,7 +21,8 @@
     "build:linux": "electron-vite build && electron-builder --linux",
     "test:shared": "tsc src/shared/money.ts src/shared/validation.ts src/shared/units.ts src/shared/credit.ts src/shared/procurement.ts src/shared/warranty.ts --outDir .test-build --module commonjs --target es2020 --skipLibCheck && node test/shared.test.cjs",
     "test:e2e": "./scripts/test-e2e.sh",
-    "test": "npm run test:shared && npm run test:e2e"
+    "test": "npm run test:shared && npm run test:tls && npm run test:e2e",
+    "test:tls": "node test/tls.test.cjs"
   },
   "dependencies": {
     "@electron-toolkit/preload": "^3.0.2",
@@ -39,6 +40,7 @@
     "jsonwebtoken": "^9.0.3",
     "lucide-react": "^0.575.0",
     "npm-run-all": "^4.1.5",
+    "selfsigned": "^5.5.0",
     "tailwind-merge": "^3.5.0"
   },
   "devDependencies": {

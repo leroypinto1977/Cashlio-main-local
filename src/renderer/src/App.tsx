@@ -35,7 +35,7 @@ import { UserSettings } from './components/UserSettings'
 import axios from 'axios'
 
 // Always fall back to the known local port so requests never go to "undefined/..."
-const LOCAL_API = (import.meta.env.VITE_LOCAL_API_URL as string) || 'http://127.0.0.1:52001'
+const LOCAL_API = (import.meta.env.VITE_LOCAL_API_URL as string) || 'https://127.0.0.1:52001'
 
 // Steps:
 // 0 = Splash (checks setup status, routes automatically)
@@ -84,6 +84,18 @@ function App(): React.JSX.Element {
   const [devicesLoading, setDevicesLoading] = useState(false)
   const [unpairing, setUnpairing] = useState<string | null>(null)
   const [deviceError, setDeviceError] = useState('')
+  // What this server's certificate hashes to. A till pairing for the first
+  // time shows the same value and asks the manager to compare — that check,
+  // done by a person, is what stops something else on the network answering
+  // in this server's place while a till is being set up.
+  const [certFingerprint, setCertFingerprint] = useState<string | null>(null)
+
+  React.useEffect(() => {
+    window.electron.ipcRenderer
+      .invoke('get-cert-fingerprint')
+      .then((fp) => setCertFingerprint(typeof fp === 'string' ? fp : null))
+      .catch(() => setCertFingerprint(null))
+  }, [])
 
   type Stats = {
     todayBills: number
@@ -763,6 +775,20 @@ function App(): React.JSX.Element {
               <h1 className="text-3xl font-bold tracking-tight">Devices</h1>
               <p className="text-muted-foreground mt-1 text-sm">Billing terminals authorized to connect to this server.</p>
             </header>
+            {certFingerprint && (
+              <div className="p-5 rounded-xl bg-card border shadow-sm">
+                <h2 className="text-sm font-bold text-zinc-900">This server's fingerprint</h2>
+                <p className="text-xs text-muted-foreground mt-1 mb-3">
+                  When a new terminal is set up it shows a fingerprint and asks whether it
+                  matches. Compare it with this. If they differ, stop — something else on the
+                  network is answering.
+                </p>
+                <p className="font-mono text-xs leading-relaxed text-zinc-800 break-all bg-zinc-50 border rounded-lg p-3">
+                  {certFingerprint}
+                </p>
+              </div>
+            )}
+
             <div className="p-6 rounded-xl bg-card border shadow-sm min-h-[400px]">
               <div className="flex items-center justify-between mb-6">
                 <h2 className="text-lg font-bold">Authorized Billing Clients</h2>
@@ -834,7 +860,7 @@ function App(): React.JSX.Element {
               </div>
               <div className="p-5 rounded-xl border bg-card space-y-1 col-span-2">
                 <p className="text-xs font-semibold text-zinc-500 uppercase tracking-wide">Server Address</p>
-                <p className="text-base font-mono font-semibold text-zinc-900">127.0.0.1:52001 (local) · 0.0.0.0:52001 (LAN)</p>
+                <p className="text-base font-mono font-semibold text-zinc-900">https://127.0.0.1:52001 (local) · 0.0.0.0:52001 (LAN)</p>
               </div>
               <div className="p-5 rounded-xl border bg-zinc-50 space-y-1 col-span-2">
                 <p className="text-xs font-semibold text-zinc-500 uppercase tracking-wide">Database</p>

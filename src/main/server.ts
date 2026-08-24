@@ -1,5 +1,7 @@
 import express, { Request, Response, NextFunction } from 'express'
 import cors from 'cors'
+import http from 'http'
+import https from 'https'
 import jwt from 'jsonwebtoken'
 import bcrypt from 'bcryptjs'
 import { Prisma } from '@prisma/client'
@@ -59,6 +61,21 @@ declare global {
  * no longer a way to walk stock out of the door.
  */
 const MAX_LINE_DISCOUNT_PCT = 90
+
+/**
+ * The fingerprint of the certificate this server is presenting, set at boot.
+ *
+ * There is no certificate authority in a shop, so a till cannot check this
+ * server the way a browser checks a bank. Instead it is told the fingerprint
+ * once, at pairing — a moment a manager is standing there authorising it —
+ * and from then on accepts that certificate and nothing else. Pinning is a
+ * stronger promise than the public web's: the till trusts *that* certificate,
+ * rather than trusting whoever vouched for it.
+ */
+let branchCertFingerprint: string | null = null
+export function setBranchCertFingerprint(fp: string | null): void {
+  branchCertFingerprint = fp
+}
 
 const app = express()
 
@@ -839,6 +856,10 @@ app.post('/api/v1/system/pair-client', requireAuth(['SUPER_ADMIN']), async (req,
       success: true,
       clientId: client.id,
       terminalCode: client.terminalCode,
+      // The one moment this can be handed over safely: a manager has just
+      // authorised this till in person. From here the till accepts only this
+      // certificate, so nothing on the network can answer in our place.
+      certFingerprint: branchCertFingerprint,
       message: `Authorized successfully. Slots remaining: ${slotsRemaining}`
     })
   } catch (err) {
@@ -5329,10 +5350,29 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
 
 // ─── Server Export ────────────────────────────────────────────────────────────
 
-export function startExpressServer(port: number = parseInt(process.env.LOCAL_SERVER_PORT || '52001')): Promise<number> {
+/**
+ * Start the branch API.
+ *
+ * Given a certificate this serves HTTPS, which is how it runs in the shop:
+ * everything between a till and here used to cross the Wi-Fi in plain text,
+ * including the cashier's session token on every single request. Without one
+ * — the test harness, and a first boot before the certificate exists — it
+ * falls back to HTTP so the server still comes up rather than leaving the
+ * shop with nothing.
+ */
+export function startExpressServer(
+  port: number = parseInt(process.env.LOCAL_SERVER_PORT || '52001'),
+  tls?: { cert: string; key: string }
+): Promise<number> {
   return new Promise((resolve, reject) => {
-    const server = app.listen(port, '0.0.0.0', () => {
-      console.log(`Local Express server running on port ${port} (all interfaces)`)
+    const server = tls
+      ? https.createServer({ cert: tls.cert, key: tls.key }, app)
+      : http.createServer(app)
+
+    server.listen(port, '0.0.0.0', () => {
+      console.log(
+        `Local ${tls ? 'HTTPS' : 'HTTP'} server running on port ${port} (all interfaces)`
+      )
       resolve(port)
     })
     server.on('error', (err) => {

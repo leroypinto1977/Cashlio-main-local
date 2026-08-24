@@ -5,7 +5,8 @@ import fs from 'fs'
 import dotenv from 'dotenv'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
-import { startExpressServer, startSyncEventPruning } from './server'
+import { startExpressServer, startSyncEventPruning, setBranchCertFingerprint } from './server'
+import { ensureBranchCert, fingerprintOfPem, fingerprintsMatch } from './tls'
 import { runBackup, listBackups, getBackupStatus, getBackupDir, startBackupSchedule } from './backup'
 import { startRefreshLoop, checkClockTamper } from './licenseGuard'
 import { getMachineId } from './machineId'
@@ -151,6 +152,31 @@ function createWindow(): void {
 // This method will be called when Electron has finished
 // initialization and is ready to create browser windows.
 // Some APIs can only be used after this event occurs.
+/**
+ * This window talks to the server running in this same process, over a
+ * certificate this machine issued itself. Chromium has no reason to trust it,
+ * so the trust is stated here — and stated narrowly: exactly one fingerprint,
+ * the one we just generated. Anything else is refused, which is the whole
+ * point of doing it this way rather than switching certificate checking off.
+ */
+let ownCertFingerprint: string | null = null
+
+app.on('certificate-error', (event, _webContents, url, _error, certificate, callback) => {
+  const presented = fingerprintOfPem(certificate.data)
+  if (
+    ownCertFingerprint &&
+    presented &&
+    fingerprintsMatch(presented, ownCertFingerprint) &&
+    /^https:\/\/(127\.0\.0\.1|localhost)(:\d+)?\//.test(url)
+  ) {
+    event.preventDefault()
+    callback(true)
+    return
+  }
+  console.error(`[tls] refusing certificate for ${url}`)
+  callback(false)
+})
+
 app.whenReady().then(async () => {
   // Set app user model id for windows
   electronApp.setAppUserModelId('com.cashlio.manager')
@@ -251,9 +277,16 @@ app.whenReady().then(async () => {
     return
   }
 
-  // Start the local express server
+  // Start the local express server, over TLS. Tills pin the certificate at
+  // pairing, so the shop's Wi-Fi stops being a place to read sessions and
+  // bills off the wire — or to answer in this server's place.
   try {
-    const port = await startExpressServer(parseInt(process.env.LOCAL_SERVER_PORT || '52001'))
+    const tls = await ensureBranchCert(app.getPath('userData'))
+    setBranchCertFingerprint(tls.fingerprint)
+    ownCertFingerprint = tls.fingerprint
+    ipcMain.handle('get-cert-fingerprint', () => tls.fingerprint)
+    console.log(`[tls] serving ${tls.hosts.join(', ')} — expires ${tls.validTo}`)
+    const port = await startExpressServer(parseInt(process.env.LOCAL_SERVER_PORT || '52001'), tls)
     console.log(`Express API started on port ${port}`)
   } catch (err) {
     // A dead API means every till in the shop is offline. Say so, rather than
