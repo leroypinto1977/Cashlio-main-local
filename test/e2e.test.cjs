@@ -929,6 +929,27 @@ async function api(path, opts = {}, token) {
   t('replacement is fully settled', r.body.replacementBill.balanceDue === 0, r.body.replacementBill?.balanceDue)
   const tenderAfter = Number((await prisma.payment.aggregate({ _sum: { amount: true } }))._sum.amount ?? 0)
   eqp('only the 1,000 difference enters the ledger', tenderAfter - tenderBefore, 1000)
+  const upTenders = await prisma.payment.findMany({ where: { bill: { originalBillId: exBill.id } } })
+  t('trading up hands nothing back', upTenders.length === 0, upTenders)
+
+  // The other direction: swap a dear item for a cheap one and the shop pays
+  // the difference out. That money leaves the drawer and has to be recorded.
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, paymentMethod: 'CASH',
+    items: [{ productId: exDear.id, quantity: 1, unitRate: 1200, gstPercentage: 0, lineDiscountPct: 0, lineDiscountAmt: 0 }] })}, token)
+  const downBill = r.body.bill
+  const downBefore = Number((await prisma.payment.aggregate({ _sum: { amount: true } }))._sum.amount ?? 0)
+  r = await api(`/api/v1/bills/${downBill.id}/exchange`, { method: 'POST', body: JSON.stringify({
+    returnItems: [{ billItemId: downBill.items[0].id, quantity: 1 }],
+    replacementItems: [{ productId: exProd.id, quantity: 1 }],
+    amountReceived: 0, reasonCode: 'WRONG_ITEM' })}, token)
+  t('trading down is accepted', r.status === 201, r.body)
+  eqp('the customer is owed the difference', r.body.netDifference, -1000)
+  const downAfter = Number((await prisma.payment.aggregate({ _sum: { amount: true } }))._sum.amount ?? 0)
+  eqp('and that difference leaves the ledger', downAfter - downBefore, -1000)
+  const downTenders = await prisma.payment.findMany({ where: { bill: { originalBillId: downBill.id } } })
+  t('recorded once, as cash going back', downTenders.length === 1 && downTenders[0].method === 'CASH', downTenders)
+  t('the replacement is still settled', r.body.replacementBill.balanceDue === 0, r.body.replacementBill?.balanceDue)
 
 
   console.log('\n— mixed whole and fractional quantities —')
@@ -1673,6 +1694,129 @@ async function api(path, opts = {}, token) {
     t('a legacy id-only cursor is accepted', legacy.events.length > 0, legacy)
     const resumed = (await api(`/api/v1/sync/pull?cursor=${encodeURIComponent(after.nextCursor)}&limit=500`, {}, token)).body
     eqp('resuming from nextCursor returns nothing new', resumed.events.length, 0)
+  }
+
+  // ── the day book and the drawer count ────────────────────────────────────
+  // The question this answers is "does the cash in the drawer match the
+  // books", so nearly every assertion below is a *delta*: do one thing, and
+  // check the expected cash moved by exactly what that thing was worth.
+  {
+    const today = new Date(new Date(Date.now() + 5.5 * 3600e3).toISOString().slice(0, 10) + 'T00:00:00.000Z')
+    const todayKey = today.toISOString().slice(0, 10)
+    const book = async (q = '') => (await api(`/api/v1/reports/day-book${q}`, {}, token)).body.book
+    const cashOf = (b) => b.tenders.find((x) => x.method === 'CASH')
+
+    let b0 = await book()
+    t('the day book is for today', b0.businessDate === todayKey, b0.businessDate)
+
+    // The books' own arithmetic, checked against the payment rows themselves.
+    const cashRows = await prisma.payment.aggregate({
+      _sum: { amount: true },
+      where: { method: 'CASH' }
+    })
+    eqp('expected cash is the float plus every cash movement',
+      b0.cash.expected, Number(cashRows._sum.amount ?? 0))
+    eqp('opening float starts at nothing', b0.cash.openingFloat, 0)
+
+    // A cash sale puts money in the drawer.
+    r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+      originDeviceId: device.id, payments: [{ method: 'CASH', amount: 2360 }], items: line(2) })}, token)
+    const cashSale = r.body.bill
+    let b1 = await book()
+    eqp('a cash sale raises expected cash by the takings',
+      b1.cash.expected - b0.cash.expected, 2360)
+    eqp('...and shows up as collected, not netted away',
+      cashOf(b1).collected - cashOf(b0).collected, 2360)
+    eqp('the sale is counted', b1.sales.billCount - b0.sales.billCount, 1)
+
+    // Handing goods back over a paid bill takes money out of the drawer.
+    r = await api(`/api/v1/bills/${cashSale.id}/return`, { method: 'POST', body: JSON.stringify({
+      originDeviceId: device.id, reason: 'Wrong size',
+      items: [{ billItemId: cashSale.items[0].id, quantity: 1 }] })}, token)
+    t('the return is accepted', r.body?.success === true, r.body)
+    const refundTotal = Number(r.body.bill.totalAmount)
+    const refundRows = await prisma.payment.findMany({ where: { billId: r.body.bill.id } })
+    t('a refund against a paid bill is recorded as money moving', refundRows.length === 1, refundRows)
+    eqp('...as a negative amount', Number(refundRows[0]?.amount ?? 0), -refundTotal)
+    t('...through the tender the sale came in on', refundRows[0]?.method === 'CASH', refundRows[0]?.method)
+
+    let b2 = await book()
+    eqp('expected cash drops by the refund', b2.cash.expected - b1.cash.expected, -refundTotal)
+    eqp('and it reads as refunded, not as negative takings',
+      cashOf(b2).refunded - cashOf(b1).refunded, refundTotal)
+    eqp('collections are untouched by it', cashOf(b2).collected, cashOf(b1).collected)
+
+    // Returning against a bill nobody has paid yet moves no money at all: it
+    // cancels debt. This is the distinction the whole reconciliation rests on.
+    await prisma.customer.update({ where: { id: creditCust.id }, data: { creditLimit: 999999 } })
+    r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+      originDeviceId: device.id, customerId: creditCust.id, payments: [], items: line(2) })}, token)
+    const creditSale = r.body.bill
+    t('the credit sale owes its whole value', Number(creditSale.balanceDue) > 0, creditSale.balanceDue)
+    const b3 = await book()
+    eqp('a credit sale adds nothing to the drawer', b3.cash.expected, b2.cash.expected)
+
+    r = await api(`/api/v1/bills/${creditSale.id}/return`, { method: 'POST', body: JSON.stringify({
+      originDeviceId: device.id, reason: 'Changed mind',
+      items: [{ billItemId: creditSale.items[0].id, quantity: 1 }] })}, token)
+    t('returning against a credit sale is accepted', r.body?.success === true, r.body)
+    const creditRefundRows = await prisma.payment.findMany({ where: { billId: r.body.bill.id } })
+    t('no money is handed back on an unpaid bill', creditRefundRows.length === 0, creditRefundRows)
+    const reopened = await prisma.bill.findUnique({ where: { id: creditSale.id } })
+    eqp('the debt is what falls instead',
+      Number(creditSale.balanceDue) - Number(reopened.balanceDue), Number(r.body.bill.totalAmount))
+    const b4 = await book()
+    eqp('and the drawer is unmoved', b4.cash.expected, b3.cash.expected)
+
+    // The float is money that was in the drawer before trading started.
+    const withFloat = await book('?openingFloat=500')
+    eqp('the opening float carries straight into what is expected',
+      withFloat.cash.expected - b4.cash.expected, 500)
+
+    // ── counting it ──
+    r = await api('/api/v1/day-close', { method: 'POST', body: JSON.stringify({
+      businessDate: todayKey, openingFloat: 500, countedCash: withFloat.cash.expected - 100 })}, token)
+    t('a drawer that does not balance cannot be closed silently',
+      r.status === 400 && r.body.error === 'DIFFERENCE_NEEDS_NOTE', r.body)
+    t('...and the message says which way it is out',
+      /short by/.test(r.body.message || ''), r.body.message)
+
+    r = await api('/api/v1/day-close', { method: 'POST', body: JSON.stringify({
+      businessDate: todayKey, openingFloat: 500, countedCash: withFloat.cash.expected - 100 })}, cashierToken)
+    t('a cashier cannot sign off the shop drawer', r.status === 403, r.status)
+
+    r = await api('/api/v1/day-close', { method: 'POST', body: JSON.stringify({
+      businessDate: todayKey, openingFloat: 500, countedCash: withFloat.cash.expected - 100,
+      notes: 'Hundred rupees paid to the courier out of the till' })}, token)
+    t('an explained difference closes the day', r.status === 200, r.body)
+    eqp('the shortfall is recorded as a shortfall', r.body.close.difference, -100)
+    eqp('against the figure that was on screen', r.body.close.expectedCash, withFloat.cash.expected)
+    t('and who counted it', r.body.close.closedBy === 'admin', r.body.close.closedBy)
+
+    r = await api('/api/v1/day-close', { method: 'POST', body: JSON.stringify({
+      businessDate: todayKey, openingFloat: 500, countedCash: 999, notes: 'again' })}, token)
+    t('a day cannot be counted twice', r.status === 409 && r.body.error === 'ALREADY_CLOSED', r.body)
+
+    // A closed day is frozen: later trade must not rewrite what was signed off.
+    r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+      originDeviceId: device.id, payments: [{ method: 'CASH', amount: 1180 }], items: line(1) })}, token)
+    const b5 = await book()
+    eqp('the signed-off figure does not move when the day trades on',
+      b5.closed.expectedCash, withFloat.cash.expected)
+    t('though the live day book keeps counting',
+      b5.cash.expected > withFloat.cash.expected - 500, [b5.cash.expected, withFloat.cash.expected])
+
+    r = await api('/api/v1/day-close/history', {}, token)
+    t('the count shows in the history', r.body.closes.some((c) => c.businessDate === todayKey), r.body.closes)
+    eqp('and is counted as a short day', r.body.summary.shortDays, 1)
+    eqp('with the running difference', r.body.summary.netDifference, -100)
+
+    r = await api('/api/v1/reports/day-book?date=2026-02-30', {}, token)
+    t('a date that does not exist is refused', r.status === 400 && r.body.error === 'BAD_DATE', r.body)
+    r = await api('/api/v1/reports/day-book?date=24-08-2026', {}, token)
+    t('so is a date written the other way round', r.status === 400, r.body)
+    r = await api(`/api/v1/reports/day-book?date=${todayKey}`, {}, cashierToken)
+    t('a cashier may read the day book they are counting against', r.status === 200, r.status)
   }
 
   console.log(`\n${pass} passed, ${fail} failed`)

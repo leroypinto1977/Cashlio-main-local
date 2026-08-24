@@ -14,6 +14,7 @@ import { router as paymentsRoutes } from './routes/payments'
 import { router as purchaseOrdersRoutes } from './routes/purchaseOrders'
 import { router as warrantiesRoutes } from './routes/warranties'
 import { router as analyticsRoutes } from './routes/analytics'
+import { router as dayCloseRoutes } from './routes/dayClose'
 import { router as overviewRoutes } from './routes/overview'
 import { router as syncRoutes } from './routes/sync'
 
@@ -84,6 +85,7 @@ app.use(paymentsRoutes)
 app.use(purchaseOrdersRoutes)
 app.use(warrantiesRoutes)
 app.use(analyticsRoutes)
+app.use(dayCloseRoutes)
 app.use(overviewRoutes)
 app.use(syncRoutes)
 
