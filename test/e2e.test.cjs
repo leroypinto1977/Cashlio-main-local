@@ -980,6 +980,117 @@ async function api(path, opts = {}, token) {
     afterReturn.estimatedMarginPct < 100, afterReturn.estimatedMarginPct)
 
 
+  console.log('\n— revoking a licence actually stops the billing —')
+  {
+    const { refreshLicenseOnce, getLicenseStatus } = require('../.test-build/licenseGuard.cjs')
+    const jose = require('jose')
+    const fs = require('fs')
+    const path = require('path')
+
+    // Stand in for the licence server, signing with a keypair this test owns
+    // so the branch server's real verification path is exercised end to end.
+    const { publicKey, privateKey } = await jose.generateKeyPair('EdDSA', { extractable: true })
+    const spki = Buffer.from(await jose.exportSPKI(publicKey).then((pem) =>
+      pem.replace(/-----[^-]+-----|\s/g, '')), 'base64')
+    process.env.LICENSE_PUBLIC_KEY = spki.toString('base64')
+
+    const HW = require('os').hostname()
+    let served = { revoked: false, reason: null, seq: 0, graceDays: 30 }
+    const mint = async (over = {}) =>
+      new jose.SignJWT({
+        licenseKey: 'SMOKE-1', tenantId: 't1', maxBranches: 1, maxSystemsPerBranch: 3,
+        expiresAt: new Date(Date.now() + 200 * 86400000).toISOString(),
+        gracePeriodDays: served.graceDays, refreshTokenSeq: served.seq,
+        branchName: 'Main', hardwareId: HW, serverNow: new Date().toISOString(), ...over
+      }).setProtectedHeader({ alg: 'EdDSA' }).setIssuedAt().setExpirationTime('7d').sign(privateKey)
+
+    const realFetch = global.fetch
+    global.fetch = async (url, init) => {
+      if (!String(url).includes('/api/v1/licenses/refresh')) return realFetch(url, init)
+      if (served.revoked) {
+        return new Response(JSON.stringify({
+          success: false, error: 'LICENSE_REVOKED',
+          revokedAt: new Date().toISOString(), revokeReason: served.reason
+        }), { status: 403, headers: { 'Content-Type': 'application/json' } })
+      }
+      const jwt = await mint()
+      return new Response(JSON.stringify({
+        success: true, jwt, serverNow: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + 200 * 86400000).toISOString()
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
+
+    // A healthy shop refreshes and can bill.
+    let r0 = await refreshLicenseOnce('http://licence.test', HW)
+    t('a healthy licence refreshes', r0.ok, r0)
+    let st = await getLicenseStatus()
+    t('...and billing is allowed', !st.locked, st)
+
+    // The licence server withdraws it.
+    served.revoked = true
+    served.reason = 'Subscription unpaid since March'
+    const r1 = await refreshLicenseOnce('http://licence.test', HW)
+    eqp('the refusal is terminal', r1.error === 'LICENSE_REVOKED' ? 1 : 0, 1)
+    st = await getLicenseStatus()
+    t('billing is blocked at once, not after the grace period', st.locked, st)
+    t('...and the shop is told why, in the words the server used',
+      st.message === 'Subscription unpaid since March', st.message)
+
+    const blocked = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+      originDeviceId: device.id, paymentMethod: 'CASH', payments: [{ method: 'CASH', amount: 118 }],
+      items: [{ productId: p2.id, quantity: 1, unitRate: 105, gstPercentage: 5, lineDiscountPct: 0, lineDiscountAmt: 0 }] })}, token)
+    eqp('a sale is refused with 402', blocked.status, 402)
+    t('...carrying the reason to the till', blocked.body.message === 'Subscription unpaid since March', blocked.body)
+
+    // Reading history still works — a shop can always get at its own data.
+    const reads = await api('/api/v1/bills?limit=1', {}, token)
+    eqp('history is still readable', reads.status, 200)
+
+    // Reinstated: the server bumps the sequence again and the shop recovers.
+    served.revoked = false
+    served.seq = 2
+    const r2 = await refreshLicenseOnce('http://licence.test', HW)
+    t('a reinstated licence refreshes', r2.ok, r2)
+    st = await getLicenseStatus()
+    t('...billing resumes', !st.locked, st)
+    t('...and the reason is cleared', st.message === null, st.message)
+    const ok = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+      originDeviceId: device.id, paymentMethod: 'CASH', payments: [{ method: 'CASH', amount: 105 }],
+      items: [{ productId: p2.id, quantity: 1, unitRate: 105, gstPercentage: 5, lineDiscountPct: 0, lineDiscountAmt: 0 }] })}, token)
+    eqp('and a sale goes through again', ok.status, 201)
+
+    // The week-long token already on disk cannot be replayed once the sequence
+    // has moved on — this is what stops a revoked shop unplugging the internet
+    // and carrying on with the copy it already holds.
+    const stale = await mint({ refreshTokenSeq: 1 })
+    global.fetch = async (url, init) => {
+      if (!String(url).includes('/api/v1/licenses/refresh')) return realFetch(url, init)
+      return new Response(JSON.stringify({
+        success: true, jwt: stale, serverNow: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + 200 * 86400000).toISOString()
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
+    const r3 = await refreshLicenseOnce('http://licence.test', HW)
+    eqp('a token from before the revocation is refused', r3.error === 'STALE_LICENSE_TOKEN' ? 1 : 0, 1)
+    st = await getLicenseStatus()
+    t('...and it locks billing rather than being ignored', st.locked, st)
+
+    // Put the shop back so the rest of the suite can trade.
+    served.seq = 3
+    global.fetch = async (url, init) => {
+      if (!String(url).includes('/api/v1/licenses/refresh')) return realFetch(url, init)
+      const jwt = await mint()
+      return new Response(JSON.stringify({
+        success: true, jwt, serverNow: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + 200 * 86400000).toISOString()
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
+    await refreshLicenseOnce('http://licence.test', HW)
+    global.fetch = realFetch
+    st = await getLicenseStatus()
+    t('the shop is trading again for the rest of the suite', !st.locked, st)
+  }
+
   console.log('\n— a bad item code is refused, not tidied up —')
   {
     const mk = (code) => api('/api/v1/products', { method: 'POST', body: JSON.stringify({

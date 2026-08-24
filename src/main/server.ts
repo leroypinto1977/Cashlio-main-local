@@ -16,7 +16,8 @@ import {
   verifyLicenseJwt,
   getLicenseStatus,
   checkClockTamper,
-  refreshLicenseOnce
+  refreshLicenseOnce,
+  refreshIfStale
 } from './licenseGuard'
 import {
   validateMobile,
@@ -110,12 +111,21 @@ app.use(express.json({ limit: '2mb' }))
 function requireActiveLicense() {
   return async (_req: Request, res: Response, next: NextFunction) => {
     try {
+      // Ride the licence check along with the shop's own trading, so a licence
+      // withdrawn overnight is noticed on the first sale of the day rather
+      // than whenever the four-hourly loop next happens to fire. It does not
+      // block: a shop on a bad line has to keep billing.
+      if (process.env.SAAS_API_URL) {
+        refreshIfStale(process.env.SAAS_API_URL, getServerMac())
+      }
       const status = await getLicenseStatus()
       if (status.locked) {
         return res.status(402).json({
           success: false,
           error: 'LICENSE_LOCKED',
           reason: status.reason,
+          // What to tell the person standing at the till.
+          message: status.message,
           daysUntilExpiry: status.daysUntilExpiry,
           daysUntilGraceEnd: status.daysUntilGraceEnd
         })

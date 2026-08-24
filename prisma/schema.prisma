@@ -25,6 +25,15 @@ model ShopConfig {
   lastRefreshError      String?   // Last refresh failure reason (for the manager UI)
   licenseLocked         Boolean   @default(false) // True after grace period expires; blocks new bills
   gracePeriodDays       Int       @default(30)
+  /// Why billing is blocked, in the words the licence server used. A cashier
+  /// staring at "licence locked" has nothing to tell the owner; "subscription
+  /// unpaid since March" tells them who to ring.
+  licenseLockReason     String?
+  /// The highest refresh sequence this shop has seen. The licence server bumps
+  /// it on revocation or transfer, so a token minted before that carries a
+  /// lower number and is refused — which is what stops a revoked shop replaying
+  /// the week-long token already on its disk.
+  refreshTokenSeq       Int       @default(0)
 
   // Shop identity — printed on every tax invoice. `stateCode` is the 2-digit
   // GST state code (first two chars of the shop GSTIN) and decides whether a
