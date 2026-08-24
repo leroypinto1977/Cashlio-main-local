@@ -54,6 +54,31 @@ export function formatQtyWithUnit(
   return `${formatQty(n)} ${unitOfMeasure || 'pcs'}`.trim()
 }
 
+/**
+ * The unit codes a GST return recognises.
+ *
+ * GSTR-1's HSN summary will not accept "pcs" or "m" — it wants the government's
+ * own Unit Quantity Codes. The shop should go on saying "m" on a receipt; this
+ * is only for the filing.
+ */
+const UQC: Record<string, string> = {
+  pcs: 'PCS',
+  box: 'BOX',
+  set: 'SET',
+  pair: 'PRS',
+  kg: 'KGS',
+  ltr: 'LTR',
+  m: 'MTR',
+  cm: 'CMS'
+  // Feet and inches have no code on the government's list, so they fall to
+  // OTH below. That is the honest answer rather than converting behind the
+  // shop's back and filing a quantity it never sold.
+}
+
+export function uqcFor(unitOfMeasure: string | null | undefined): string {
+  return UQC[(unitOfMeasure || '').trim().toLowerCase()] ?? 'OTH'
+}
+
 /** Units valid for a mode, used to keep the two dropdowns consistent. */
 export function measuresFor(sellMode: string | null | undefined): readonly string[] {
   return isLengthMode(sellMode) ? LENGTH_MEASURES : UNIT_MEASURES

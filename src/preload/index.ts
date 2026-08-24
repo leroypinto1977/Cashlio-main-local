@@ -21,7 +21,8 @@ const INVOKE_CHANNELS = [
   'backup:status',
   'backup:list',
   'backup:run',
-  'backup:open-folder'
+  'backup:open-folder',
+  'gst:save-return'
 ] as const
 
 type InvokeChannel = (typeof INVOKE_CHANNELS)[number]

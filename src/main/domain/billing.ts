@@ -166,6 +166,44 @@ export async function recomputeBillSettlement(tx: TxClient, billId: string): Pro
     }
   })
 }
+/** Tenders a refund can be paid back through. */
+const REFUNDABLE_TENDERS = ['CASH', 'UPI', 'CARD', 'CHEQUE']
+
+/**
+ * Writes down money going back over the counter, as a negative payment against
+ * the credit note. It hangs off the RETURN bill, which recomputeBillSettlement
+ * skips, so it can never be mistaken for a collection against the sale.
+ */
+export async function recordRefundTender(
+  tx: TxClient,
+  args: {
+    returnBillId: string
+    receivedAt: Date
+    customerId: string | null
+    amount: number
+    method: string | null
+    cashierId: string
+    note: string
+  }
+): Promise<void> {
+  if (args.amount <= 0) return
+  await tx.payment.create({
+    data: {
+      billId: args.returnBillId,
+      customerId: args.customerId,
+      amount: -round2(args.amount),
+      // Money goes back the way it came. A split or credit sale leaves no
+      // single tender to reverse, so it falls to cash, which is what is
+      // actually handed over the counter.
+      method: REFUNDABLE_TENDERS.includes(args.method ?? '') ? (args.method as string) : 'CASH',
+      isSettlement: false,
+      receivedAt: args.receivedAt,
+      collectedById: args.cashierId,
+      note: args.note
+    }
+  })
+}
+
 // ─── Bill core helpers ────────────────────────────────────────────────────────
 // Shared between POST /bills, POST /bills/:id/return, and POST /bills/:id/exchange
 // so the same FIFO / pro-ration / serialization logic is used everywhere.
@@ -246,6 +284,7 @@ export async function createBillCore(tx: TxClient, args: CreateBillArgs, billNum
   const soldAt = args.soldAt ?? new Date()
   type FinalLine = {
     productId: string; itemCode: string; productName: string; unitOfMeasure: string
+    hsnCode: string | null
     quantity: number; unitRate: number; gstPercentage: number
     lineDiscountPct: number; lineDiscountAmt: number
     lineGstAmount: number; lineTotal: number
@@ -409,6 +448,10 @@ export async function createBillCore(tx: TxClient, args: CreateBillArgs, billNum
       itemCode: product.itemCode,
       productName: product.name,
       unitOfMeasure: product.unitOfMeasure,
+      // Copied at the moment of sale, like the code and name above it: the
+      // return is filed from the invoice as issued, not from what the product
+      // record says months later.
+      hsnCode: product.hsnCode,
       quantity: item.quantity,
       unitRate: item.unitRate,
       gstPercentage: item.gstPercentage,
@@ -513,6 +556,10 @@ export async function createBillCore(tx: TxClient, args: CreateBillArgs, billNum
           method: t.method,
           reference: t.reference ?? null,
           isSettlement: false,
+          // The money changed hands when the sale was made, not when the row
+          // reached this server. A terminal replaying three days of offline
+          // bills would otherwise drop all that cash into today's drawer.
+          receivedAt: soldAt,
           collectedById: args.cashierId
         }))
       },
@@ -561,6 +608,12 @@ export type ProcessReturnArgs = {
   cashierId: string
   originDeviceId: string
   billNumber?: string
+  /**
+   * Set by the exchange, which spends the returned value on the replacement
+   * rather than handing it over. The caller records whatever is left as cash
+   * once it knows what the replacement came to.
+   */
+  deferRefund?: boolean
 }
 
 /**
@@ -792,6 +845,9 @@ export async function processReturnCore(tx: TxClient, args: ProcessReturnArgs) {
           itemCode: l.originalItem.itemCode,
           productName: l.originalItem.productName,
           unitOfMeasure: l.originalItem.unitOfMeasure,
+          // A credit note is filed against the same classification the sale
+          // was, so it carries the code the original line carried.
+          hsnCode: l.originalItem.hsnCode,
           quantity: l.quantity,
           unitRate: l.originalItem.unitRate,
           gstPercentage: l.originalItem.gstPercentage,
@@ -817,7 +873,31 @@ export async function processReturnCore(tx: TxClient, args: ProcessReturnArgs) {
     returnLines.map((l) => l.originalItem.productId)
   )
   // Returning goods against an unsettled bill reduces what the customer owes
-  // rather than handing back money they never paid.
+  // rather than handing back money they never paid. Whatever the refund is
+  // worth beyond that debt is money genuinely leaving the shop, and until it
+  // is written down the drawer cannot be counted against the books.
+  //
+  // balanceDue is read under the lock taken at the top of this function and is
+  // kept current by recomputeBillSettlement, so it is the settled position
+  // before this return — including any earlier return against the same bill.
+  const outstandingBefore = round2(Math.max(0, Number(original.balanceDue ?? 0)))
+  const dueReduction = round2(Math.min(totalAmount, outstandingBefore))
+  const refundPaidOut = round2(totalAmount - dueReduction)
+  // An exchange spends this on the replacement instead of handing it over, and
+  // only the caller knows how much the replacement actually absorbs.
+  if (refundPaidOut > 0 && !args.deferRefund) {
+    await recordRefundTender(tx, {
+      returnBillId: created.id,
+      receivedAt: created.createdAt,
+      customerId: original.customerId,
+      amount: refundPaidOut,
+      method: original.paymentMethod,
+      cashierId: args.cashierId,
+      note: `Refund against ${original.billNumber}`
+    })
+  }
   await recomputeBillSettlement(tx, original.id)
-  return created
+  // refundPaidOut is what this return is worth once the customer's own debt
+  // has taken its share — the most that could ever be handed back in money.
+  return Object.assign(created, { refundPaidOut })
 }

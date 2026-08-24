@@ -1,4 +1,5 @@
 import { Router } from 'express'
+import { buildGstr1, toPortalJson } from '../domain/gstr1'
 import { prisma } from '../prisma'
 import { requireAuth } from '../http/middleware'
 import { IST_OFFSET_MS, istMidnight } from '../domain/dates'
@@ -191,6 +192,30 @@ router.get('/api/v1/analytics/summary', requireAuth(), async (req, res) => {
     })
   } catch (err) {
     console.error(err)
+    return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
+  }
+})
+
+/**
+ * The GST return for a month, and the same thing in the portal's own shape.
+ *
+ * Two forms because they answer different needs: the readable one is what
+ * somebody checks before filing, and `?format=portal` is what gets uploaded.
+ * Filing a return nobody looked at is how a wrong one gets filed.
+ */
+router.get('/api/v1/reports/gstr1', requireAuth(['SUPER_ADMIN']), async (req, res) => {
+  try {
+    const now = new Date(Date.now() + IST_OFFSET_MS)
+    const month = Math.min(12, Math.max(1, parseInt(String(req.query.month ?? '')) || (now.getUTCMonth() + 1)))
+    const year = Math.min(2100, Math.max(2000, parseInt(String(req.query.year ?? '')) || now.getUTCFullYear()))
+
+    const report = await buildGstr1({ month, year })
+    if (String(req.query.format ?? '') === 'portal') {
+      return res.json({ success: true, filing: toPortalJson(report), readiness: report.readiness })
+    }
+    return res.json({ success: true, report })
+  } catch (err) {
+    console.error('Error building GSTR-1:', err)
     return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
   }
 })

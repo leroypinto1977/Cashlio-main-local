@@ -5,7 +5,7 @@ import { requireAuth, requireActiveLicense } from '../http/middleware'
 import { pageArgs } from '../http/respond'
 import { peekNumber } from '../domain/numbering'
 import { serializeBillItem, serializeBill } from '../domain/serializers'
-import { readTenders, lockBill, resolveSoldAt, createBillCore, planRestock, processReturnCore } from '../domain/billing'
+import { readTenders, lockBill, resolveSoldAt, createBillCore, planRestock, processReturnCore, recordRefundTender } from '../domain/billing'
 import type { IncomingSaleItem } from '../domain/billing'
 import { emitProductUpsertBulk, emitBillUpsert } from '../syncEvents'
 import { round2 } from '../../shared/money'
@@ -457,7 +457,10 @@ router.post('/api/v1/bills/:id/exchange', requireActiveLicense(), requireAuth(['
         reason: reason ? `Exchange: ${reason}` : 'Exchange',
         reasonCode: isReturnReasonCode(req.body?.reasonCode) ? req.body.reasonCode : null,
         cashierId,
-        originDeviceId: deviceId
+        originDeviceId: deviceId,
+        // Nothing is handed over yet — how much of this is money back and how
+        // much goes onto the replacement is only known once it is priced.
+        deferRefund: true
       })
 
       const replacement = await createBillCore(tx, {
@@ -475,13 +478,29 @@ router.post('/api/v1/bills/:id/exchange', requireActiveLicense(), requireAuth(['
           amountReceived != null && Number(amountReceived) > 0
             ? [{ method: pm, amount: round2(Number(amountReceived)) }]
             : [],
-        creditApplied: Number(refund.totalAmount),
+        // Only the part of the return the customer had actually paid for can
+        // be spent on the replacement. Value that went to clearing their own
+        // debt is already gone and cannot be handed over twice.
+        creditApplied: refund.refundPaidOut,
         allowCreditOverride: true,
         // The replacement rate is resolved from the product master above.
         allowPriceOverride: true,
         discountAmount: 0,
         notes: `Exchange for ${original.billNumber} (refund ${refund.billNumber})`,
         clientLocalId: null
+      })
+
+      // The replacement soaks up as much of the refund as it costs; anything
+      // left over is money the shop gives back across the counter.
+      const cashBack = round2(Math.max(0, refund.refundPaidOut - Number(replacement.totalAmount)))
+      await recordRefundTender(tx, {
+        returnBillId: refund.id,
+        receivedAt: refund.createdAt,
+        customerId: original.customerId,
+        amount: cashBack,
+        method: pm,
+        cashierId,
+        note: `Exchange difference on ${original.billNumber}`
       })
 
       return { refundBill: refund, replacementBill: replacement }

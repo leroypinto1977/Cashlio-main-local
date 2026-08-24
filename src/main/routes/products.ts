@@ -7,7 +7,7 @@ import { allocateNumber, peekNumber } from '../domain/numbering'
 import { serializeBatch } from '../domain/serializers'
 import { resolveBrand, brandFields } from '../domain/brands'
 import { recordSync, emitProductUpsert } from '../syncEvents'
-import { validateName, validateItemCode } from '../../shared/validation'
+import { validateName, validateItemCode, validateHsn } from '../../shared/validation'
 import { parseQty, roundQty, computePurchaseCost, defaultMeasureFor, measuresFor } from '../../shared/units'
 
 /**
@@ -149,7 +149,7 @@ router.post('/api/v1/products', requireAuth(['SUPER_ADMIN']), async (req, res) =
   try {
     const {
       itemCode, brand, brandId, name, specification, categoryId, productType,
-      unitOfMeasure, sellMode, sellingRate, gstPercentage, warrantyPeriodDays,
+      unitOfMeasure, sellMode, sellingRate, gstPercentage, warrantyPeriodDays, hsnCode,
       minStockLevel, supplierIds
     } = req.body
 
@@ -161,6 +161,8 @@ router.post('/api/v1/products', requireAuth(['SUPER_ADMIN']), async (req, res) =
     if (!codeCheck.ok) return fieldError(res, codeCheck)
     const nameCheck = validateName(String(name), 'Product name')
     if (!nameCheck.ok) return fieldError(res, nameCheck)
+    const hsnCheck = validateHsn(String(hsnCode ?? ''))
+    if (!hsnCheck.ok) return fieldError(res, hsnCheck)
 
     const mode = sellMode === 'LENGTH' ? 'LENGTH' : 'UNIT'
     const uom = measuresFor(mode).includes(String(unitOfMeasure))
@@ -183,6 +185,7 @@ router.post('/api/v1/products', requireAuth(['SUPER_ADMIN']), async (req, res) =
           categoryId,
           productType,
           unitOfMeasure: uom,
+          hsnCode: hsnCheck.value || null,
           sellMode: mode,
           sellingRate: sellingRate ?? 0,
           gstPercentage: gstPercentage ?? 0,
@@ -225,7 +228,7 @@ router.put('/api/v1/products/:id', requireAuth(['SUPER_ADMIN']), async (req, res
     const id = String(req.params.id)
     const {
       itemCode, brand, brandId, name, specification, categoryId, productType,
-      unitOfMeasure, sellMode, sellingRate, gstPercentage, warrantyPeriodDays,
+      unitOfMeasure, sellMode, sellingRate, gstPercentage, warrantyPeriodDays, hsnCode,
       minStockLevel, isActive
     } = req.body
 
@@ -272,6 +275,14 @@ router.put('/api/v1/products/:id', requireAuth(['SUPER_ADMIN']), async (req, res
       }
     }
 
+    // An empty string clears the code; leaving the field out changes nothing.
+    let nextHsn: string | null | undefined
+    if (hsnCode !== undefined) {
+      const hsnCheck = validateHsn(String(hsnCode ?? ''))
+      if (!hsnCheck.ok) return fieldError(res, hsnCheck)
+      nextHsn = hsnCheck.value || null
+    }
+
     const mode = sellMode === undefined ? undefined : sellMode === 'LENGTH' ? 'LENGTH' : 'UNIT'
 
     const product = await prisma.$transaction(async (tx) => {
@@ -299,6 +310,7 @@ router.put('/api/v1/products/:id', requireAuth(['SUPER_ADMIN']), async (req, res
           ...(brandData ?? {}),
           name, specification, categoryId, productType,
           unitOfMeasure: uom,
+          hsnCode: nextHsn,
           sellMode: mode,
           sellingRate, gstPercentage, warrantyPeriodDays, isActive,
           minStockLevel:

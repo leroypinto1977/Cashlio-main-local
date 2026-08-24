@@ -99,7 +99,7 @@ type SavedBill = {
   tenders?: Tender[]
   customerOutstanding?: number | null
   items: {
-    productName: string; itemCode?: string; quantity: number; unitRate?: number; lineTotal: number
+    productName: string; itemCode?: string; hsnCode?: string | null; quantity: number; unitRate?: number; lineTotal: number
     gstPercentage?: number; taxableValue?: number; cgstAmount?: number; sgstAmount?: number
     igstAmount?: number; billDiscountAmt?: number
   }[]
@@ -275,6 +275,7 @@ export function BillingScreen({
     customerName: b.customer?.name ?? null,
     items: b.items.map((it) => ({
       itemCode: it.itemCode || '',
+      hsnCode: it.hsnCode ?? null,
       productName: it.productName,
       quantity: it.quantity,
       unitRate: it.unitRate ?? (it.quantity > 0 ? it.lineTotal / it.quantity : 0),
