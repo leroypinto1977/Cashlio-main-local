@@ -684,6 +684,19 @@ async function api(path, opts = {}, token) {
   r = await api('/api/v1/warranties?status=ACTIVE', {}, token)
   t('ACTIVE filter excludes it', !r.body.warranties.some(w => w.id === lapsed.id))
 
+  // The serial number is recorded when somebody is holding the unit, which is
+  // usually later than the sale — and correcting a mistyped one must not need
+  // a claim to be open.
+  r = await api(`/api/v1/warranties/${lapsed.id}`, { method: 'PUT', body: JSON.stringify({ serialNumber: ' SN-0099 ' }) }, token)
+  t('a serial can be recorded outside a claim', r.status === 200, r.body)
+  t('...and is trimmed', r.body.warranty.serialNumber === 'SN-0099', r.body.warranty.serialNumber)
+  r = await api(`/api/v1/warranties/${lapsed.id}`, { method: 'PUT', body: JSON.stringify({ serialNumber: '' }) }, token)
+  t('...and can be cleared', r.status === 200 && r.body.warranty.serialNumber === null, r.body.warranty)
+  r = await api('/api/v1/warranties/no-such-id', { method: 'PUT', body: JSON.stringify({ serialNumber: 'X' }) }, token)
+  eqp('an unknown warranty is a 404, not a 500', r.status, 404)
+  r = await api('/api/v1/warranties?search=SN-4471', {}, token)
+  t('a warranty is findable by serial number', r.body.warranties.some(w => w.id === wId), r.body.warranties?.length)
+
 
   console.log('\n— pricing cannot be dictated by the client —')
   const goldProd = await prisma.product.create({ data: {
