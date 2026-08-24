@@ -14,7 +14,8 @@ const buildDir = path.join(__dirname, '.build')
 fs.mkdirSync(buildDir, { recursive: true })
 for (const [entry, out] of [
   [path.join(__dirname, '..', 'src', 'renderer', 'src', 'lib', 'receipt.ts'), 'receipt.cjs'],
-  [path.join(__dirname, '..', 'src', 'main', 'printing.ts'), 'printing.cjs']
+  [path.join(__dirname, '..', 'src', 'main', 'printing.ts'), 'printing.cjs'],
+  [path.join(__dirname, '..', 'src', 'renderer', 'src', 'lib', 'billingShortcuts.tsx'), 'shortcuts.cjs']
 ]) {
   esbuild.buildSync({
     entryPoints: [entry],
@@ -35,6 +36,7 @@ global.window = {}
 
 const R = require(path.join(buildDir, 'receipt.cjs'))
 const P = require(path.join(buildDir, 'printing.cjs'))
+const K = require(path.join(buildDir, 'shortcuts.cjs'))
 
 let pass = 0, fail = 0
 const t = (name, cond, detail) => {
@@ -150,6 +152,75 @@ console.log('\n— the counter printer setting —')
   store.set('cashlio_receipt_printer', 'not json at all')
   eq('unreadable settings do not throw', R.readPrinterSettings().deviceName, '')
   eq('...and fall back to the dialog', R.readPrinterSettings().paperWidthMm, 80)
+}
+
+// ─── The keyboard layer ──────────────────────────────────────────────────────
+console.log('\n— the keys a cashier uses —')
+{
+  const at = (over = {}) => ({
+    modalOpen: false, pendingProduct: false, dropdownOpen: false,
+    lineCount: 3, selectedLine: -1, canCollect: true, ...over
+  })
+  const act = (key, alt, over) => K.resolveShortcut(key, alt, at(over))
+
+  eq('F2 goes to the search box', act('F2', false).type, 'focus-search')
+  eq('F4 opens the customer picker', act('F4', false).type, 'open-customer')
+  eq('F6 goes to the money box', act('F6', false).type, 'focus-amount')
+  eq('F9 takes the money', act('F9', false).type, 'collect')
+
+  // A key must never do what the button would refuse to do.
+  eq('F9 does nothing on an unfinishable bill',
+    act('F9', false, { canCollect: false }).type, 'none')
+
+  // A modal owns the keyboard while it is open.
+  for (const key of ['F2', 'F4', 'F6', 'F9']) {
+    eq(`${key} is ignored while a modal is up`, act(key, false, { modalOpen: true }).type, 'none')
+  }
+  eq('...and Escape is left to the modal itself',
+    act('Escape', false, { modalOpen: true }).type, 'none')
+
+  // Escape backs out of one thing at a time, innermost first.
+  eq('Escape cancels the quantity prompt first',
+    act('Escape', false, { pendingProduct: true, dropdownOpen: true }).type, 'cancel-pending')
+  eq('...then closes the dropdown',
+    act('Escape', false, { dropdownOpen: true }).type, 'close-dropdown')
+  eq('...and otherwise returns to the search box', act('Escape', false).type, 'focus-search')
+
+  // A cashier types names and amounts all day: no bare key can be a command.
+  for (const key of ['a', '1', '+', '-', 'Delete', 'Backspace', 'ArrowUp', 'ArrowDown']) {
+    eq(`"${key}" alone types, it does not command`, act(key, false).type, 'none')
+  }
+
+  // The line actions default to the last line, which is what was just scanned.
+  const up = act('ArrowUp', true)
+  eq('Alt+Up steps back from the last line', JSON.stringify(up), JSON.stringify({ type: 'select-line', index: 1 }))
+  eq('Alt+Down from the last line stays there',
+    act('ArrowDown', true).index, 2)
+  eq('Alt+Up at the top stays at the top', act('ArrowUp', true, { selectedLine: 0 }).index, 0)
+  eq('Alt+Down at the end stays at the end', act('ArrowDown', true, { selectedLine: 2 }).index, 2)
+
+  eq('Alt+= raises the selected line', JSON.stringify(act('=', true, { selectedLine: 1 })),
+    JSON.stringify({ type: 'step-quantity', index: 1, direction: 1 }))
+  eq('Alt++ does the same on a keyboard that sends +',
+    act('+', true, { selectedLine: 1 }).direction, 1)
+  eq('Alt+- lowers it', act('-', true, { selectedLine: 1 }).direction, -1)
+  eq('Alt+Backspace removes it', JSON.stringify(act('Backspace', true, { selectedLine: 1 })),
+    JSON.stringify({ type: 'remove-line', index: 1 }))
+  eq('Alt+Delete does too', act('Delete', true, { selectedLine: 1 }).type, 'remove-line')
+
+  // An empty cart has no line to act on.
+  for (const key of ['ArrowUp', '=', '-', 'Backspace']) {
+    eq(`Alt+${key} does nothing with an empty cart`,
+      act(key, true, { lineCount: 0 }).type, 'none')
+  }
+
+  // A selection left pointing past the end after a removal must not act on a
+  // line that is not there.
+  eq('a stale selection is clamped to the last line',
+    act('Backspace', true, { selectedLine: 9, lineCount: 3 }).index, 2)
+  eq('...and so is a stale step', act('=', true, { selectedLine: 9, lineCount: 3 }).index, 2)
+
+  eq('an unclaimed Alt combination is left alone', act('q', true).type, 'none')
 }
 
 console.log(`\n${pass} passed, ${fail} failed`)

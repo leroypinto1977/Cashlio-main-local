@@ -11,6 +11,7 @@ import { apiFetch } from '../lib/api'
 import { printReceipt, type ReceiptBill, type ReceiptShop } from '../lib/receipt'
 import { computeInvoiceTotals, round2 } from '@shared/money'
 import { stateCodeOf } from '@shared/validation'
+import { useBillingShortcuts, useFocusAndSelect, ShortcutBar } from '../lib/billingShortcuts'
 import { isLengthMode, parseQty, qtyStep, roundQty, formatQty } from '@shared/units'
 import { settle, checkCredit, PAYMENT_METHODS, type PaymentMethod, type Tender } from '@shared/credit'
 
@@ -187,6 +188,14 @@ export function BillingScreen({
 }) {
   // Cart
   const [cartItems, setCartItems] = useState<CartItem[]>([])
+  /**
+   * The line the keyboard is acting on. -1 means the last one, which is what
+   * a cashier almost always wants: the thing just scanned is the thing being
+   * corrected. Moving the selection pins it to a real index.
+   */
+  const [selectedLine, setSelectedLine] = useState(-1)
+  const searchInputRef = useRef<HTMLInputElement>(null)
+  const tenderAmountRef = useRef<HTMLInputElement>(null)
 
   // Search
   const [search, setSearch] = useState('')
@@ -730,6 +739,35 @@ export function BillingScreen({
     }
   }
 
+  const focusSearch = useFocusAndSelect(searchInputRef)
+  const focusAmount = useFocusAndSelect(tenderAmountRef)
+
+  useBillingShortcuts({
+    modalOpen: showCustomerModal || !!successBill,
+    pendingProduct: !!pendingProduct,
+    dropdownOpen: showDropdown,
+    lineCount: cartItems.length,
+    selectedLine,
+    setSelectedLine,
+    focusSearch,
+    focusAmount,
+    cancelPending: () => setPendingProduct(null),
+    closeDropdown: () => setShowDropdown(false),
+    openCustomer: () => setShowCustomerModal(true),
+    stepQuantity: (idx, dir) => updateQty(idx, dir * qtyStep(cartItems[idx]?.sellMode)),
+    removeLine: removeItem,
+    collect: () => void handlePay(),
+    canCollect: canPay && !submitting && cartItems.length > 0
+  })
+
+  // A line removed elsewhere must not leave the selection pointing past the end.
+  useEffect(() => {
+    if (selectedLine >= cartItems.length) setSelectedLine(-1)
+  }, [cartItems.length, selectedLine])
+
+  const activeLine = selectedLine < 0 ? cartItems.length - 1 : selectedLine
+
+
   // ─── New Bill ─────────────────────────────────────────────────────────────
 
   const startNewBill = () => {
@@ -878,6 +916,7 @@ export function BillingScreen({
             <div className="relative">
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground z-10" />
               <Input
+                ref={searchInputRef}
                 value={search}
                 onChange={(e) => { setSearch(e.target.value); setPendingProduct(null) }}
                 onFocus={() => search && setShowDropdown(true)}
@@ -1025,7 +1064,15 @@ export function BillingScreen({
                 </thead>
                 <tbody className="divide-y">
                   {cartItems.map((it, idx) => (
-                    <tr key={it.productId + idx} className="hover:bg-zinc-50/60 group">
+                    <tr
+                      key={it.productId + idx}
+                      onClick={() => setSelectedLine(idx)}
+                      className={`group cursor-default ${
+                        idx === activeLine
+                          ? 'bg-zinc-100 ring-1 ring-inset ring-zinc-300'
+                          : 'hover:bg-zinc-50/60'
+                      }`}
+                    >
                       <td className="px-4 py-3 text-muted-foreground text-xs">{idx + 1}</td>
                       <td className="px-4 py-3">
                         <p className="font-medium text-zinc-900">{it.productName}</p>
@@ -1129,6 +1176,8 @@ export function BillingScreen({
               </table>
             </div>
           )}
+
+          <ShortcutBar hasLines={cartItems.length > 0} />
         </div>
 
         {/* RIGHT PANEL */}
@@ -1233,6 +1282,7 @@ export function BillingScreen({
                     <div className="relative flex-1">
                       <span className="absolute left-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground font-medium">₹</span>
                       <Input
+                        ref={idx === 0 ? tenderAmountRef : undefined}
                         type="number"
                         min="0"
                         step="0.01"
