@@ -1104,6 +1104,36 @@ async function api(path, opts = {}, token) {
     t('the shop is trading again for the rest of the suite', !st.locked, st)
   }
 
+  console.log('\n— a brand list that cannot drift —')
+  {
+    const made = await api('/api/v1/brands', { method: 'POST', body: JSON.stringify({ name: 'Finolex' }) }, token)
+    t('a brand can be added', made.status === 201, made.body)
+
+    for (const spelling of ['finolex', 'FINOLEX', '  Finolex  ']) {
+      const dup = await api('/api/v1/brands', { method: 'POST', body: JSON.stringify({ name: spelling }) }, token)
+      eqp(`"${spelling}" is refused as a duplicate`, dup.status, 409)
+      t('...naming the spelling already on the list', dup.body.existingName === 'Finolex', dup.body)
+    }
+
+    // The quieter path: saving a product that names a brand used to create a
+    // second one when the case differed, without anybody choosing to.
+    const p = await api('/api/v1/products', { method: 'POST', body: JSON.stringify({
+      itemCode: 'BRAND-CASE-01', name: 'Case Test', categoryId: cat.id,
+      sellingRate: 10, gstPercentage: 0, brand: 'FINOLEX' })}, token)
+    t('a product naming a differently-cased brand is accepted', p.status === 201, p.body)
+    t('...and is filed under the brand already on the list', p.body.product.brand === 'Finolex', p.body.product.brand)
+    const brands = (await api('/api/v1/brands', {}, token)).body.brands
+    eqp('the list did not grow', brands.filter((b) => b.name.toLowerCase() === 'finolex').length, 1)
+
+    // Categories and warehouses carry the same constraint.
+    await api('/api/v1/categories', { method: 'POST', body: JSON.stringify({ name: 'Lighting Test' }) }, token)
+    const dupCat = await api('/api/v1/categories', { method: 'POST', body: JSON.stringify({ name: 'lighting test' }) }, token)
+    eqp('a category in another case is refused too', dupCat.status, 409)
+    await api('/api/v1/warehouses', { method: 'POST', body: JSON.stringify({ name: 'Back Room' }) }, token)
+    const dupWh = await api('/api/v1/warehouses', { method: 'POST', body: JSON.stringify({ name: 'BACK ROOM' }) }, token)
+    eqp('and so is a warehouse', dupWh.status, 409)
+  }
+
   console.log('\n— a bad item code is refused, not tidied up —')
   {
     const mk = (code) => api('/api/v1/products', { method: 'POST', body: JSON.stringify({

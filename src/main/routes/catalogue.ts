@@ -95,9 +95,18 @@ router.post('/api/v1/brands', requireAuth(['SUPER_ADMIN']), async (req, res) => 
     return res.status(201).json({ success: true, brand })
   } catch (err: unknown) {
     if ((err as { code?: string }).code === 'P2002') {
+      // Uniqueness ignores case, so the clash may be with a different
+      // spelling. Say which one, or the message reads as a lie.
+      const existing = await prisma.brand.findFirst({
+        where: { name: { equals: String(req.body?.name ?? '').trim(), mode: 'insensitive' } }
+      })
       return res.status(409).json({
         success: false, error: 'BRAND_NAME_EXISTS',
-        message: 'A brand with this name already exists.'
+        message: existing
+          ? `That brand is already on the list as "${existing.name}".`
+          : 'A brand with this name already exists.',
+        existingId: existing?.id ?? null,
+        existingName: existing?.name ?? null
       })
     }
     console.error(err)

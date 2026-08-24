@@ -27,7 +27,12 @@ export async function resolveBrand(
   if (typeof input.brand === 'string') {
     const name = input.brand.trim()
     if (!name) return { kind: 'cleared' }
-    const existing = await tx.brand.findUnique({ where: { name } })
+    // Case-insensitively, because a product naming "finolex" means the
+    // "Finolex" already on the list. Matching exactly created a second brand
+    // silently, while somebody thought they were saving a product.
+    const existing = await tx.brand.findFirst({
+      where: { name: { equals: name, mode: 'insensitive' } }
+    })
     const brand = existing ?? (await tx.brand.create({ data: { name } }))
     return { kind: 'resolved', brandId: brand.id, brand: brand.name }
   }

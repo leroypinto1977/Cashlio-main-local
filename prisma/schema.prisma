@@ -122,6 +122,11 @@ model User {
   warrantiesResolved Warranty[] @relation("WarrantyResolvedBy")
 }
 
+/// Names are unique without regard to case — a functional index on
+/// lower(name), added by the case_insensitive_names migration, since Prisma
+/// cannot express one. Postgres compares text case-sensitively, so the plain
+/// @unique below let "Finolex" and "finolex" both exist, which is exactly the
+/// drift a controlled list is meant to prevent.
 model Warehouse {
   id        String         @id @default(uuid())
   name      String         @unique
@@ -133,6 +138,11 @@ model Warehouse {
 
 /// Brand names are a controlled list rather than free text so that filtering
 /// and brand-wise reporting stay reliable (no "Finolex" / "FINOLEX" drift).
+/// Names are unique without regard to case — a functional index on
+/// lower(name), added by the case_insensitive_names migration, since Prisma
+/// cannot express one. Postgres compares text case-sensitively, so the plain
+/// @unique below let "Finolex" and "finolex" both exist, which is exactly the
+/// drift a controlled list is meant to prevent.
 model Brand {
   id        String    @id @default(uuid())
   name      String    @unique
@@ -142,6 +152,11 @@ model Brand {
   products  Product[]
 }
 
+/// Names are unique without regard to case — a functional index on
+/// lower(name), added by the case_insensitive_names migration, since Prisma
+/// cannot express one. Postgres compares text case-sensitively, so the plain
+/// @unique below let "Finolex" and "finolex" both exist, which is exactly the
+/// drift a controlled list is meant to prevent.
 model Category {
   id        String    @id @default(uuid())
   name      String    @unique
