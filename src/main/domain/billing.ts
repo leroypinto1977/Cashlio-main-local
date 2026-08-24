@@ -124,6 +124,18 @@ export async function lockBill(tx: TxClient, billId: string): Promise<void> {
 }
 
 /**
+ * The same, for a purchase order.
+ *
+ * Receiving read the order, decided what was still outstanding, and wrote the
+ * batches — with nothing holding the row in between. Two deliveries booked at
+ * the same moment both saw the same "still outstanding" and both received in
+ * full: two batches for one delivery, and stock the shop does not have.
+ */
+export async function lockPurchaseOrder(tx: TxClient, orderId: string): Promise<void> {
+  await tx.$executeRaw`SELECT "id" FROM "PurchaseOrder" WHERE "id" = ${orderId} FOR UPDATE`
+}
+
+/**
  * Recomputes a bill's settlement from the records that actually exist: what
  * has been collected against it, less anything returned. Storing the result
  * keeps queries cheap, but it is always derivable from payments and credit

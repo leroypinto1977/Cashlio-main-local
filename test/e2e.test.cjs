@@ -1104,6 +1104,98 @@ async function api(path, opts = {}, token) {
     t('the shop is trading again for the rest of the suite', !st.locked, st)
   }
 
+  console.log('\n— doing it twice at once does it once —')
+  {
+    // A till is a place where two people can press the same button at the same
+    // moment, and a refund is how a till gets robbed.
+    const raceProd = await prisma.product.create({ data: {
+      itemCode: 'CONCUR-TEST-001', name: 'Race Item', categoryId: cat.id,
+      sellingRate: 500, gstPercentage: 0 }})
+    await prisma.productBatch.create({ data: {
+      productId: raceProd.id, batchCode: 'C1', uniqueStockCode: 'CONCUR-TEST-001/C1',
+      purchaseRate: 200, receivedQty: 100, currentQty: 100 }})
+    const stockOf = async () => Number((await prisma.productBatch.aggregate({
+      where: { productId: raceProd.id }, _sum: { currentQty: true } }))._sum.currentQty)
+    const sell = async (qty) => (await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+      originDeviceId: device.id, paymentMethod: 'CASH', payments: [{ method: 'CASH', amount: qty * 500 }],
+      items: [{ productId: raceProd.id, quantity: qty, unitRate: 500, gstPercentage: 0, lineDiscountPct: 0, lineDiscountAmt: 0 }] })}, token)).body.bill
+
+    // Two identical full returns, fired together.
+    let bill = await sell(4)
+    let before = await stockOf()
+    const retBody = JSON.stringify({
+      items: [{ billItemId: bill.items[0].id, quantity: 4 }], reasonCode: 'CHANGED_MIND' })
+    const [r1, r2] = await Promise.all([
+      api(`/api/v1/bills/${bill.id}/return`, { method: 'POST', body: retBody }, token),
+      api(`/api/v1/bills/${bill.id}/return`, { method: 'POST', body: retBody }, token)
+    ])
+    eqp('only one of two simultaneous returns is accepted',
+      [r1, r2].filter((r) => r.status === 201).length, 1)
+    eqp('one credit note, not two',
+      await prisma.bill.count({ where: { originalBillId: bill.id, status: 'RETURN' } }), 1)
+    eqp('the goods go back on the shelf once', (await stockOf()) - before, 4)
+
+    // Two overlapping partial returns must not exceed what was sold.
+    bill = await sell(2)
+    await Promise.all([
+      api(`/api/v1/bills/${bill.id}/return`, { method: 'POST', body: JSON.stringify({
+        items: [{ billItemId: bill.items[0].id, quantity: 2 }], reasonCode: 'CHANGED_MIND' })}, token),
+      api(`/api/v1/bills/${bill.id}/return`, { method: 'POST', body: JSON.stringify({
+        items: [{ billItemId: bill.items[0].id, quantity: 1 }], reasonCode: 'CHANGED_MIND' })}, token)
+    ])
+    const notes = await prisma.bill.findMany({
+      where: { originalBillId: bill.id, status: 'RETURN' }, include: { items: true } })
+    const returned = notes.flatMap((n) => n.items).reduce((s, i) => s + Number(i.quantity), 0)
+    t('never more is returned than was sold', returned <= 2, { sold: 2, returned })
+
+    // Two payments against one balance.
+    const rcust = await prisma.customer.create({ data: {
+      name: 'Race Buyer', phone: '9000000901', creditLimit: 100000, creditDays: 30 }})
+    const credit = (await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+      originDeviceId: device.id, customerId: rcust.id, payments: [],
+      items: [{ productId: raceProd.id, quantity: 2, unitRate: 500, gstPercentage: 0, lineDiscountPct: 0, lineDiscountAmt: 0 }] })}, token)).body.bill
+    const payBody = JSON.stringify({
+      customerId: rcust.id, amount: 1000, method: 'CASH', allocations: [{ billId: credit.id, amount: 1000 }] })
+    await Promise.all([
+      api('/api/v1/payments', { method: 'POST', body: payBody }, token),
+      api('/api/v1/payments', { method: 'POST', body: payBody }, token)
+    ])
+    const settled = await prisma.bill.findUnique({
+      where: { id: credit.id }, include: { payments: true } })
+    const collected = settled.payments.reduce((s, p) => s + Number(p.amount), 0)
+    t('a bill is never over-collected', collected <= 1000.005, { collected })
+    t('...and its balance never goes negative', Number(settled.balanceDue) >= 0, Number(settled.balanceDue))
+
+    // Two voids.
+    bill = await sell(3)
+    before = await stockOf()
+    await Promise.all([
+      api(`/api/v1/bills/${bill.id}/void`, { method: 'POST', body: JSON.stringify({ reason: 'x' }) }, token),
+      api(`/api/v1/bills/${bill.id}/void`, { method: 'POST', body: JSON.stringify({ reason: 'x' }) }, token)
+    ])
+    eqp('stock is restored once by a doubled void', (await stockOf()) - before, 3)
+
+    // Two receipts of one delivery. This one was a real defect: both booked in
+    // full, so the shop had twenty units it had never been sent.
+    const sup = await prisma.supplier.create({ data: { name: 'Race Supplier', phone: '9000000902' } })
+    const po = (await api('/api/v1/purchase-orders', { method: 'POST', body: JSON.stringify({
+      supplierId: sup.id,
+      items: [{ productId: raceProd.id, quantity: 20, unitRate: 200, gstPercentage: 0 }] })}, token)).body.order
+    await api(`/api/v1/purchase-orders/${po.id}/place`, { method: 'POST', body: JSON.stringify({}) }, token)
+    before = await stockOf()
+    const recvBody = JSON.stringify({
+      items: [{ itemId: po.items[0].id, quantity: 20, purchaseRate: 200 }] })
+    await Promise.all([
+      api(`/api/v1/purchase-orders/${po.id}/receive`, { method: 'POST', body: recvBody }, token),
+      api(`/api/v1/purchase-orders/${po.id}/receive`, { method: 'POST', body: recvBody }, token)
+    ])
+    eqp('a delivery booked twice at once arrives once', (await stockOf()) - before, 20)
+    const order = await prisma.purchaseOrder.findUnique({
+      where: { id: po.id }, include: { items: true } })
+    eqp('...and the order records what it actually received',
+      Number(order.items[0].receivedQty), 20)
+  }
+
   console.log('\n— the same account, however it is typed —')
   {
     for (const spelling of ['admin', 'Admin', 'ADMIN', '  admin  ']) {

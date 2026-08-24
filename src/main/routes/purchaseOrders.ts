@@ -1,4 +1,5 @@
 import { Router } from 'express'
+import { lockPurchaseOrder } from '../domain/billing'
 import { prisma } from '../prisma'
 import { requireAuth } from '../http/middleware'
 import { pageArgs } from '../http/respond'
@@ -354,6 +355,11 @@ router.post('/api/v1/purchase-orders/:id/receive', requireAuth(['SUPER_ADMIN']),
     }
 
     const result = await prisma.$transaction(async (tx) => {
+      // Hold the order for the rest of the transaction. Without this, two
+      // deliveries booked at the same moment both read the same outstanding
+      // quantity and both received in full — two batches for one delivery,
+      // and stock on the books that never arrived.
+      await lockPurchaseOrder(tx, id)
       const order = await tx.purchaseOrder.findUnique({
         where: { id },
         include: { items: { include: { product: true } } }
