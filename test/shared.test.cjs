@@ -106,6 +106,21 @@ check('landline rejected for customer', !V.validateMobile('02242345678').ok)
 check('email lowercased', V.validateEmail('A@B.COM').value === 'a@b.com')
 check('bad email rejected', !V.validateEmail('nope@').ok)
 check('item code valid', V.validateItemCode('WIRE-HAV-1.5-RED').ok)
+
+// A MAC comes back from the operating system in whatever spelling it likes.
+check('a MAC is canonicalised', V.normalizeMac('de:ad:be:ef:99:01') === 'DE:AD:BE:EF:99:01')
+check('...from dashes', V.normalizeMac('de-ad-be-ef-99-01') === 'DE:AD:BE:EF:99:01')
+check('...from no separators', V.normalizeMac('deadbeef9901') === 'DE:AD:BE:EF:99:01')
+check('...ignoring surrounding space', V.normalizeMac('  DE:AD:BE:EF:99:01  ') === 'DE:AD:BE:EF:99:01')
+check('every spelling of one address agrees', (() => {
+  const forms = ['de:ad:be:ef:99:01', 'DE:AD:BE:EF:99:01', 'De-Ad-Be-Ef-99-01', 'deadbeef9901']
+  return new Set(forms.map(V.normalizeMac)).size === 1
+})())
+check('two different addresses stay different',
+  V.normalizeMac('de:ad:be:ef:99:01') !== V.normalizeMac('de:ad:be:ef:99:02'))
+check('something that is not a MAC is left recognisable',
+  V.normalizeMac('RETIRED:abc') === 'RETIRED:ABC')
+check('an empty MAC stays empty', V.normalizeMac('') === '')
 check('single char item code rejected', !V.validateItemCode('A').ok)
 
 // A code goes on receipts and batch labels, so what was typed is what is

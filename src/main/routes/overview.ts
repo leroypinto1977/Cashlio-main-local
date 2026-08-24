@@ -1,6 +1,7 @@
 import { Router } from 'express'
 import { prisma } from '../prisma'
 import { getServerMac } from '../machineId'
+import { normalizeMac } from '../../shared/validation'
 import { requireAuth } from '../http/middleware'
 import { istMidnight } from '../domain/dates'
 import { getLicenseStatus, checkClockTamper, refreshLicenseOnce } from '../licenseGuard'
@@ -48,7 +49,10 @@ router.get('/api/v1/system/stats', requireAuth(), async (_req, res) => {
 
 router.get('/api/v1/system/self-device-id', requireAuth(), async (_req, res) => {
   try {
-    const mac = getServerMac()
+    // Same canonical spelling as pairing uses, or the manager's own machine
+    // gets a second device row the first time the OS reports its MAC
+    // differently.
+    const mac = normalizeMac(getServerMac())
     let client = await prisma.authorizedClient.findUnique({ where: { macAddress: mac } })
     if (!client) {
       client = await prisma.authorizedClient.create({

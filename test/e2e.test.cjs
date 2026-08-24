@@ -1104,6 +1104,55 @@ async function api(path, opts = {}, token) {
     t('the shop is trading again for the rest of the suite', !st.locked, st)
   }
 
+  console.log('\n— the same account, however it is typed —')
+  {
+    for (const spelling of ['admin', 'Admin', 'ADMIN', '  admin  ']) {
+      const r = await api('/api/v1/auth/login', { method: 'POST', body: JSON.stringify({
+        username: spelling, password: 'password123' }) })
+      t(`"${spelling}" signs in`, r.status === 200 && Boolean(r.body.token), r.body)
+    }
+    // The wrong password is still the wrong password, whatever the casing.
+    const bad = await api('/api/v1/auth/login', { method: 'POST', body: JSON.stringify({
+      username: 'ADMIN', password: 'not-the-password' }) })
+    eqp('a wrong password is still refused', bad.status, 401)
+  }
+
+  console.log('\n— one device, one till —')
+  {
+    // Free a seat so the licence limit cannot mask a duplicate.
+    const existing = (await api('/api/v1/system/authorized-clients', {}, token)).body.clients
+    for (const c of existing.slice(1)) {
+      await api(`/api/v1/system/authorized-clients/${c.id}`, { method: 'DELETE' }, token)
+    }
+    const before = (await api('/api/v1/system/authorized-clients', {}, token)).body.clients.length
+
+    const lower = await api('/api/v1/system/pair-client', { method: 'POST', body: JSON.stringify({
+      macAddress: 'de:ad:be:ef:77:01', friendlyName: 'Casing Till' })}, token)
+    t('a till pairs', lower.status === 200, lower.body)
+
+    for (const [label, spelling] of [
+      ['in upper case', 'DE:AD:BE:EF:77:01'],
+      ['with dashes', 'de-ad-be-ef-77-01'],
+      ['with no separators', 'deadbeef7701']
+    ]) {
+      const again = await api('/api/v1/system/pair-client', { method: 'POST', body: JSON.stringify({
+        macAddress: spelling, friendlyName: 'Casing Till' })}, token)
+      t(`...and pairing again ${label} is the same till`,
+        again.status === 200 && again.body.clientId === lower.body.clientId, again.body)
+      t(`...keeping its terminal code`, again.body.terminalCode === lower.body.terminalCode,
+        { first: lower.body.terminalCode, again: again.body.terminalCode })
+    }
+
+    const after = (await api('/api/v1/system/authorized-clients', {}, token)).body.clients
+    eqp('one device took one seat, not four', after.length - before, 1)
+    t('...stored in one canonical spelling',
+      after.some((c) => c.macAddress === 'DE:AD:BE:EF:77:01'), after.map((c) => c.macAddress))
+
+    const nonsense = await api('/api/v1/system/pair-client', { method: 'POST', body: JSON.stringify({
+      macAddress: '', friendlyName: 'Nameless' })}, token)
+    eqp('a till that cannot identify itself is refused', nonsense.status, 400)
+  }
+
   console.log('\n— a brand list that cannot drift —')
   {
     const made = await api('/api/v1/brands', { method: 'POST', body: JSON.stringify({ name: 'Finolex' }) }, token)
@@ -1223,21 +1272,21 @@ async function api(path, opts = {}, token) {
     const before = await total()
 
     // A till exists and has never said how far it has read, so nothing goes.
-    await prisma.authorizedClient.update({
-      where: { id: device.id }, data: { syncCursorTxid: null } })
+    await prisma.authorizedClient.updateMany({
+      where: { retiredAt: null }, data: { syncCursorTxid: null } })
     let pruned = await pruneSyncEvents()
     eqp('nothing is deleted while a till has not reported', pruned.deleted, 0)
     eqp('...and the log is untouched', await total(), before)
 
     // It reports a cursor behind the old rows — still nothing to delete.
-    await prisma.authorizedClient.update({
-      where: { id: device.id }, data: { syncCursorTxid: 0 } })
+    await prisma.authorizedClient.updateMany({
+      where: { retiredAt: null }, data: { syncCursorTxid: 0 } })
     pruned = await pruneSyncEvents()
     eqp('nothing is deleted below a till that is behind', pruned.deleted, 0)
 
     // It catches up past them, and only then do they go.
-    await prisma.authorizedClient.update({
-      where: { id: device.id }, data: { syncCursorTxid: 5 } })
+    await prisma.authorizedClient.updateMany({
+      where: { retiredAt: null }, data: { syncCursorTxid: 5 } })
     pruned = await pruneSyncEvents()
     eqp('old rows every till has read are deleted', pruned.deleted, 2)
     eqp('...and only those', await total(), before - 2)
