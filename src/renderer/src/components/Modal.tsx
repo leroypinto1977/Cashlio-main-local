@@ -10,6 +10,18 @@ type ModalProps = {
 }
 
 export function Modal({ open, onClose, title, children, size = 'md' }: ModalProps) {
+  // Escape closes it. Clicking the backdrop already did, but the keyboard is
+  // faster than the mouse at a counter, and a dialog that ignores Escape reads
+  // as stuck.
+  React.useEffect(() => {
+    if (!open) return undefined
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [open, onClose])
+
   if (!open) return null
 
   const sizeClass = { sm: 'max-w-sm', md: 'max-w-2xl', lg: 'max-w-3xl' }[size]
