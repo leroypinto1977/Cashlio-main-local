@@ -31,6 +31,8 @@ export type ProductSyncRow = {
   warrantyPeriodDays: number
   minStockLevel: number
   isActive: boolean
+  /** Every code this product can be scanned by, primary first. */
+  barcodes: string[]
   totalStock: number
 }
 
@@ -84,7 +86,10 @@ export async function buildProductSyncPayload(
   tx: TxClient,
   productId: string
 ): Promise<ProductSyncRow | null> {
-  const p = await tx.product.findUnique({ where: { id: productId } })
+  const p = await tx.product.findUnique({
+    where: { id: productId },
+    include: { barcodes: { select: { code: true, isPrimary: true }, orderBy: { isPrimary: 'desc' } } }
+  })
   if (!p) return null
   const agg = await tx.productBatch.aggregate({
     where: { productId, isActive: true, currentQty: { gt: 0 } },
@@ -105,6 +110,9 @@ export async function buildProductSyncPayload(
     warrantyPeriodDays: p.warrantyPeriodDays,
     minStockLevel: Number(p.minStockLevel),
     isActive: p.isActive,
+    // The till scans offline, so the codes travel with the product rather than
+    // being looked up over the link that may not be there.
+    barcodes: p.barcodes.map((b: { code: string }) => b.code),
     totalStock: roundQty(Number(agg._sum.currentQty ?? 0))
   }
 }

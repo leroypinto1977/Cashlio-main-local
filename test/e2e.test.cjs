@@ -1819,6 +1819,102 @@ async function api(path, opts = {}, token) {
     t('a cashier may read the day book they are counting against', r.status === 200, r.status)
   }
 
+  // ── barcodes ─────────────────────────────────────────────────────────────
+  // The till promises "scan barcode or search"; these check the scan half is
+  // real, resolves to exactly one product, and refuses codes that cannot be.
+  console.log('\n— a scanner finds one product, or nothing —')
+  {
+    const mkProd = (body) => api('/api/v1/products', { method: 'POST', body: JSON.stringify(body) }, token)
+
+    r = await mkProd({ itemCode: 'BC-LAMP-01', name: 'LED Lamp 9W', categoryId: cat.id,
+      sellingRate: 120, gstPercentage: 12, barcodes: ['8901058000108'] })
+    t('a product can be created with a barcode', r.status === 201, r.body)
+    const lamp = r.body.product
+
+    r = await api('/api/v1/products/by-barcode/8901058000108', {}, token)
+    t('scanning it finds the product', r.body.product?.id === lamp.id, r.body)
+    eqp('with the stock figure the till needs', r.body.product.totalStock, 0)
+
+    // The same physical item under a second manufacturer code.
+    r = await api(`/api/v1/products/${lamp.id}`, { method: 'PUT', body: JSON.stringify({
+      barcodes: ['8901058000108', { code: '4006381333931', isPrimary: true }] })}, token)
+    t('a second code can be added', r.status === 200, r.body)
+    r = await api('/api/v1/products/by-barcode/4006381333931', {}, token)
+    t('and it finds the same product', r.body.product?.id === lamp.id, r.body)
+    r = await api('/api/v1/products/by-barcode/8901058000108', {}, token)
+    t('without losing the first', r.body.product?.id === lamp.id, r.body)
+
+    r = await api(`/api/v1/products/${lamp.id}`, {}, token)
+    t('the product carries both', r.body.product.barcodes.length === 2, r.body.product.barcodes)
+    t('and only one is primary',
+      r.body.product.barcodes.filter((b) => b.isPrimary).length === 1, r.body.product.barcodes)
+    t('the primary is the one that was flagged',
+      r.body.product.barcodes.find((b) => b.isPrimary)?.code === '4006381333931', r.body.product.barcodes)
+
+    // A code can only belong to one product, and the refusal has to say which.
+    r = await mkProd({ itemCode: 'BC-LAMP-02', name: 'LED Lamp 12W', categoryId: cat.id,
+      sellingRate: 160, gstPercentage: 12, barcodes: ['8901058000108'] })
+    t('a barcode cannot be given to a second product',
+      r.status === 409 && r.body.error === 'BARCODE_TAKEN', r.body)
+    t('...and the refusal names the product holding it',
+      /LED Lamp 9W/.test(r.body.message || '') && /BC-LAMP-01/.test(r.body.message || ''), r.body.message)
+
+    // A mistyped GTIN is a typo, not a shop code.
+    r = await mkProd({ itemCode: 'BC-BAD-01', name: 'Bad Barcode Item', categoryId: cat.id,
+      sellingRate: 10, gstPercentage: 0, barcodes: ['8901058000107'] })
+    t('a barcode whose check digit is wrong is refused',
+      r.status === 400 && r.body.error === 'BARCODE_CHECK_DIGIT', r.body)
+    t('...saying what the digit should have been', /should be 8/.test(r.body.message || ''), r.body.message)
+
+    // A shop's own code has no check digit to fail.
+    r = await mkProd({ itemCode: 'BC-LOOSE-01', name: 'Loose Wire (per metre)', categoryId: cat.id,
+      sellingRate: 22, gstPercentage: 18, barcodes: ['loose-wire-red'] })
+    t('a shop code is accepted', r.status === 201, r.body)
+    r = await api('/api/v1/products/by-barcode/loose-wire-red', {}, token)
+    t('and scans case-insensitively', r.body.product?.itemCode === 'BC-LOOSE-01', r.body)
+
+    r = await mkProd({ itemCode: 'BC-DUP-01', name: 'Duplicate List', categoryId: cat.id,
+      sellingRate: 10, gstPercentage: 0, barcodes: ['96385074', '96385074'] })
+    t('the same code twice in one list is refused',
+      r.status === 400 && r.body.error === 'BARCODE_REPEATED', r.body)
+
+    r = await api('/api/v1/products/by-barcode/00000000000000000', {}, token)
+    t('an unknown code is a clean miss',
+      r.status === 404 && r.body.error === 'BARCODE_NOT_FOUND', r.body)
+    t('...naming the code, so the counter can read it back',
+      (r.body.message || '').includes('00000000000000000'), r.body.message)
+
+    // Searching by a barcode has to match the whole code, never part of one.
+    r = await api('/api/v1/products?search=4006381333931&slim=true', {}, token)
+    t('a full barcode searches to its product',
+      r.body.products.length === 1 && r.body.products[0].id === lamp.id, r.body.products?.length)
+    r = await api('/api/v1/products?search=400638&slim=true', {}, token)
+    t('half a barcode matches nothing', r.body.products.length === 0, r.body.products?.length)
+
+    // Discontinuing a product must not leave its code silently sellable.
+    await api(`/api/v1/products/${lamp.id}`, { method: 'PUT', body: JSON.stringify({ isActive: false }) }, token)
+    r = await api('/api/v1/products/by-barcode/4006381333931', {}, token)
+    t('a discontinued product is refused, not returned',
+      r.status === 404 && r.body.error === 'PRODUCT_DISCONTINUED', r.body)
+    t('...and says which product it was', /LED Lamp 9W/.test(r.body.message || ''), r.body.message)
+    await api(`/api/v1/products/${lamp.id}`, { method: 'PUT', body: JSON.stringify({ isActive: true }) }, token)
+
+    // Clearing the list frees the codes for another product.
+    r = await api(`/api/v1/products/${lamp.id}`, { method: 'PUT', body: JSON.stringify({ barcodes: [] }) }, token)
+    t('the codes can be cleared', r.body.product !== undefined, r.body)
+    r = await api('/api/v1/products/by-barcode/8901058000108', {}, token)
+    t('after which the code finds nothing', r.status === 404, r.status)
+    r = await mkProd({ itemCode: 'BC-LAMP-03', name: 'LED Lamp 15W', categoryId: cat.id,
+      sellingRate: 190, gstPercentage: 12, barcodes: ['8901058000108'] })
+    t('and is free for another product', r.status === 201, r.body)
+
+    // The terminal scans offline, so the codes have to reach it.
+    const ev = await prisma.syncEvent.findFirst({
+      where: { entity: 'product', entityId: r.body.product.id }, orderBy: { id: 'desc' } })
+    t('a product syncs to the till with its barcodes',
+      (ev?.payload?.barcodes || []).includes('8901058000108'), ev?.payload?.barcodes)
+  }
+
   console.log(`\n${pass} passed, ${fail} failed`)
   await prisma.$disconnect()
   process.exit(fail ? 1 : 0)

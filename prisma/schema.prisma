@@ -227,6 +227,31 @@ model Product {
   category           Category            @relation(fields: [categoryId], references: [id])
   batches            ProductBatch[]
   suppliers          ProductSupplier[]
+  barcodes           ProductBarcode[]
+}
+
+/// The codes a scanner can find this product by.
+///
+/// A table rather than a column on Product because the same item genuinely
+/// carries more than one: a manufacturer changes its EAN between runs, the
+/// same switch arrives from two suppliers under two codes, and loose goods get
+/// a code the shop prints itself. With one column the second code scans to
+/// nothing, and the only way out is a duplicate product — which splits the
+/// stock and the sales history of one thing in two.
+model ProductBarcode {
+  id        String   @id @default(uuid())
+  productId String
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  /// Globally unique: a scan has to resolve to exactly one product, or the
+  /// till has to stop and ask, which is the delay scanning exists to avoid.
+  /// Stored as `validateBarcode` returns it — uppercased — so the plain unique
+  /// index is a case-insensitive one in practice.
+  code      String   @unique
+  /// The one shown against the product and printed on a shelf label.
+  isPrimary Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([productId])
 }
 
 model ProductBatch {

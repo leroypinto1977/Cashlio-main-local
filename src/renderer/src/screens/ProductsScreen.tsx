@@ -2,13 +2,13 @@ import React, { useState, useEffect, useCallback } from 'react'
 import {
   Package, Plus, Search, Edit2, Trash2, ArrowLeft,
   ChevronRight, Tag, Layers, AlertCircle, Box, RefreshCw,
-  Archive, RotateCcw, Wand2, EyeOff, Bookmark
+  Archive, RotateCcw, Wand2, EyeOff, Bookmark, X, ScanLine
 } from 'lucide-react'
 import { Button } from '../components/ui/button'
 import { Input } from '../components/ui/input'
 import { Modal } from '../components/Modal'
 import { apiFetch } from '../lib/api'
-import { validateItemCode, suggestItemCodeFix, validateHsn, ITEM_CODE_HINT, validateName } from '@shared/validation'
+import { validateItemCode, suggestItemCodeFix, validateHsn, ITEM_CODE_HINT, validateName, validateBarcode, barcodeKind } from '@shared/validation'
 import {
   type SellMode, measuresFor, defaultMeasureFor, isLengthMode,
   qtyStep, parseQty, formatQty, formatQtyWithUnit, computePurchaseCost
@@ -58,6 +58,7 @@ type Product = {
   gstPercentage: number
   warrantyPeriodDays: number
   hsnCode?: string | null
+  barcodes?: { code: string; isPrimary: boolean }[]
   minStockLevel: number
   isActive: boolean
   totalStock: number
@@ -83,6 +84,8 @@ type ProductForm = {
   warrantyValue: string
   warrantyUnit: WarrantyUnit
   minStockLevel: string
+  /** Primary first — the order they are shown and saved in. */
+  barcodes: string[]
 }
 
 type StatusFilter = 'active' | 'inactive' | 'all'
@@ -103,7 +106,7 @@ const emptyProductForm = (): ProductForm => ({
   itemCode: '', brandId: '', name: '', specification: '',
   categoryId: '', productType: '', unitOfMeasure: defaultMeasureFor('UNIT'),
   sellMode: 'UNIT', sellingRate: '0', gstPercentage: '0', hsnCode: '',
-  warrantyValue: '0', warrantyUnit: 'days', minStockLevel: '0'
+  warrantyValue: '0', warrantyUnit: 'days', minStockLevel: '0', barcodes: []
 })
 
 const emptyBatchForm = (gstPct: number = 0): BatchForm => ({
@@ -111,6 +114,122 @@ const emptyBatchForm = (gstPct: number = 0): BatchForm => ({
   receivedQty: '', supplierId: '', warehouseId: '',
   receivedDate: new Date().toISOString().slice(0, 10), notes: ''
 })
+
+/**
+ * The codes a scanner can find this product by.
+ *
+ * A list rather than a field because the same item really does carry more than
+ * one code, and the alternative — a duplicate product for the second code —
+ * splits its stock and its sales history in two.
+ *
+ * The input is built for a scanner: they type the code and press Enter, so
+ * Enter adds and the box clears itself ready for the next one. Nothing is
+ * corrected silently; a code that fails its check digit is refused and told
+ * what the digit should have been, because a scanner does not make that
+ * mistake and a person retyping from the label does.
+ */
+function BarcodeEditor({
+  codes,
+  onChange
+}: {
+  codes: string[]
+  onChange: (next: string[]) => void
+}): React.JSX.Element {
+  const [entry, setEntry] = useState('')
+  const [problem, setProblem] = useState('')
+
+  const add = (): void => {
+    const check = validateBarcode(entry)
+    if (!check.ok) {
+      setProblem(check.message)
+      return
+    }
+    if (codes.includes(check.value)) {
+      setProblem(`${check.value} is already on this product.`)
+      return
+    }
+    onChange([...codes, check.value])
+    setEntry('')
+    setProblem('')
+  }
+
+  return (
+    <div>
+      <label className="flex items-center gap-1.5 text-sm font-semibold mb-1.5 ml-1">
+        <ScanLine className="w-4 h-4" /> Barcodes
+      </label>
+
+      {codes.length > 0 && (
+        <div className="space-y-1.5 mb-2">
+          {codes.map((code, i) => (
+            <div key={code} className="flex items-center gap-2 rounded-md border px-3 py-2">
+              <span className="font-mono text-sm flex-1 truncate">{code}</span>
+              <span className="text-[11px] px-1.5 py-0.5 rounded bg-zinc-100 text-zinc-600 shrink-0">
+                {barcodeKind(code)}
+              </span>
+              {i === 0 ? (
+                <span className="text-[11px] px-1.5 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200 shrink-0">
+                  Primary
+                </span>
+              ) : (
+                <button
+                  type="button"
+                  className="text-[11px] text-muted-foreground hover:text-zinc-900 shrink-0"
+                  onClick={() => onChange([code, ...codes.filter((c) => c !== code)])}
+                >
+                  Make primary
+                </button>
+              )}
+              <button
+                type="button"
+                aria-label={`Remove ${code}`}
+                className="text-muted-foreground hover:text-red-600 shrink-0"
+                onClick={() => onChange(codes.filter((c) => c !== code))}
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="flex gap-2">
+        <Input
+          value={entry}
+          onChange={(e) => {
+            setEntry(e.target.value)
+            if (problem) setProblem('')
+          }}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              // A scanner sends Enter itself. Without this the form would
+              // submit instead, saving the product half-typed.
+              e.preventDefault()
+              add()
+            }
+          }}
+          placeholder="Scan a barcode, or type one"
+          className={`h-11 font-mono ${problem ? 'border-red-400 focus-visible:ring-red-300' : ''}`}
+          aria-invalid={problem ? true : undefined}
+        />
+        <Button type="button" variant="outline" className="h-11 shrink-0" onClick={add} disabled={!entry.trim()}>
+          Add
+        </Button>
+      </div>
+
+      {problem ? (
+        <p className="text-xs text-red-600 mt-1 ml-1">{problem}</p>
+      ) : (
+        <p className="text-xs text-muted-foreground mt-1 ml-1">
+          {codes.length === 0
+            ? 'Optional. Add one and the till can scan straight to this product.'
+            : 'The primary code is the one shown on the product and printed on a shelf label.'}
+        </p>
+      )}
+    </div>
+  )
+}
+
 
 // ─── Warranty helpers ─────────────────────────────────────────────────────────
 
@@ -371,6 +490,8 @@ export function ProductsScreen({ token }: { token: string | null }) {
     setProductForm({
       itemCode: p.itemCode, brandId: p.brandId || '', name: p.name,
       hsnCode: p.hsnCode || '',
+      // Primary first, so the leading code stays the leading code on save.
+      barcodes: [...(p.barcodes ?? [])].sort((a, b) => Number(b.isPrimary) - Number(a.isPrimary)).map((b) => b.code),
       specification: p.specification || '', categoryId: p.categoryId,
       productType: p.productType || '',
       unitOfMeasure: measuresFor(mode).includes(p.unitOfMeasure)
@@ -438,6 +559,8 @@ export function ProductsScreen({ token }: { token: string | null }) {
         sellingRate: parseFloat(productForm.sellingRate) || 0,
         gstPercentage: parseFloat(productForm.gstPercentage) || 0,
         hsnCode: productForm.hsnCode.trim(),
+        // The first code leads; the server settles the primary flag from that.
+        barcodes: productForm.barcodes.map((code, i) => ({ code, isPrimary: i === 0 })),
         warrantyPeriodDays: warrantyToDays(productForm.warrantyValue, productForm.warrantyUnit),
         minStockLevel: parseQty(productForm.minStockLevel, productForm.sellMode)
       }
@@ -460,6 +583,10 @@ export function ProductsScreen({ token }: { token: string | null }) {
         setProductFormError(e.data.message || 'Item code can no longer be changed for this product.')
       } else if (e.data?.error === 'ITEM_CODE_EXISTS') {
         setProductFormError(e.data.message || 'Item code already exists.')
+      } else if (e.data?.error === 'BARCODE_TAKEN') {
+        setProductFormError(e.data.message || 'That barcode already belongs to another product.')
+      } else if (e.data?.error?.startsWith('BARCODE_')) {
+        setProductFormError(e.data.message || 'That barcode cannot be used.')
       } else if (e.data?.error === 'BRAND_NOT_FOUND') {
         // The brand list is stale — refresh it so the picker matches the server.
         await loadBrands()
@@ -1778,6 +1905,7 @@ function ProductFormFields({
             </p>
           )}
         </div>
+        <BarcodeEditor codes={form.barcodes} onChange={(next) => set('barcodes', next)} />
         <div className="grid grid-cols-2 gap-3">
           <div>
             <label className="block text-sm font-semibold mb-1.5 ml-1">Warranty</label>
