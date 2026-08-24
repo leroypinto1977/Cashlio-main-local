@@ -35,6 +35,7 @@ import { BillingScreen } from './screens/BillingScreen'
 import { SalesScreen } from './screens/SalesScreen'
 import { AnalyticsScreen } from './screens/AnalyticsScreen'
 import { BackupSettings } from './components/BackupSettings'
+import { ReceiptPrinterSettings } from './components/ReceiptPrinterSettings'
 import { ShopProfileSettings } from './components/ShopProfileSettings'
 import { UserSettings } from './components/UserSettings'
 import axios from 'axios'
@@ -877,6 +878,9 @@ function App(): React.JSX.Element {
                 <p className="text-xs font-semibold text-zinc-500 uppercase tracking-wide">Database</p>
                 <p className="text-sm text-zinc-700">Local PostgreSQL — managed by Prisma ORM</p>
                 <p className="text-xs text-zinc-400 mt-1">All data is stored locally on this machine. No cloud sync in this phase.</p>
+              </div>
+              <div className="col-span-2">
+                <ReceiptPrinterSettings />
               </div>
               <div className="col-span-2">
                 <BackupSettings />

@@ -18,6 +18,7 @@ const INVOKE_CHANNELS = [
   'get-machine-id',
   'get-cert-fingerprint',
   'print-receipt',
+  'printer:list',
   'backup:status',
   'backup:list',
   'backup:run',

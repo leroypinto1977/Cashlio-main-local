@@ -1,7 +1,6 @@
-// Receipt rendering — produces an 80mm-thermal-friendly HTML document
-// for the bill that just got saved (or any historical bill).
-// The same HTML prints acceptably on A4 fallback because @page sizing
-// scales naturally; widths are in mm.
+// Receipt rendering — produces a thermal-roll HTML document for the bill that
+// just got saved (or any historical bill). Widths are in mm, so the same HTML
+// prints acceptably on an A4 fallback: @page sizing scales naturally.
 
 export type ReceiptShop = {
   name: string
@@ -56,11 +55,74 @@ export type ReceiptBill = {
   items: ReceiptItem[]
 }
 
+/** Roll widths a counter printer takes. 80mm is the common one; 58mm is the
+ *  small handheld roll. Both are sold by their *paper* width — the printable
+ *  strip is narrower, and printing to the paper width clips the edges. */
+export const PAPER_WIDTHS = [80, 58] as const
+export type PaperWidth = (typeof PAPER_WIDTHS)[number]
+
+const PAPER: Record<PaperWidth, { printable: number; fontPx: number; totalPx: number }> = {
+  80: { printable: 72, fontPx: 11, totalPx: 13 },
+  58: { printable: 48, fontPx: 9, totalPx: 11 }
+}
+
 export type ReceiptOptions = {
   /** Inject `window.print()` on load so opening the doc auto-prints. */
   autoPrint?: boolean
   /** Optional copy label (e.g. "DUPLICATE", "REPRINT"). */
   copyLabel?: string
+  /** Roll width to lay the receipt out for. Defaults to 80mm. */
+  paperWidthMm?: PaperWidth
+}
+
+/** Where this machine's counter printer is configured. Per-machine, because
+ *  the printer is plugged into this counter and not into the shop. */
+const PRINTER_KEY = 'cashlio_receipt_printer'
+
+export type PrinterSettings = {
+  /** Empty means "ask me" — the OS dialog, which is the default. */
+  deviceName: string
+  paperWidthMm: PaperWidth
+}
+
+export function readPrinterSettings(): PrinterSettings {
+  try {
+    const raw = localStorage.getItem(PRINTER_KEY)
+    if (!raw) return { deviceName: '', paperWidthMm: 80 }
+    const p = JSON.parse(raw) as Partial<PrinterSettings>
+    const width = PAPER_WIDTHS.includes(p.paperWidthMm as PaperWidth)
+      ? (p.paperWidthMm as PaperWidth)
+      : 80
+    return { deviceName: String(p.deviceName ?? ''), paperWidthMm: width }
+  } catch {
+    return { deviceName: '', paperWidthMm: 80 }
+  }
+}
+
+export function writePrinterSettings(s: PrinterSettings): void {
+  try {
+    localStorage.setItem(PRINTER_KEY, JSON.stringify(s))
+  } catch {
+    // A till with storage disabled still prints, it just asks every time.
+  }
+}
+
+export type Printer = { name: string; displayName: string; isDefault: boolean }
+
+/** The printers this machine can see. Empty outside Electron. */
+export async function listPrinters(): Promise<Printer[]> {
+  const ipc = (window as unknown as {
+    electron?: { ipcRenderer?: { invoke?: (ch: string, ...a: unknown[]) => Promise<unknown> } }
+  }).electron?.ipcRenderer
+  if (!ipc?.invoke) return []
+  try {
+    const res = await ipc.invoke('printer:list')
+    // An older main process answers this channel with something else entirely;
+    // a list is the only shape worth trusting.
+    return Array.isArray(res) ? (res as Printer[]) : []
+  } catch {
+    return []
+  }
 }
 
 const fmt = (n: number): string =>
@@ -81,6 +143,12 @@ export function buildReceiptHtml(
   bill: ReceiptBill,
   opts: ReceiptOptions = {}
 ): string {
+  const paperWidth: PaperWidth = opts.paperWidthMm === 58 ? 58 : 80
+  const paper = PAPER[paperWidth]
+  // Half the difference on each side, so the printable strip sits centred on
+  // the roll rather than hard against one edge.
+  const sidePadMm = Math.round(((paperWidth - paper.printable) / 2) * 10) / 10
+
   const date = bill.paidAt ? new Date(bill.paidAt) : new Date()
   const dateStr = date.toLocaleString('en-IN', { hour12: true })
 
@@ -154,7 +222,7 @@ export function buildReceiptHtml(
   <td colspan="2" class="name">${esc(it.productName)}</td>
 </tr>
 <tr class="item-meta">
-  <td class="sm">${esc(it.itemCode)}${hsn} · ${esc(lineRate)}</td>
+  <td class="sm">${esc(it.itemCode)}${hsn} · <span class="qty">${esc(lineRate)}</span></td>
   <td class="tot">₹${fmt(it.lineTotal)}</td>
 </tr>`
     })
@@ -179,38 +247,48 @@ export function buildReceiptHtml(
 <meta charset="utf-8">
 <title>Receipt ${esc(bill.billNumber)}</title>
 <style>
-  @page { margin: 0; size: 80mm auto; }
+  @page { margin: 0; size: ${paperWidth}mm auto; }
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; }
+  /* Explicit, so the document does not inherit a dark background from
+     whatever is rendering it — the receipt is black on white paper. */
+  html { background: #fff; }
   body {
     font-family: 'Menlo', 'Courier New', monospace;
-    font-size: 11px;
+    font-size: ${paper.fontPx}px;
     line-height: 1.35;
     color: #000;
-    padding: 4mm 3mm;
-    width: 80mm;
+    background: #fff;
+    /* The side padding is what keeps the text inside the printable strip;
+       printing to the paper width shaves the first and last character off
+       every line. */
+    padding: 4mm ${sidePadMm}mm;
+    width: ${paperWidth}mm;
   }
   .center { text-align: center; }
   .right  { text-align: right; }
   .bold   { font-weight: 700; }
-  .lg     { font-size: 14px; }
-  .sm     { font-size: 9.5px; }
+  .lg     { font-size: ${paper.fontPx + 3}px; }
+  .sm     { font-size: ${paper.fontPx - 1.5}px; }
   .muted  { color: #444; }
   hr { border: none; border-top: 1px dashed #000; margin: 4px 0; }
   table { width: 100%; border-collapse: collapse; }
   td { padding: 1px 0; vertical-align: top; }
-  td.tot { text-align: right; white-space: nowrap; padding-left: 4px; width: 60px; }
+  td.tot { text-align: right; white-space: nowrap; padding-left: 4px; width: ${paperWidth === 58 ? 48 : 60}px; }
   td.name { word-break: break-word; padding-top: 3px; font-weight: 600; }
   tr.item-meta td { color: #222; padding-bottom: 3px; }
+  /* The quantity and the rate are one expression. On a narrow roll the line
+     wraps, and it has to wrap before "3 × ₹59.00" rather than through it. */
+  .qty { white-space: nowrap; }
   .row { display: flex; justify-content: space-between; gap: 6px; padding: 1px 0; }
   .row .lbl { color: #222; }
-  .grand { font-size: 13px; font-weight: 700; border-top: 1px dashed #000; padding-top: 4px; margin-top: 3px; }
+  .grand { font-size: ${paper.totalPx}px; font-weight: 700; border-top: 1px dashed #000; padding-top: 4px; margin-top: 3px; }
   .banner { text-align: center; font-weight: 700; border: 1px dashed #000; padding: 3px; margin: 4px 0; letter-spacing: 1px; }
   .banner.void { color: #b00; border-color: #b00; }
   .banner.ret  { color: #964; border-color: #964; }
-  .footer { text-align: center; font-size: 9.5px; margin-top: 8px; }
+  .footer { text-align: center; font-size: ${paper.fontPx - 1.5}px; margin-top: 8px; }
   .doctype { letter-spacing: 2px; font-weight: 700; margin-top: 2px; }
-  .balance { font-size: 12px; font-weight: 700; border-top: 1px dashed #000; padding-top: 3px; margin-top: 3px; }
+  .balance { font-size: ${paper.totalPx - 1}px; font-weight: 700; border-top: 1px dashed #000; padding-top: 3px; margin-top: 3px; }
   table.gst td { padding: 1px 0; }
   table.gst thead td { border-bottom: 1px dashed #000; font-weight: 600; }
   @media print { body { width: auto; padding: 2mm; } }
@@ -303,11 +381,21 @@ export async function printReceipt(
   bill: ReceiptBill,
   opts: ReceiptOptions = {}
 ): Promise<PrintReceiptResult> {
-  const html = buildReceiptHtml(shop, bill, { ...opts, autoPrint: true })
+  const printer = readPrinterSettings()
+  const paperWidthMm = opts.paperWidthMm ?? printer.paperWidthMm
+  const html = buildReceiptHtml(shop, bill, { ...opts, paperWidthMm, autoPrint: true })
   const ipc = (window as unknown as { electron?: { ipcRenderer?: { invoke?: (ch: string, ...a: unknown[]) => Promise<unknown> } } }).electron?.ipcRenderer
   if (ipc?.invoke) {
     try {
-      const result = (await ipc.invoke('print-receipt', { html, billNumber: bill.billNumber })) as PrintReceiptResult
+      const result = (await ipc.invoke('print-receipt', {
+        html,
+        billNumber: bill.billNumber,
+        // With a printer chosen the receipt goes straight to it. Without one
+        // the OS dialog still opens, which is the right default: a shop that
+        // has not set a counter printer has not told us where to send paper.
+        deviceName: printer.deviceName || undefined,
+        paperWidthMm
+      })) as PrintReceiptResult
       return result ?? { ok: true }
     } catch (e) {
       return { ok: false, error: (e as Error).message || 'PRINT_FAILED' }
