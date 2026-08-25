@@ -5,10 +5,12 @@ import fs from 'fs'
 import dotenv from 'dotenv'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
-import { startExpressServer, startSyncEventPruning } from './server'
+import { startExpressServer, stopExpressServer, startSyncEventPruning } from './server'
 import { setBranchCertFingerprint } from './branchCert'
 import { ensureBranchCert, fingerprintOfPem, fingerprintsMatch } from './tls'
 import { registerPrintingIpc } from './printing'
+import { verifyBackup, testRestore, restoreOverLive, writeLastRestoreCheck } from './restore'
+import { prisma } from './prisma'
 import { runBackup, listBackups, getBackupStatus, getBackupDir, startBackupSchedule } from './backup'
 import { startRefreshLoop, checkClockTamper } from './licenseGuard'
 import { getMachineId } from './machineId'
@@ -212,6 +214,71 @@ app.whenReady().then(async () => {
   ipcMain.handle('backup:list', async () => listBackups())
   // Trigger a backup synchronously (caller awaits the result).
   ipcMain.handle('backup:run', async () => runBackup())
+  // Read a backup back without restoring it: is it complete, and unchanged?
+  ipcMain.handle('backup:verify', async (_e, fullPath: string) => verifyBackup(fullPath))
+
+  /**
+   * Restore a backup into a scratch database and report what came back. Safe:
+   * the real database is not touched, and the scratch copy is dropped either
+   * way. This is the check the schedule runs on its own each week.
+   */
+  ipcMain.handle('backup:test-restore', async (_e, fullPath: string) => {
+    const check = await testRestore(fullPath)
+    writeLastRestoreCheck(await getBackupDir(), check)
+    return check
+  })
+
+  /**
+   * Replace the live database with a backup, then restart.
+   *
+   * The server stops first so a sale cannot land in a database that is being
+   * dropped, and the app relaunches afterwards because every connection this
+   * process holds points at tables that no longer exist.
+   */
+  ipcMain.handle(
+    'backup:restore',
+    async (_e, args: { fullPath: string; confirmation: string }) => {
+      const cfg = await prisma.shopConfig.findFirst()
+      const branchName = cfg?.branchName ?? ''
+      if (!branchName) {
+        return {
+          ok: false,
+          error: 'NO_BRANCH',
+          message: 'This branch has no name set, so there is nothing to confirm against.'
+        }
+      }
+      if (args?.confirmation?.trim() !== branchName.trim()) {
+        return {
+          ok: false,
+          error: 'CONFIRMATION_MISMATCH',
+          message: `This replaces everything in the database with the contents of that file. Type the branch name — ${branchName} — to confirm.`
+        }
+      }
+      await stopExpressServer()
+      const result = await restoreOverLive({
+        dumpPath: args.fullPath,
+        confirmation: args.confirmation,
+        branchName,
+        takeSafetyBackup: async () => {
+          const r = await runBackup()
+          return r.ok ? { ok: true, fullPath: r.fullPath } : { ok: false, error: r.error }
+        }
+      })
+      if (result.ok) {
+        // Nothing in this process can be trusted to still be talking to the
+        // same database, so it starts again rather than carrying on.
+        setTimeout(() => {
+          app.relaunch()
+          app.exit(0)
+        }, 1500)
+      } else {
+        // Nothing was replaced, so the shop goes back to trading.
+        await startExpressServer(parseInt(process.env.LOCAL_SERVER_PORT || '52001'))
+      }
+      return result
+    }
+  )
+
   // Reveal backup folder in the OS file manager.
   ipcMain.handle('backup:open-folder', async () => {
     const dir = await getBackupDir()

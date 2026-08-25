@@ -22,6 +22,9 @@ const INVOKE_CHANNELS = [
   'backup:status',
   'backup:list',
   'backup:run',
+  'backup:verify',
+  'backup:test-restore',
+  'backup:restore',
   'backup:open-folder',
   'gst:save-return'
 ] as const
