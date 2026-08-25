@@ -6,6 +6,7 @@ import { pageArgs, MAX_PAGE, fieldError } from '../http/respond'
 import { allocateNumber, peekNumber } from '../domain/numbering'
 import { serializeBatch } from '../domain/serializers'
 import { resolveBrand, brandFields } from '../domain/brands'
+import { planBarcodes, applyBarcodes } from '../domain/barcodes'
 import { recordSync, emitProductUpsert } from '../syncEvents'
 import { validateName, validateItemCode, validateHsn } from '../../shared/validation'
 import { parseQty, roundQty, computePurchaseCost, defaultMeasureFor, measuresFor } from '../../shared/units'
@@ -42,7 +43,10 @@ router.get('/api/v1/products', requireAuth(), async (req, res) => {
         ? [
             { name: { contains: String(search), mode: 'insensitive' } },
             { itemCode: { contains: String(search), mode: 'insensitive' } },
-            { brand: { contains: String(search), mode: 'insensitive' } }
+            { brand: { contains: String(search), mode: 'insensitive' } },
+            // Exact, not `contains`: a scanned code is complete, and a partial
+            // match on a thirteen-digit number is a coincidence, not a result.
+            { barcodes: { some: { code: String(search).trim().toUpperCase() } } }
           ]
         : undefined
     }
@@ -55,6 +59,7 @@ router.get('/api/v1/products', requireAuth(), async (req, res) => {
         // The category is one row and the till shows it; the batches are the
         // expensive part, and only the manager screens read them.
         category: true,
+        barcodes: { select: { code: true, isPrimary: true }, orderBy: { isPrimary: 'desc' } },
         batches: {
           where: { isActive: true },
           orderBy: { createdAt: 'desc' },
@@ -110,6 +115,70 @@ router.get('/api/v1/products', requireAuth(), async (req, res) => {
   }
 })
 
+/**
+ * What a scanner just read.
+ *
+ * Separate from the search endpoint because a scan is not a search: it either
+ * names one product or it names nothing, and the till wants to know which
+ * without paging a result list. A miss returns 404 with the code, so the
+ * counter can say "that barcode is not on anything" rather than showing an
+ * empty list that looks like a slow network.
+ */
+router.get('/api/v1/products/by-barcode/:code', requireAuth(), async (req, res) => {
+  try {
+    const code = String(req.params.code ?? '').trim().toUpperCase()
+    if (!code) return res.status(400).json({ success: false, error: 'BARCODE_REQUIRED' })
+
+    const match = await prisma.productBarcode.findUnique({
+      where: { code },
+      include: {
+        product: {
+          include: {
+            category: { select: { id: true, name: true } },
+            barcodes: { select: { code: true, isPrimary: true }, orderBy: { isPrimary: 'desc' } },
+            batches: {
+              where: { isActive: true },
+              orderBy: { createdAt: 'desc' },
+              select: { id: true, batchCode: true, currentQty: true, purchaseRate: true }
+            }
+          }
+        }
+      }
+    })
+    if (!match) {
+      return res.status(404).json({
+        success: false,
+        error: 'BARCODE_NOT_FOUND',
+        code,
+        message: `No product carries the barcode ${code}.`
+      })
+    }
+    const p = match.product
+    if (!p.isActive) {
+      return res.status(404).json({
+        success: false,
+        error: 'PRODUCT_DISCONTINUED',
+        code,
+        message: `${p.name} carries that barcode, but it has been discontinued.`
+      })
+    }
+    return res.json({
+      success: true,
+      product: {
+        ...p,
+        totalStock: roundQty(p.batches.reduce((sum, b) => sum + Number(b.currentQty), 0)),
+        sellingRate: Number(p.sellingRate),
+        gstPercentage: Number(p.gstPercentage),
+        minStockLevel: Number(p.minStockLevel),
+        batches: p.batches.map((b) => ({ ...b, currentQty: Number(b.currentQty), purchaseRate: Number(b.purchaseRate) }))
+      }
+    })
+  } catch (err) {
+    console.error(err)
+    return res.status(500).json({ success: false, error: 'INTERNAL_SERVER_ERROR' })
+  }
+})
+
 router.get('/api/v1/products/:id', requireAuth(), async (req, res) => {
   try {
     const product = await prisma.product.findUnique({
@@ -117,6 +186,7 @@ router.get('/api/v1/products/:id', requireAuth(), async (req, res) => {
       include: {
         category: true,
         suppliers: { include: { supplier: true } },
+        barcodes: { select: { code: true, isPrimary: true }, orderBy: { isPrimary: 'desc' } },
         batches: {
           where: { isActive: true },
           orderBy: { createdAt: 'desc' },
@@ -150,7 +220,7 @@ router.post('/api/v1/products', requireAuth(['SUPER_ADMIN']), async (req, res) =
     const {
       itemCode, brand, brandId, name, specification, categoryId, productType,
       unitOfMeasure, sellMode, sellingRate, gstPercentage, warrantyPeriodDays, hsnCode,
-      minStockLevel, supplierIds
+      minStockLevel, supplierIds, barcodes
     } = req.body
 
     if (!itemCode || !name || !categoryId) {
@@ -163,6 +233,8 @@ router.post('/api/v1/products', requireAuth(['SUPER_ADMIN']), async (req, res) =
     if (!nameCheck.ok) return fieldError(res, nameCheck)
     const hsnCheck = validateHsn(String(hsnCode ?? ''))
     if (!hsnCheck.ok) return fieldError(res, hsnCheck)
+    const barcodePlan = planBarcodes(barcodes)
+    if (!barcodePlan.ok) return fieldError(res, barcodePlan)
 
     const mode = sellMode === 'LENGTH' ? 'LENGTH' : 'UNIT'
     const uom = measuresFor(mode).includes(String(unitOfMeasure))
@@ -197,6 +269,10 @@ router.post('/api/v1/products', requireAuth(['SUPER_ADMIN']), async (req, res) =
         },
         include: { category: true }
       })
+      const codes = await applyBarcodes(tx, created.id, barcodePlan.codes)
+      if (!codes.ok) {
+        throw Object.assign(new Error('BARCODE_TAKEN'), { code: 'BARCODE_TAKEN', conflict: codes.conflict })
+      }
       await emitProductUpsert(tx, created.id)
       return created
     })
@@ -215,6 +291,15 @@ router.post('/api/v1/products', requireAuth(['SUPER_ADMIN']), async (req, res) =
     if (code === 'BRAND_NOT_FOUND') {
       return res.status(400).json({ success: false, error: 'BRAND_NOT_FOUND', message: 'That brand no longer exists.' })
     }
+    if (code === 'BARCODE_TAKEN') {
+      const c = (err as { conflict: { code: string; itemCode: string; name: string; productId: string } }).conflict
+      return res.status(409).json({
+        success: false,
+        error: 'BARCODE_TAKEN',
+        message: `${c.code} is already the barcode of ${c.name} (${c.itemCode}). A barcode can only belong to one product.`,
+        conflict: c
+      })
+    }
     if (code === 'P2002') {
       return res.status(409).json({ success: false, error: 'ITEM_CODE_EXISTS' })
     }
@@ -229,7 +314,7 @@ router.put('/api/v1/products/:id', requireAuth(['SUPER_ADMIN']), async (req, res
     const {
       itemCode, brand, brandId, name, specification, categoryId, productType,
       unitOfMeasure, sellMode, sellingRate, gstPercentage, warrantyPeriodDays, hsnCode,
-      minStockLevel, isActive
+      minStockLevel, isActive, barcodes
     } = req.body
 
     if (name != null) {
@@ -283,6 +368,10 @@ router.put('/api/v1/products/:id', requireAuth(['SUPER_ADMIN']), async (req, res
       nextHsn = hsnCheck.value || null
     }
 
+    // Leaving the field out leaves the codes alone; sending [] clears them.
+    const barcodePlan = barcodes === undefined ? null : planBarcodes(barcodes)
+    if (barcodePlan && !barcodePlan.ok) return fieldError(res, barcodePlan)
+
     const mode = sellMode === undefined ? undefined : sellMode === 'LENGTH' ? 'LENGTH' : 'UNIT'
 
     const product = await prisma.$transaction(async (tx) => {
@@ -318,6 +407,12 @@ router.put('/api/v1/products/:id', requireAuth(['SUPER_ADMIN']), async (req, res
         },
         include: { category: true }
       })
+      if (barcodePlan && barcodePlan.ok) {
+        const codes = await applyBarcodes(tx, updated.id, barcodePlan.codes)
+        if (!codes.ok) {
+          throw Object.assign(new Error('BARCODE_TAKEN'), { code: 'BARCODE_TAKEN', conflict: codes.conflict })
+        }
+      }
       await emitProductUpsert(tx, updated.id)
       return updated
     })
@@ -335,6 +430,15 @@ router.put('/api/v1/products/:id', requireAuth(['SUPER_ADMIN']), async (req, res
     const code = (err as { code?: string }).code
     if (code === 'BRAND_NOT_FOUND') {
       return res.status(400).json({ success: false, error: 'BRAND_NOT_FOUND', message: 'That brand no longer exists.' })
+    }
+    if (code === 'BARCODE_TAKEN') {
+      const c = (err as { conflict: { code: string; itemCode: string; name: string; productId: string } }).conflict
+      return res.status(409).json({
+        success: false,
+        error: 'BARCODE_TAKEN',
+        message: `${c.code} is already the barcode of ${c.name} (${c.itemCode}). A barcode can only belong to one product.`,
+        conflict: c
+      })
     }
     if (code === 'P2002') {
       return res.status(409).json({ success: false, error: 'ITEM_CODE_EXISTS' })

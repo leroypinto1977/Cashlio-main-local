@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react'
 import {
   Search, Plus, Minus, Trash2, User, X, CheckCircle2, AlertTriangle,
   ShoppingCart, ChevronDown, CreditCard, Banknote, Smartphone, Printer,
-  FileText, ShieldCheck, SplitSquareHorizontal
+  FileText, ShieldCheck, SplitSquareHorizontal, ScanLine
 } from 'lucide-react'
 import { Button } from '../components/ui/button'
 import { Input } from '../components/ui/input'
@@ -11,6 +11,7 @@ import { apiFetch } from '../lib/api'
 import { printReceipt, type ReceiptBill, type ReceiptShop } from '../lib/receipt'
 import { computeInvoiceTotals, round2 } from '@shared/money'
 import { stateCodeOf } from '@shared/validation'
+import { useBillingShortcuts, useFocusAndSelect, ShortcutBar } from '../lib/billingShortcuts'
 import { isLengthMode, parseQty, qtyStep, roundQty, formatQty } from '@shared/units'
 import { settle, checkCredit, PAYMENT_METHODS, type PaymentMethod, type Tender } from '@shared/credit'
 
@@ -27,6 +28,19 @@ type Product = {
   sellingRate: number
   gstPercentage: number
   totalStock: number
+  barcodes?: { code: string; isPrimary: boolean }[]
+}
+
+/**
+ * Whether a query came off a scanner rather than a keyboard.
+ *
+ * Retail barcodes are eight digits or more with nothing else in them. Somebody
+ * searching for a product by name or item code never types that, so it is a
+ * safe read — and it only changes the wording of a message, never what is
+ * looked up.
+ */
+function looksScanned(q: string): boolean {
+  return /^[0-9]{8,}$/.test(q.trim())
 }
 
 type CartItem = {
@@ -174,6 +188,14 @@ export function BillingScreen({
 }) {
   // Cart
   const [cartItems, setCartItems] = useState<CartItem[]>([])
+  /**
+   * The line the keyboard is acting on. -1 means the last one, which is what
+   * a cashier almost always wants: the thing just scanned is the thing being
+   * corrected. Moving the selection pins it to a real index.
+   */
+  const [selectedLine, setSelectedLine] = useState(-1)
+  const searchInputRef = useRef<HTMLInputElement>(null)
+  const tenderAmountRef = useRef<HTMLInputElement>(null)
 
   // Search
   const [search, setSearch] = useState('')
@@ -392,11 +414,20 @@ export function BillingScreen({
     setPendingProduct(null)
   }
 
+  /**
+   * A scanner types the whole code and sends Enter itself, so Enter is the
+   * scan. An exact hit on an item code or a barcode goes straight into the
+   * cart; anything else falls back to showing the list.
+   */
+  const isExactHit = (p: Product, ql: string): boolean =>
+    p.itemCode.toLowerCase() === ql ||
+    (p.barcodes ?? []).some((b) => b.code.toLowerCase() === ql)
+
   const handleSearchEnter = async () => {
     if (!search.trim() || pendingProduct) return
     const q = search.trim()
     const ql = q.toLowerCase()
-    const exactCached = searchResults.find((p) => p.itemCode.toLowerCase() === ql)
+    const exactCached = searchResults.find((p) => isExactHit(p, ql))
     if (exactCached) { addProductDirect(exactCached); return }
     if (debounceRef.current) clearTimeout(debounceRef.current)
     setSearchLoading(true)
@@ -405,7 +436,7 @@ export function BillingScreen({
         `/api/v1/products?search=${encodeURIComponent(q)}&isActive=true`, token
       )
       setSearchResults(data.products)
-      const exact = data.products.find((p) => p.itemCode.toLowerCase() === ql)
+      const exact = data.products.find((p) => isExactHit(p, ql))
       if (exact) { addProductDirect(exact); return }
       setShowDropdown(true)
     } catch { /* keep current dropdown */ }
@@ -708,6 +739,35 @@ export function BillingScreen({
     }
   }
 
+  const focusSearch = useFocusAndSelect(searchInputRef)
+  const focusAmount = useFocusAndSelect(tenderAmountRef)
+
+  useBillingShortcuts({
+    modalOpen: showCustomerModal || !!successBill,
+    pendingProduct: !!pendingProduct,
+    dropdownOpen: showDropdown,
+    lineCount: cartItems.length,
+    selectedLine,
+    setSelectedLine,
+    focusSearch,
+    focusAmount,
+    cancelPending: () => setPendingProduct(null),
+    closeDropdown: () => setShowDropdown(false),
+    openCustomer: () => setShowCustomerModal(true),
+    stepQuantity: (idx, dir) => updateQty(idx, dir * qtyStep(cartItems[idx]?.sellMode)),
+    removeLine: removeItem,
+    collect: () => void handlePay(),
+    canCollect: canPay && !submitting && cartItems.length > 0
+  })
+
+  // A line removed elsewhere must not leave the selection pointing past the end.
+  useEffect(() => {
+    if (selectedLine >= cartItems.length) setSelectedLine(-1)
+  }, [cartItems.length, selectedLine])
+
+  const activeLine = selectedLine < 0 ? cartItems.length - 1 : selectedLine
+
+
   // ─── New Bill ─────────────────────────────────────────────────────────────
 
   const startNewBill = () => {
@@ -856,6 +916,7 @@ export function BillingScreen({
             <div className="relative">
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground z-10" />
               <Input
+                ref={searchInputRef}
                 value={search}
                 onChange={(e) => { setSearch(e.target.value); setPendingProduct(null) }}
                 onFocus={() => search && setShowDropdown(true)}
@@ -912,8 +973,24 @@ export function BillingScreen({
                 </div>
               )}
               {showDropdown && search && !searchLoading && searchResults.length === 0 && (
-                <div className="absolute top-full left-0 right-0 z-50 mt-1 bg-white border rounded-xl shadow-xl px-4 py-6 text-center text-sm text-muted-foreground">
-                  No products found for "{search}"
+                <div className="absolute top-full left-0 right-0 z-50 mt-1 bg-white border rounded-xl shadow-xl px-4 py-6 text-center text-sm">
+                  {looksScanned(search) ? (
+                    // A scan that finds nothing used to look identical to a slow
+                    // network. Naming the code lets the counter read it back off
+                    // the label instead of scanning again and again.
+                    <>
+                      <ScanLine className="w-5 h-5 mx-auto mb-1.5 text-amber-600" />
+                      <p className="text-zinc-900 font-medium">
+                        No product carries the barcode{' '}
+                        <span className="font-mono">{search.trim()}</span>
+                      </p>
+                      <p className="text-muted-foreground text-xs mt-1">
+                        Add it to the product in Products, or search by name.
+                      </p>
+                    </>
+                  ) : (
+                    <p className="text-muted-foreground">No products found for "{search}"</p>
+                  )}
                 </div>
               )}
             </div>
@@ -987,7 +1064,15 @@ export function BillingScreen({
                 </thead>
                 <tbody className="divide-y">
                   {cartItems.map((it, idx) => (
-                    <tr key={it.productId + idx} className="hover:bg-zinc-50/60 group">
+                    <tr
+                      key={it.productId + idx}
+                      onClick={() => setSelectedLine(idx)}
+                      className={`group cursor-default ${
+                        idx === activeLine
+                          ? 'bg-zinc-100 ring-1 ring-inset ring-zinc-300'
+                          : 'hover:bg-zinc-50/60'
+                      }`}
+                    >
                       <td className="px-4 py-3 text-muted-foreground text-xs">{idx + 1}</td>
                       <td className="px-4 py-3">
                         <p className="font-medium text-zinc-900">{it.productName}</p>
@@ -1091,6 +1176,8 @@ export function BillingScreen({
               </table>
             </div>
           )}
+
+          <ShortcutBar hasLines={cartItems.length > 0} />
         </div>
 
         {/* RIGHT PANEL */}
@@ -1195,6 +1282,7 @@ export function BillingScreen({
                     <div className="relative flex-1">
                       <span className="absolute left-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground font-medium">₹</span>
                       <Input
+                        ref={idx === 0 ? tenderAmountRef : undefined}
                         type="number"
                         min="0"
                         step="0.01"

@@ -339,5 +339,54 @@ eq('days until expiry', W.daysUntilExpiry(new Date('2026-06-11'), new Date('2026
 check('negative once expired', W.daysUntilExpiry(d2026, d2028) < 0)
 check('resolution codes validate', W.isWarrantyResolution('REPLACED') && !W.isWarrantyResolution('LOST'))
 
+// ─── Barcodes ────────────────────────────────────────────────────────────────
+// The GTINs below are real published barcodes, so the check-digit arithmetic
+// is measured against the outside world rather than against itself.
+check('Maggi EAN-13 checks out', V.isValidGtin('8901058000108'))
+check('a textbook UPC-A checks out', V.isValidGtin('036000291452'))
+check('an EAN-8 checks out', V.isValidGtin('96385074'))
+check('EAN-13 5901234123457 checks out', V.isValidGtin('5901234123457'))
+check('EAN-13 4006381333931 checks out', V.isValidGtin('4006381333931'))
+check('one digit wrong fails', !V.isValidGtin('8901058000107'))
+check('two digits transposed fails', !V.isValidGtin('8901058000180'))
+check('a 13-digit number is not automatically a GTIN', !V.isValidGtin('1234567890123'))
+check('wrong length is not a GTIN', !V.isValidGtin('890105800010'))
+check('letters are not a GTIN', !V.isValidGtin('ABC1058000108'))
+eq('check digit of the Maggi body', V.gtinCheckDigit('890105800010'), 8)
+
+check('a real barcode is accepted', V.validateBarcode('8901058000108').ok)
+eq('and stored as scanned', V.validateBarcode('8901058000108').value, '8901058000108')
+check('a mistyped GTIN is refused', !V.validateBarcode('8901058000107').ok)
+check('with the digit it should have been',
+  V.validateBarcode('8901058000107').error === 'BARCODE_CHECK_DIGIT')
+check('...and the message names it', /should be 8/.test(V.validateBarcode('8901058000107').message))
+check('a shop code needs no check digit', V.validateBarcode('LOOSE-WIRE-RED').ok)
+check('shop codes are stored uppercase', V.validateBarcode('loose-wire-red').value === 'LOOSE-WIRE-RED')
+check('a short number is a shop code, not a bad GTIN', V.validateBarcode('4501').ok)
+check('a 14-digit number is a shop code', V.validateBarcode('12345678901234').ok)
+check('empty is refused', !V.validateBarcode('  ').ok)
+check('a space means it was typed, not scanned', !V.validateBarcode('8901 0580 00108').ok)
+check('and says so', V.validateBarcode('890 1058').error === 'BARCODE_HAS_SPACE')
+check('stray characters are refused', !V.validateBarcode('89010*58').ok)
+check('...naming the character', /"\*"/.test(V.validateBarcode('89010*58').message))
+check('over-long codes are refused', !V.validateBarcode('X'.repeat(49)).ok)
+check('exactly at the limit is fine', V.validateBarcode('X'.repeat(48)).ok)
+check('EAN-13 is named', V.barcodeKind('8901058000108') === 'EAN-13')
+check('UPC-A is named', V.barcodeKind('036000291452') === 'UPC-A')
+check('EAN-8 is named', V.barcodeKind('96385074') === 'EAN-8')
+check('anything else is a shop code', V.barcodeKind('LOOSE-WIRE-RED') === 'Shop code')
+
+// Every check digit 0-9 must be reachable, or the arithmetic is skewed.
+{
+  const seen = new Set()
+  for (let i = 0; i < 1000; i++) {
+    const body = String(i).padStart(12, '0')
+    const d = V.gtinCheckDigit(body)
+    seen.add(d)
+    check(`generated GTIN ${body}${d} validates`, V.isValidGtin(body + String(d)), true)
+  }
+  eq('every check digit occurs', seen.size, 10)
+}
+
 console.log(`\n${pass} passed, ${fail} failed\n`)
 process.exit(fail ? 1 : 0)

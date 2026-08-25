@@ -304,3 +304,92 @@ export function codeStub(source: string, len = 3): string {
   const cleaned = (source || '').toUpperCase().replace(/[^A-Z0-9]/g, '')
   return cleaned.slice(0, len)
 }
+
+// ─── Barcodes ─────────────────────────────────────────────────────────────────
+
+/**
+ * The check digit an EAN-13, EAN-8 or UPC-A carries in its last position.
+ *
+ * Every digit but the last is weighted 3 or 1, alternating from the right, and
+ * the check digit is what takes the total to a multiple of ten. A scanner
+ * verifies this itself, so a failure here means the number was typed, and one
+ * of the digits was typed wrong.
+ */
+export function gtinCheckDigit(digitsWithoutCheck: string): number {
+  let sum = 0
+  // Weighting runs right-to-left, so the rightmost body digit is always 3.
+  const reversed = [...digitsWithoutCheck].reverse()
+  for (let i = 0; i < reversed.length; i++) {
+    sum += Number(reversed[i]) * (i % 2 === 0 ? 3 : 1)
+  }
+  return (10 - (sum % 10)) % 10
+}
+
+/** True for a well-formed EAN-8, UPC-A or EAN-13, check digit and all. */
+export function isValidGtin(raw: string): boolean {
+  const v = (raw || '').trim()
+  if (!/^\d+$/.test(v)) return false
+  if (![8, 12, 13].includes(v.length)) return false
+  return gtinCheckDigit(v.slice(0, -1)) === Number(v[v.length - 1])
+}
+
+/** Longest a shop's own code can sensibly be — Code 128 stops being scannable. */
+export const MAX_BARCODE_LENGTH = 48
+
+/**
+ * Checks a barcode, whether it came off a scanner or a keyboard.
+ *
+ * Two kinds of code are in use in a shop. Printed retail barcodes are GTINs —
+ * EAN-13, EAN-8 or UPC-A — and those carry a check digit, so a mistyped one
+ * can be caught outright rather than becoming a code that scans to nothing.
+ * Everything else is the shop's own: a code stuck on loose goods, a supplier's
+ * part number, a label printed in the back room. Those have no structure to
+ * check, so they are accepted as typed.
+ *
+ * A number that is the right length for a GTIN but fails its check digit is
+ * refused, because that is a typo, not a shop code — nobody invents a
+ * thirteen-digit internal number by hand.
+ */
+export function validateBarcode(raw: string): FieldResult {
+  const v = (raw || '').trim()
+  if (!v) return bad('BARCODE_REQUIRED', 'Enter or scan a barcode.')
+  if (/\s/.test(v)) {
+    return bad(
+      'BARCODE_HAS_SPACE',
+      'Barcodes cannot contain spaces. A scanner never sends one, so this was typed — check it against the label.'
+    )
+  }
+  if (v.length > MAX_BARCODE_LENGTH) {
+    return bad(
+      'BARCODE_TOO_LONG',
+      `A barcode cannot be longer than ${MAX_BARCODE_LENGTH} characters.`
+    )
+  }
+  const stray = [...new Set(v.replace(/[A-Za-z0-9.\-_]/g, '').split(''))]
+  if (stray.length > 0) {
+    const list = stray.map((c) => `"${c}"`).join(', ')
+    return bad(
+      'BARCODE_BAD_CHARACTER',
+      `${list} cannot be used in a barcode — letters, digits, dots, hyphens and underscores only.`
+    )
+  }
+  if (/^\d+$/.test(v) && [8, 12, 13].includes(v.length) && !isValidGtin(v)) {
+    const expected = gtinCheckDigit(v.slice(0, -1))
+    return bad(
+      'BARCODE_CHECK_DIGIT',
+      `This does not check out as a valid barcode — the last digit should be ${expected}, not ${v[v.length - 1]}. Re-scan it, or check the digits against the label.`
+    )
+  }
+  return ok(v.toUpperCase())
+}
+
+/** What kind of code this is, for showing next to it. */
+export function barcodeKind(raw: string): 'EAN-13' | 'EAN-8' | 'UPC-A' | 'Shop code' {
+  const v = (raw || '').trim()
+  if (isValidGtin(v)) {
+    if (v.length === 13) return 'EAN-13'
+    if (v.length === 12) return 'UPC-A'
+    return 'EAN-8'
+  }
+  return 'Shop code'
+}

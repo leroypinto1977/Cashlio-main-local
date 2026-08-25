@@ -8,6 +8,7 @@ import icon from '../../resources/icon.png?asset'
 import { startExpressServer, startSyncEventPruning } from './server'
 import { setBranchCertFingerprint } from './branchCert'
 import { ensureBranchCert, fingerprintOfPem, fingerprintsMatch } from './tls'
+import { registerPrintingIpc } from './printing'
 import { runBackup, listBackups, getBackupStatus, getBackupDir, startBackupSchedule } from './backup'
 import { startRefreshLoop, checkClockTamper } from './licenseGuard'
 import { getMachineId } from './machineId'
@@ -202,37 +203,7 @@ app.whenReady().then(async () => {
   // hidden BrowserWindow and trigger printing via webContents.print.
   // silent:true is used only when an explicit deviceName is given (future
   // "default printer" setting); otherwise the OS print dialog is shown.
-  ipcMain.handle('print-receipt', async (_evt, payload: { html: string; billNumber?: string; deviceName?: string }) => {
-    const html = payload?.html ?? ''
-    if (!html) return { ok: false, error: 'NO_HTML' }
-    const printWin = new BrowserWindow({
-      show: false,
-      webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false }
-    })
-    try {
-      const dataUrl = 'data:text/html;charset=utf-8,' + encodeURIComponent(html)
-      await printWin.loadURL(dataUrl)
-      await new Promise<void>((resolve, reject) => {
-        printWin.webContents.print(
-          {
-            silent: !!payload?.deviceName,
-            deviceName: payload?.deviceName,
-            printBackground: true,
-            margins: { marginType: 'none' }
-          },
-          (success, failureReason) => {
-            if (success) resolve()
-            else reject(new Error(failureReason || 'PRINT_CANCELLED'))
-          }
-        )
-      })
-      return { ok: true }
-    } catch (e) {
-      return { ok: false, error: (e as Error).message }
-    } finally {
-      if (!printWin.isDestroyed()) printWin.close()
-    }
-  })
+  registerPrintingIpc(ipcMain, BrowserWindow)
 
   // ─── Local DB backup IPC ──────────────────────────────────────────────────
   // Status snapshot (count, last backup, dir, pg_dump availability).
