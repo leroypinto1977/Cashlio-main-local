@@ -125,6 +125,28 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
  * falls back to HTTP so the server still comes up rather than leaving the
  * shop with nothing.
  */
+/** Held so a restore can stop taking writes before it replaces the database. */
+let running: http.Server | https.Server | null = null
+
+/**
+ * Stops accepting connections and waits for the ones in flight.
+ *
+ * A restore drops every table. A sale landing mid-way through would be written
+ * into a database that is about to stop existing, and the till would have been
+ * told it succeeded.
+ */
+export function stopExpressServer(): Promise<void> {
+  return new Promise((resolve) => {
+    if (!running) return resolve()
+    const server = running
+    running = null
+    server.close(() => resolve())
+    // Give in-flight requests a moment, then stop waiting: a hung keep-alive
+    // connection must not be able to block a restore indefinitely.
+    setTimeout(() => resolve(), 5000)
+  })
+}
+
 export function startExpressServer(
   port: number = parseInt(process.env.LOCAL_SERVER_PORT || '52001'),
   tls?: { cert: string; key: string }
@@ -133,6 +155,7 @@ export function startExpressServer(
     const server = tls
       ? https.createServer({ cert: tls.cert, key: tls.key }, app)
       : http.createServer(app)
+    running = server
 
     server.listen(port, '0.0.0.0', () => {
       console.log(

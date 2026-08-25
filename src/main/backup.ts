@@ -17,6 +17,18 @@ import { spawn } from 'node:child_process'
 import { createGzip } from 'node:zlib'
 import { pipeline } from 'node:stream/promises'
 import { prisma } from './prisma'
+import { pgToolUrl, pgEnv } from './pgUrl'
+import {
+  writeManifest,
+  manifestPathFor,
+  verifyBackup,
+  testRestore,
+  readLastRestoreCheck,
+  writeLastRestoreCheck,
+  restoreCheckIsDue,
+  type RestoreCheckRecord,
+  type VerifyResult
+} from './restore'
 
 const RETENTION_COUNT = 30
 const FILE_PREFIX = 'cashlio-'
@@ -32,25 +44,6 @@ function fileNameForNow(d = new Date()): string {
     `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}-` +
     `${pad2(d.getHours())}${pad2(d.getMinutes())}`
   return `${FILE_PREFIX}${stamp}${FILE_SUFFIX}`
-}
-
-/**
- * Take the password out of a Postgres URL so it can be passed by environment
- * instead of on the command line. Returns the URL unchanged if there is none
- * (peer or trust authentication, or a password already in ~/.pgpass).
- */
-function splitPassword(dbUrl: string): { url: string; password: string | null } {
-  try {
-    const u = new URL(dbUrl)
-    if (!u.password) return { url: dbUrl, password: null }
-    const password = decodeURIComponent(u.password)
-    u.password = ''
-    return { url: u.toString(), password }
-  } catch {
-    // Not a URL we can parse — hand it over untouched rather than mangling a
-    // connection string that works.
-    return { url: dbUrl, password: null }
-  }
 }
 
 export async function getBackupDir(): Promise<string> {
@@ -102,6 +95,10 @@ export type BackupStatus = {
   lastBackupAt: string | null
   totalSizeBytes: number
   pgDumpAvailable: boolean
+  /** The last time a backup was actually read back. Null means never, which
+   *  is the state every backup system is in until somebody checks. */
+  lastRestoreCheck: RestoreCheckRecord | null
+  restoreCheckDue: boolean
 }
 
 async function checkPgDump(): Promise<boolean> {
@@ -116,12 +113,15 @@ async function checkPgDump(): Promise<boolean> {
 export async function getBackupStatus(): Promise<BackupStatus> {
   const dir = await getBackupDir()
   const files = await listBackups()
+  const lastRestoreCheck = readLastRestoreCheck(dir)
   return {
     dir,
     count: files.length,
     lastBackupAt: files[0]?.createdAt ?? null,
     totalSizeBytes: files.reduce((s, f) => s + f.sizeBytes, 0),
-    pgDumpAvailable: await checkPgDump()
+    pgDumpAvailable: await checkPgDump(),
+    lastRestoreCheck,
+    restoreCheckDue: files.length > 0 && restoreCheckIsDue(lastRestoreCheck)
   }
 }
 
@@ -133,6 +133,8 @@ async function pruneOldBackups(dir: string): Promise<number> {
   for (const f of toRemove) {
     try {
       fs.unlinkSync(f.fullPath)
+      // The manifest is no use without the dump it describes.
+      try { fs.unlinkSync(manifestPathFor(f.fullPath)) } catch { /* may not exist */ }
       removed++
     } catch (e) {
       console.error('[backup] failed to prune', f.fullPath, e)
@@ -143,7 +145,15 @@ async function pruneOldBackups(dir: string): Promise<number> {
 }
 
 export type BackupResult =
-  | { ok: true; filename: string; fullPath: string; sizeBytes: number; durationMs: number }
+  | {
+      ok: true
+      filename: string
+      fullPath: string
+      sizeBytes: number
+      durationMs: number
+      /** Read back straight away. A dump that has never been opened is a file. */
+      verification: VerifyResult | null
+    }
   | { ok: false; error: string }
 
 let backupInProgress = false
@@ -171,12 +181,16 @@ export async function runBackup(): Promise<BackupResult> {
     // vector is public: `ps` shows it to every account on the machine for as
     // long as the dump runs, twice a day. Postgres reads the same URL from
     // the environment, which is not listed to other users.
-    const { url: safeUrl, password } = splitPassword(dbUrl)
+    const { url: safeUrl, password, schema } = pgToolUrl(dbUrl)
     // --no-owner / --no-acl makes restores portable across users; --clean
     // includes DROPs so a restore can fully replace the existing schema.
-    const child = spawn(cmd, ['--no-owner', '--no-acl', '--clean', '--if-exists', safeUrl], {
+    // A named schema other than the default is dumped explicitly, since that
+    // is the only part of the shop Prisma was ever pointed at.
+    const args = ['--no-owner', '--no-acl', '--clean', '--if-exists']
+    if (schema && schema !== 'public') args.push('--schema', schema)
+    const child = spawn(cmd, [...args, safeUrl], {
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: password ? { ...process.env, PGPASSWORD: password } : process.env
+      env: pgEnv(password)
     })
 
     let stderr = ''
@@ -214,14 +228,34 @@ export async function runBackup(): Promise<BackupResult> {
       // See getBackupDir: not every filesystem carries modes.
     }
 
+    // What went into it, written beside it. Without this a dump can only ever
+    // be checked for being readable, never for being complete.
+    try {
+      await writeManifest(fullPath)
+    } catch (e) {
+      console.error('[backup] could not write manifest', e)
+    }
+
     const sizeBytes = fs.statSync(fullPath).size
     const durationMs = Date.now() - started
     console.log(`[backup] wrote ${filename} (${(sizeBytes / 1024).toFixed(1)} KB) in ${durationMs}ms`)
 
+    // Read it straight back. It costs a second and it is the difference
+    // between having written a file and having taken a backup.
+    let verification: VerifyResult | null = null
+    try {
+      verification = await verifyBackup(fullPath)
+      if (!verification.ok) {
+        console.error('[backup] the backup just written did not verify:', verification.problems)
+      }
+    } catch (e) {
+      console.error('[backup] verification threw', e)
+    }
+
     // Best-effort prune; don't let pruning failures fail the backup.
     pruneOldBackups(dir).catch((e) => console.error('[backup] prune error', e))
 
-    return { ok: true, filename, fullPath, sizeBytes, durationMs }
+    return { ok: true, filename, fullPath, sizeBytes, durationMs, verification }
   } finally {
     backupInProgress = false
   }
@@ -241,6 +275,23 @@ export function startBackupSchedule(): void {
         console.log(`[backup] auto-running (last backup ${last ? `${ageHrs.toFixed(1)}h ago` : 'never'})`)
         const r = await runBackup()
         if (!r.ok) console.error('[backup] auto-run failed:', r.error)
+      }
+
+      // Once a week, restore the most recent backup into a scratch database
+      // and see what comes back. Nobody clicks a button they do not know they
+      // need, and the day they find out is the wrong day to find out.
+      if (restoreCheckIsDue(readLastRestoreCheck(status.dir))) {
+        const newest = (await listBackups())[0]
+        if (newest) {
+          console.log(`[restore] rehearsing a restore of ${newest.filename}`)
+          const check = await testRestore(newest.fullPath)
+          writeLastRestoreCheck(status.dir, check)
+          if (check.ok) {
+            console.log(`[restore] ${newest.filename} restored ${check.totalRows} rows in ${check.durationMs}ms`)
+          } else {
+            console.error('[restore] the newest backup did not restore:', check.problems)
+          }
+        }
       }
     } catch (e) {
       console.error('[backup] schedule tick error', e)
