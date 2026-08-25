@@ -53,6 +53,16 @@ type AnalyticsSummary = {
   estimatedCOGS: number
   estimatedGrossProfit: number
   estimatedMarginPct: number
+  totalExpenses: number
+  expensePaid: number
+  expenseGst: number
+  fixedExpenses: number
+  variableExpenses: number
+  expenseCount: number
+  recurringExpenses: number
+  expensesByCategory: { categoryId: string; name: string; kind: string; amount: number; netCost: number; count: number }[]
+  netProfit: number
+  netMarginPct: number
   revenueExGst: number
   totalTaxableValue: number
   totalReturns: number
@@ -391,6 +401,115 @@ export function AnalyticsScreen({ token }: { token: string | null }): React.JSX.
               </div>
             </div>
           </div>
+
+          {/* What the goods earned, less what it cost to run the shop. */}
+          <div className="p-5 rounded-xl border shadow-sm bg-card">
+            <div className="flex items-start justify-between mb-4">
+              <div>
+                <p className="text-xs font-semibold text-zinc-500 uppercase tracking-wide">
+                  What was left
+                </p>
+                <p className="text-xs text-zinc-400 mt-0.5">
+                  Gross profit is what the goods earned. This is what remained after the
+                  shop was run.
+                </p>
+              </div>
+              <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${summary.netProfit >= 0 ? 'bg-emerald-50' : 'bg-red-50'}`}>
+                {summary.netProfit >= 0 ? (
+                  <TrendingUp className="w-4 h-4 text-emerald-600" />
+                ) : (
+                  <TrendingDown className="w-4 h-4 text-red-600" />
+                )}
+              </div>
+            </div>
+
+            {summary.expenseCount === 0 ? (
+              <p className="text-sm text-zinc-500">
+                No expenses recorded for this period, so this is the same as gross profit.
+                Rent, wages and the rest go in under{' '}
+                <span className="font-medium text-zinc-700">Expenses</span> — until they do,
+                the figure above is what the goods earned, not what the shop made.
+              </p>
+            ) : (
+              <>
+                <div className="grid grid-cols-4 gap-3">
+                  <div className="p-3 rounded-lg bg-zinc-50 border">
+                    <p className="text-xs text-zinc-500 mb-1">Gross profit</p>
+                    <p className="text-base font-bold text-zinc-700">₹{fmt(summary.estimatedGrossProfit)}</p>
+                  </div>
+                  <div className="p-3 rounded-lg bg-zinc-50 border">
+                    <p className="text-xs text-zinc-500 mb-1">Running costs</p>
+                    <p className="text-base font-bold text-zinc-700">− ₹{fmt(summary.totalExpenses)}</p>
+                    <p className="text-[11px] text-zinc-400 mt-0.5">{summary.expenseCount} recorded</p>
+                  </div>
+                  <div className={`p-3 rounded-lg border ${summary.netProfit >= 0 ? 'bg-emerald-50 border-emerald-100' : 'bg-red-50 border-red-100'}`}>
+                    <p className="text-xs text-zinc-500 mb-1">Net profit</p>
+                    <p className={`text-base font-bold ${summary.netProfit >= 0 ? 'text-emerald-700' : 'text-red-700'}`}>
+                      ₹{fmt(summary.netProfit)}
+                    </p>
+                  </div>
+                  <div className="p-3 rounded-lg bg-zinc-50 border">
+                    <p className="text-xs text-zinc-500 mb-1">Net margin</p>
+                    <p className={`text-base font-bold ${summary.netMarginPct >= 0 ? 'text-emerald-700' : 'text-red-700'}`}>
+                      {summary.netMarginPct.toFixed(1)}%
+                    </p>
+                  </div>
+                </div>
+
+                {/* A month's rent recorded on one day lands entirely in that
+                    day. True, but over a short window it reads as a shop in
+                    trouble — so it is said rather than left to be inferred. */}
+                {summary.recurringExpenses > 0 && (period === 'today' || period === 'week') && (
+                  <p className="mt-3 text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-md px-3 py-2">
+                    ₹{fmt(summary.recurringExpenses)} of this is monthly cost — rent, wages
+                    and the like — that happens to have been recorded in{' '}
+                    {period === 'today' ? 'today' : 'this week'}. Over a window this short it
+                    drags the figure down. The month is the one to read.
+                  </p>
+                )}
+
+                <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-zinc-500">
+                  <span>
+                    Fixed <span className="font-semibold text-zinc-700">₹{fmt(summary.fixedExpenses)}</span>
+                  </span>
+                  <span>
+                    Variable <span className="font-semibold text-zinc-700">₹{fmt(summary.variableExpenses)}</span>
+                  </span>
+                  {summary.expenseGst > 0 && (
+                    // The tax paid on expenses is reclaimable, so it is not a
+                    // cost — saying so stops the two figures looking wrong.
+                    <span>
+                      ₹{fmt(summary.expenseGst)} of GST paid is reclaimable and not counted as cost
+                    </span>
+                  )}
+                </div>
+
+                {summary.expensesByCategory.length > 0 && (
+                  <div className="mt-4 space-y-1.5">
+                    {summary.expensesByCategory.slice(0, 6).map((c) => {
+                      const share =
+                        summary.totalExpenses > 0 ? (c.netCost / summary.totalExpenses) * 100 : 0
+                      return (
+                        <div key={c.categoryId} className="flex items-center gap-3 text-xs">
+                          <span className="w-40 shrink-0 truncate text-zinc-700">{c.name}</span>
+                          <div className="flex-1 h-2 rounded-full bg-zinc-100 overflow-hidden">
+                            <div
+                              className={`h-full rounded-full ${c.kind === 'FIXED' ? 'bg-zinc-700' : 'bg-zinc-400'}`}
+                              style={{ width: `${Math.max(2, share)}%` }}
+                            />
+                          </div>
+                          <span className="w-24 text-right tabular-nums text-zinc-700 shrink-0">
+                            ₹{fmt(c.netCost)}
+                          </span>
+                        </div>
+                      )
+                    })}
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+
 
           {/* Payment breakdown + Top products */}
           <div className="grid grid-cols-5 gap-4">

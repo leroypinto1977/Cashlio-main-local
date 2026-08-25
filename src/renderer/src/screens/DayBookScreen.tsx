@@ -34,6 +34,7 @@ type ClosedDay = {
   businessDate: string
   openingFloat: number
   expectedCash: number
+  cashPaidOut: number
   countedCash: number
   difference: number
   upiTotal: number
@@ -51,7 +52,14 @@ type DayBook = {
   sales: { billCount: number; total: number; voided: number }
   returns: { count: number; total: number }
   tenders: TenderMovement[]
-  cash: { openingFloat: number; collected: number; refunded: number; expected: number }
+  cash: {
+    openingFloat: number
+    collected: number
+    refunded: number
+    paidOut: number
+    expected: number
+  }
+  paidOut: { id: string; category: string; amount: number; payee: string | null; notes: string | null }[]
   previousClose: { businessDate: string; countedCash: number; difference: number } | null
   closed: ClosedDay | null
   blocking: string[]
@@ -245,7 +253,11 @@ export function DayBookScreen({ token }: { token: string | null }): React.JSX.El
     if (!book) return 0
     const float = Number(openingFloat)
     const base = Number.isFinite(float) ? float : 0
-    return Math.round((base + book.cash.collected - book.cash.refunded) * 100) / 100
+    return (
+      Math.round(
+        (base + book.cash.collected - book.cash.refunded - book.cash.paidOut) * 100
+      ) / 100
+    )
   }, [book, openingFloat])
 
   const liveDifference =
@@ -440,6 +452,27 @@ export function DayBookScreen({ token }: { token: string | null }): React.JSX.El
                 value={book.cash.refunded > 0 ? `− ${rupees(book.cash.refunded)}` : '—'}
                 muted
               />
+              <Row
+                label="Paid out of the till"
+                value={book.cash.paidOut > 0 ? `− ${rupees(book.cash.paidOut)}` : '—'}
+                muted
+              />
+
+              {/* Named, because "the drawer is ₹200 short" and "the courier was
+                  paid ₹200" are the same fact and only one of them is useful. */}
+              {book.paidOut.length > 0 && (
+                <ul className="text-xs text-muted-foreground pl-3 space-y-0.5">
+                  {book.paidOut.map((p) => (
+                    <li key={p.id} className="flex justify-between gap-3">
+                      <span className="truncate">
+                        {p.category}
+                        {p.payee ? ` — ${p.payee}` : ''}
+                      </span>
+                      <span className="tabular-nums shrink-0">{rupees(p.amount)}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
               <div className="flex items-center justify-between pt-3 border-t">
                 <span className="font-semibold">Should be in the drawer</span>
                 <span className="text-2xl font-bold tabular-nums">{rupees(expectedCash)}</span>

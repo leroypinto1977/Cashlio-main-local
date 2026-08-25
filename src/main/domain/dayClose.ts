@@ -18,6 +18,7 @@ import { IST_OFFSET_MS } from './dates'
 type DbClient = {
   bill: { findMany: Function; groupBy: Function; aggregate: Function; count: Function }
   payment: { findMany: Function }
+  expense: { findMany: Function }
   dayClose: { findUnique: Function; findFirst: Function; findMany: Function; create: Function }
 }
 
@@ -49,9 +50,13 @@ export type DayBook = {
     openingFloat: number
     collected: number
     refunded: number
-    /** openingFloat + collected - refunded. */
+    /** Cash taken out of the till for expenses — the courier, the tea, a part. */
+    paidOut: number
+    /** openingFloat + collected - refunded - paidOut. */
     expected: number
   }
+  /** The expenses behind `cash.paidOut`, so a difference can be traced. */
+  paidOut: Array<{ id: string; category: string; amount: number; payee: string | null; notes: string | null }>
   previousClose: { businessDate: string; countedCash: number; difference: number } | null
   /** Set once the day has been counted. A closed day is read-only. */
   closed: ClosedDay | null
@@ -63,6 +68,7 @@ export type ClosedDay = {
   businessDate: string
   openingFloat: number
   expectedCash: number
+  cashPaidOut: number
   countedCash: number
   difference: number
   upiTotal: number
@@ -128,7 +134,7 @@ export async function buildDayBook(
   const { from, to } = dayWindow(businessDate)
   const window = { gte: from, lt: to }
 
-  const [saleRows, returnRows, voided, payments, closeRow, prevClose] = await Promise.all([
+  const [saleRows, returnRows, voided, payments, closeRow, prevClose, tillExpenses] = await Promise.all([
     db.bill.findMany({
       where: { paidAt: window, status: { notIn: ['VOID', 'RETURN'] } },
       select: { totalAmount: true }
@@ -149,6 +155,14 @@ export async function buildDayBook(
     db.dayClose.findFirst({
       where: { businessDate: { lt: businessDate } },
       orderBy: { businessDate: 'desc' }
+    }),
+    // Cash handed over the counter that was not a refund: the courier, a
+    // part collected in a hurry, the tea. Without these the drawer comes up
+    // short every day and the shortfall gets written off as a miscount.
+    db.expense.findMany({
+      where: { paidFromTill: true, paidOn: businessDate },
+      include: { category: { select: { name: true } } },
+      orderBy: { createdAt: 'asc' }
     })
   ])
 
@@ -180,6 +194,12 @@ export async function buildDayBook(
         ? round2(Number(closeRow.openingFloat))
         : previousCounted
 
+  // The gross figure, not the net-of-GST one: what left the drawer is what
+  // was handed over, tax included.
+  const paidOut = round2(
+    tillExpenses.reduce((s: number, e: any) => s + Number(e.amount), 0)
+  )
+
   const salesTotal = round2(saleRows.reduce((s: number, b: any) => s + Number(b.totalAmount), 0))
   const returnsTotal = round2(returnRows.reduce((s: number, b: any) => s + Number(b.totalAmount), 0))
 
@@ -202,8 +222,16 @@ export async function buildDayBook(
       openingFloat,
       collected: cashMovement.collected,
       refunded: cashMovement.refunded,
-      expected: round2(openingFloat + cashMovement.net)
+      paidOut,
+      expected: round2(openingFloat + cashMovement.net - paidOut)
     },
+    paidOut: tillExpenses.map((e: any) => ({
+      id: e.id,
+      category: e.category?.name ?? '',
+      amount: round2(Number(e.amount)),
+      payee: e.payee ?? null,
+      notes: e.notes ?? null
+    })),
     previousClose: prevClose
       ? {
           businessDate: businessDateKey(prevClose.businessDate),
@@ -221,6 +249,7 @@ export function serializeClose(row: any): ClosedDay {
     businessDate: businessDateKey(row.businessDate),
     openingFloat: round2(Number(row.openingFloat)),
     expectedCash: round2(Number(row.expectedCash)),
+    cashPaidOut: round2(Number(row.cashPaidOut ?? 0)),
     countedCash: round2(Number(row.countedCash)),
     difference: round2(Number(row.difference)),
     upiTotal: round2(Number(row.upiTotal)),
@@ -282,6 +311,7 @@ export async function closeDay(db: DbClient, args: CloseDayArgs): Promise<CloseD
       businessDate: args.businessDate,
       openingFloat: round2(args.openingFloat),
       expectedCash: book.cash.expected,
+      cashPaidOut: book.cash.paidOut,
       countedCash: round2(args.countedCash),
       difference,
       upiTotal: byMethod('UPI'),
