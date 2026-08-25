@@ -4,6 +4,7 @@ import { prisma } from '../prisma'
 import { requireAuth } from '../http/middleware'
 import { IST_OFFSET_MS, istMidnight } from '../domain/dates'
 import { round2 } from '../../shared/money'
+import { serializeExpense, totalByCategory, totalExpenses } from '../domain/expenses'
 
 /**
  * What the shop earned, and on what.
@@ -148,6 +149,26 @@ router.get('/api/v1/analytics/summary', requireAuth(), async (req, res) => {
       payBreakdownCount[row.method] = row._count
     }
 
+    // What the shop spent that is not stock. Netted of GST, because a
+    // registered shop reclaims that, and because the margin below is worked
+    // out on ex-GST revenue — comparing a GST-inclusive cost against it would
+    // report a business as losing money it never spent.
+    const expenseRows = await prisma.expense.findMany({
+      where: startDate ? { paidOn: { gte: startDate } } : undefined,
+      include: { category: { select: { id: true, name: true, kind: true } } }
+    })
+    const expenses = expenseRows.map((r) => serializeExpense({ ...r, recordedBy: null }))
+    const expenseTotals = totalExpenses(expenses)
+    // A month's rent recorded on one day lands entirely in that day. The
+    // figure is true, but over a short period it reads as a shop in trouble,
+    // so the screen is told how much of the cost is monthly.
+    const recurringInPeriod = round2(
+      expenseRows
+        .filter((r) => r.isRecurring)
+        .reduce((sum, r) => sum + Number(r.amount) - Number(r.gstAmount), 0)
+    )
+    const expensesByCategory = totalByCategory(expenses)
+
     const totalDiscounts = totalLineDiscounts + totalBillDiscounts
     const grossRevenuePlusDics = totalRevenue + totalDiscounts
     // Margin compares ex-GST revenue with ex-GST cost. Using the GST-inclusive
@@ -159,6 +180,10 @@ router.get('/api/v1/analytics/summary', requireAuth(), async (req, res) => {
     const revenueExGst = round2(grossTaxable - returnsTaxable)
     const estimatedGrossProfit = round2(revenueExGst - estimatedCOGS)
     const estimatedMarginPct = revenueExGst > 0 ? (estimatedGrossProfit / revenueExGst) * 100 : 0
+    // The number a shopkeeper means when they ask what they made. Gross profit
+    // is what the goods earned; this is what was left after the shop was run.
+    const netProfit = round2(estimatedGrossProfit - expenseTotals.net)
+    const netMarginPct = revenueExGst > 0 ? (netProfit / revenueExGst) * 100 : 0
     const topProducts = Object.values(productMap).sort((a, b) => b.revenue - a.revenue).slice(0, 8)
 
     return res.json({
@@ -179,6 +204,17 @@ router.get('/api/v1/analytics/summary', requireAuth(), async (req, res) => {
         estimatedCOGS,
         estimatedGrossProfit,
         estimatedMarginPct,
+        // Net of what it cost to run the shop, not just what the stock cost.
+        totalExpenses: expenseTotals.net,
+        expensePaid: expenseTotals.paid,
+        expenseGst: expenseTotals.gst,
+        fixedExpenses: expenseTotals.fixed,
+        variableExpenses: expenseTotals.variable,
+        expenseCount: expenseTotals.count,
+        recurringExpenses: recurringInPeriod,
+        expensesByCategory,
+        netProfit,
+        netMarginPct,
         revenueExGst,
         totalTaxableValue,
         hasCOGSData: cogsItemCount > 0,

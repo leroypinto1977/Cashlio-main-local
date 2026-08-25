@@ -7,6 +7,7 @@ import {
   Home,
   MonitorSmartphone,
   Settings,
+  Banknote,
   LogOut,
   Shield,
   Lock,
@@ -30,6 +31,7 @@ import { ReceivablesScreen } from './screens/ReceivablesScreen'
 import { WarrantiesScreen } from './screens/WarrantiesScreen'
 import { GstReturnScreen } from './screens/GstReturnScreen'
 import { DayBookScreen } from './screens/DayBookScreen'
+import { ExpensesScreen } from './screens/ExpensesScreen'
 import { OrdersScreen } from './screens/OrdersScreen'
 import { BillingScreen } from './screens/BillingScreen'
 import { SalesScreen } from './screens/SalesScreen'
@@ -663,6 +665,7 @@ function App(): React.JSX.Element {
               ['receivables', <Wallet className="w-4 h-4" />,           'Receivables'],
               ['warranties', <ShieldCheck className="w-4 h-4" />,        'Warranties'],
               ['dayclose',   <Wallet className="w-4 h-4" />,            'Day book'],
+              ['expenses',   <Banknote className="w-4 h-4" />,          'Expenses'],
               ['gst',        <FileText className="w-4 h-4" />,          'GST return'],
               ['devices',    <MonitorSmartphone className="w-4 h-4" />, 'Devices'],
               ['settings',   <Settings className="w-4 h-4" />,         'Settings'],
@@ -702,6 +705,7 @@ function App(): React.JSX.Element {
         {activeTab === 'warranties' && <WarrantiesScreen token={authToken} />}
         {activeTab === 'gst' && <GstReturnScreen token={authToken} />}
         {activeTab === 'dayclose' && <DayBookScreen token={authToken} />}
+        {activeTab === 'expenses' && <ExpensesScreen token={authToken} />}
 
         {/* Phase 3 billing screens */}
         {activeTab === 'billing' && (

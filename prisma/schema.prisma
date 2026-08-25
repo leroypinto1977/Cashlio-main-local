@@ -121,6 +121,7 @@ model User {
   warrantiesClaimed  Warranty[]         @relation("WarrantyClaimedBy")
   warrantiesResolved Warranty[]         @relation("WarrantyResolvedBy")
   dayCloses          DayClose[]
+  expenses           Expense[]
 }
 
 /// Names are unique without regard to case — a functional index on
@@ -578,9 +579,12 @@ model DayClose {
   businessDate DateTime @unique @db.Date
   /// What was in the drawer before trading started.
   openingFloat Decimal  @db.Decimal(10, 2)
-  /// Opening float + cash taken - cash refunded, as the books had it when the
-  /// count was made.
+  /// Opening float + cash taken - cash refunded - cash paid out, as the books
+  /// had it when the count was made.
   expectedCash Decimal  @db.Decimal(10, 2)
+  /// Cash handed over the counter for expenses that day — the courier, a part,
+  /// the tea. Frozen with the rest, so a difference stays traceable.
+  cashPaidOut  Decimal  @default(0) @db.Decimal(10, 2)
   /// What was actually in the drawer.
   countedCash  Decimal  @db.Decimal(10, 2)
   /// counted - expected. Negative is short, positive is over.
@@ -601,4 +605,69 @@ model DayClose {
   closedAt     DateTime @default(now())
 
   @@index([businessDate])
+}
+
+/// What the shop spends money on, as a controlled list.
+///
+/// A controlled list rather than a free-text field because the whole point of
+/// recording expenses is to total them by kind — "we spent ₹40,000 on wages
+/// last month" only exists if wages, Wages and salary are one thing.
+model ExpenseCategory {
+  id        String    @id @default(uuid())
+  /// Unique without regard to case — see the case_insensitive_names migration.
+  name      String    @unique
+  /// FIXED costs are there whether the shop sells anything or not — rent,
+  /// wages, the internet line. VARIABLE ones move with trade — freight,
+  /// packing, commission. The split is what makes a break-even figure
+  /// possible later; on its own it is still worth grouping by.
+  kind      String    @default("FIXED")
+  /// Retired rather than deleted: last year's expenses still point at it.
+  isActive  Boolean   @default(true)
+  createdAt DateTime  @default(now())
+  expenses  Expense[]
+
+  @@index([isActive])
+}
+
+/// Money going out that is not stock.
+///
+/// Without these the analytics screen can only ever report gross margin, which
+/// is not the number a shopkeeper means when they ask what they made.
+model Expense {
+  id           String          @id @default(uuid())
+  categoryId   String
+  category     ExpenseCategory @relation(fields: [categoryId], references: [id])
+  /// What was actually handed over, GST included — the figure on the bill.
+  amount       Decimal         @db.Decimal(12, 2)
+  /// The GST inside that amount. A registered shop reclaims it, so it is not
+  /// a cost; net profit is worked out against `amount - gstAmount`, which is
+  /// also the only figure comparable with ex-GST revenue.
+  gstAmount    Decimal         @default(0) @db.Decimal(12, 2)
+  /// The IST calendar day this expense belongs to, held as UTC midnight so it
+  /// round-trips through a `date` column unchanged.
+  paidOn       DateTime        @db.Date
+  /// CASH | UPI | CARD | CHEQUE | BANK
+  method       String          @default("CASH")
+  /// Cash taken out of the till rather than from a bank or a pocket. The day
+  /// book subtracts these, which turns "the drawer is ₹200 short" into a
+  /// courier who was paid.
+  paidFromTill Boolean         @default(false)
+  payee        String?
+  /// Their bill number, a cheque number, a UPI reference.
+  reference    String?
+  notes        String?
+  /// A cost that comes round every month — rent, wages, the internet line.
+  /// Flagged so the months it has not been recorded in can be pointed out;
+  /// nothing is created automatically, because an expense nobody entered is
+  /// an expense nobody checked.
+  isRecurring  Boolean         @default(false)
+  recordedById String
+  recordedBy   User            @relation(fields: [recordedById], references: [id])
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+
+  // Every read is a date range, usually narrowed to a category.
+  @@index([paidOn])
+  @@index([categoryId, paidOn])
+  @@index([paidFromTill, paidOn])
 }

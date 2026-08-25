@@ -1,10 +1,10 @@
 /**
- * The receipt, and the page it prints on.
+ * The logic that needs no database: the receipt and the page it prints on, the
+ * keyboard layer, and the expense arithmetic.
  *
- * A receipt is the one thing a customer takes away, and a thermal roll gives
- * no second chance: the width is fixed by the paper and the length is cut
- * where the print ends. Both are arithmetic, so both are checked here rather
- * than discovered on a roll in a shop.
+ * All of it is the kind of thing that is discovered on a roll in a shop, or at
+ * a counter with a queue, or in a month-end figure nobody can reconcile —
+ * unless it is checked here first.
  */
 const path = require('path')
 const fs = require('fs')
@@ -15,7 +15,8 @@ fs.mkdirSync(buildDir, { recursive: true })
 for (const [entry, out] of [
   [path.join(__dirname, '..', 'src', 'renderer', 'src', 'lib', 'receipt.ts'), 'receipt.cjs'],
   [path.join(__dirname, '..', 'src', 'main', 'printing.ts'), 'printing.cjs'],
-  [path.join(__dirname, '..', 'src', 'renderer', 'src', 'lib', 'billingShortcuts.tsx'), 'shortcuts.cjs']
+  [path.join(__dirname, '..', 'src', 'renderer', 'src', 'lib', 'billingShortcuts.tsx'), 'shortcuts.cjs'],
+  [path.join(__dirname, '..', 'src', 'main', 'domain', 'expenses.ts'), 'expenses.cjs']
 ]) {
   esbuild.buildSync({
     entryPoints: [entry],
@@ -37,6 +38,7 @@ global.window = {}
 const R = require(path.join(buildDir, 'receipt.cjs'))
 const P = require(path.join(buildDir, 'printing.cjs'))
 const K = require(path.join(buildDir, 'shortcuts.cjs'))
+const X = require(path.join(buildDir, 'expenses.cjs'))
 
 let pass = 0, fail = 0
 const t = (name, cond, detail) => {
@@ -221,6 +223,75 @@ console.log('\n— the keys a cashier uses —')
   eq('...and so is a stale step', act('=', true, { selectedLine: 9, lineCount: 3 }).index, 2)
 
   eq('an unclaimed Alt combination is left alone', act('q', true).type, 'none')
+}
+
+// ─── Expenses ────────────────────────────────────────────────────────────────
+console.log('\n— what the shop spends —')
+{
+  const today = new Date(new Date(Date.now() + 5.5 * 3600e3).toISOString().slice(0, 10) + 'T00:00:00.000Z')
+  const key = (d) => d.toISOString().slice(0, 10)
+  const shift = (days) => key(new Date(today.getTime() + days * 864e5))
+  const ok = (over = {}) => X.parseExpense({ categoryId: 'c1', amount: 1180, gstAmount: 180, ...over })
+
+  t('a plain expense parses', ok().ok)
+  eq('the amount is kept as paid', ok().value.amount, 1180)
+  eq('and so is the tax inside it', ok().value.gstAmount, 180)
+
+  // The whole reason the tax is stored separately.
+  eq('an expense costs what is left after the tax comes back', X.netCost(1180, 180), 1000)
+  eq('with no tax it costs what was paid', X.netCost(5000, 0), 5000)
+  eq('a nonsense pair never costs less than nothing', X.netCost(100, 500), 0)
+
+  // The two mistakes that would quietly corrupt a total.
+  eq('an amount that is not a number is refused', ok({ amount: 'abc' }).error, 'AMOUNT_REQUIRED')
+  eq('so is nothing at all', ok({ amount: 0 }).error, 'AMOUNT_NOT_POSITIVE')
+  eq('and a negative one', ok({ amount: -50 }).error, 'AMOUNT_NOT_POSITIVE')
+  eq('GST larger than the amount is refused', ok({ amount: 100, gstAmount: 500 }).error, 'GST_EXCEEDS_AMOUNT')
+  t('...saying it is the tax inside, not on top',
+    /inside that figure/.test(ok({ amount: 100, gstAmount: 500 }).message))
+  eq('GST equal to the amount is allowed through', ok({ amount: 100, gstAmount: 100 }).ok, true)
+  eq('negative GST is refused', ok({ gstAmount: -1 }).error, 'GST_INVALID')
+  eq('no category is refused', ok({ categoryId: '  ' }).error, 'CATEGORY_REQUIRED')
+
+  // A mistyped year is the realistic date error, in both directions.
+  eq('rent paid for next month is fine', ok({ paidOn: shift(31) }).ok, true)
+  eq('a date a year out is refused', ok({ paidOn: shift(400) }).error, 'DATE_TOO_FAR_AHEAD')
+  eq('last month is fine', ok({ paidOn: shift(-31) }).ok, true)
+  eq('a date four years back is refused', ok({ paidOn: shift(-1500) }).error, 'DATE_TOO_FAR_BACK')
+  eq('a malformed date is refused', ok({ paidOn: '24-08-2026' }).error, 'BAD_DATE')
+  eq('a date that does not exist is refused', ok({ paidOn: '2026-02-30' }).error, 'BAD_DATE')
+  eq('no date at all means today', X.parseExpense({ categoryId: 'c1', amount: 10 }).value.paidOn.getTime(), today.getTime())
+
+  // Only cash can come out of the drawer.
+  eq('cash can be taken from the till', ok({ method: 'CASH', paidFromTill: true }).value.paidFromTill, true)
+  eq('a card payment cannot', ok({ method: 'CARD', paidFromTill: true }).value.paidFromTill, false)
+  eq('nor a bank transfer', ok({ method: 'BANK', paidFromTill: true }).value.paidFromTill, false)
+  eq('an unknown method falls back to cash', ok({ method: 'CRYPTO' }).value.method, 'CASH')
+
+  // Totals, which is the whole point of recording any of this.
+  const row = (name, kind, amount, gst) => ({
+    category: { id: name, name, kind }, amount, gstAmount: gst, netCost: X.netCost(amount, gst)
+  })
+  const rows = [
+    row('Rent', 'FIXED', 25000, 0),
+    row('Salaries & wages', 'FIXED', 40000, 0),
+    row('Transport & freight', 'VARIABLE', 1180, 180),
+    row('Transport & freight', 'VARIABLE', 590, 90)
+  ]
+  const tot = X.totalExpenses(rows)
+  eq('what was handed over', tot.paid, 66770)
+  eq('the tax inside it', tot.gst, 270)
+  eq('what it actually cost', tot.net, 66500)
+  eq('fixed costs are separated', tot.fixed, 65000)
+  eq('from the ones that move with trade', tot.variable, 1500)
+  eq('and paid is always net plus tax', tot.net + tot.gst, tot.paid)
+
+  const byCat = X.totalByCategory(rows)
+  eq('three categories, not four rows', byCat.length, 3)
+  eq('biggest first, since that is what gets looked at', byCat[0].name, 'Salaries & wages')
+  eq('repeat entries in a category are added up', byCat.find((c) => c.name === 'Transport & freight').netCost, 1500)
+  eq('...and counted', byCat.find((c) => c.name === 'Transport & freight').count, 2)
+  eq('an empty month totals to nothing', X.totalExpenses([]).net, 0)
 }
 
 console.log(`\n${pass} passed, ${fail} failed`)

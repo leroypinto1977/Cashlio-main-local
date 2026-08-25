@@ -1915,6 +1915,114 @@ async function api(path, opts = {}, token) {
       (ev?.payload?.barcodes || []).includes('8901058000108'), ev?.payload?.barcodes)
   }
 
+  // ── expenses ─────────────────────────────────────────────────────────────
+  // The analytics screen has always said "gross margin", which is honest but
+  // is not what a shopkeeper means by profit. These check the expenses reach
+  // that figure, and reach the drawer.
+  console.log('\n— what the shop spends, and what is left —')
+  {
+    r = await api('/api/v1/expense-categories', {}, token)
+    t('the shop starts with categories to pick from', r.body.categories.length >= 8, r.body.categories?.length)
+    const cat = (name) => r.body.categories.find((c) => c.name === name)
+    const rent = cat('Rent'), freight = cat('Transport & freight'), wages = cat('Salaries & wages')
+    t('...including the fixed ones', rent?.kind === 'FIXED' && wages?.kind === 'FIXED', [rent?.kind, wages?.kind])
+    t('...and the ones that move with trade', freight?.kind === 'VARIABLE', freight?.kind)
+
+    const todayKey2 = new Date(new Date(Date.now() + 5.5 * 3600e3).toISOString().slice(0, 10) + 'T00:00:00.000Z')
+      .toISOString().slice(0, 10)
+    const spend = (body) => api('/api/v1/expenses', { method: 'POST', body: JSON.stringify({ paidOn: todayKey2, ...body }) }, token)
+
+    r = await spend({ categoryId: rent.id, amount: 25000, method: 'BANK', payee: 'Landlord', isRecurring: true })
+    t('rent is recorded', r.status === 201, r.body)
+    eqp('and costs what was paid, there being no tax on it', r.body.expense.netCost, 25000)
+
+    r = await spend({ categoryId: freight.id, amount: 1180, gstAmount: 180, method: 'UPI', reference: 'UPI9911' })
+    t('freight is recorded', r.status === 201, r.body)
+    eqp('and costs the amount less the tax the shop reclaims', r.body.expense.netCost, 1000)
+
+    // Only cash leaves the drawer.
+    r = await spend({ categoryId: freight.id, amount: 200, method: 'CASH', paidFromTill: true, payee: 'Courier' })
+    t('a courier paid from the till is recorded', r.status === 201, r.body)
+    t('...and marked as coming out of the drawer', r.body.expense.paidFromTill === true, r.body.expense)
+    const courierId = r.body.expense.id
+
+    r = await spend({ categoryId: freight.id, amount: 300, method: 'CARD', paidFromTill: true })
+    t('a card payment cannot come out of the drawer', r.body.expense?.paidFromTill === false, r.body.expense)
+
+    // The refusals that keep a total honest.
+    r = await spend({ categoryId: rent.id, amount: 500, gstAmount: 900 })
+    t('GST above the amount is refused', r.status === 400 && r.body.error === 'GST_EXCEEDS_AMOUNT', r.body)
+    r = await spend({ categoryId: rent.id, amount: -100 })
+    t('a negative expense is refused', r.status === 400 && r.body.error === 'AMOUNT_NOT_POSITIVE', r.body)
+    r = await spend({ categoryId: 'no-such-category', amount: 100 })
+    t('an unknown category is refused', r.status === 400 && r.body.error === 'CATEGORY_NOT_FOUND', r.body)
+    r = await api('/api/v1/expenses', { method: 'POST', body: JSON.stringify({ categoryId: rent.id, amount: 100 }) }, cashierToken)
+    t('a cashier cannot see or record what the shop spends', r.status === 403, r.status)
+
+    // The totals, which are the reason for recording any of it.
+    r = await api(`/api/v1/expenses/summary?from=${todayKey2}&to=${todayKey2}`, {}, token)
+    const sum = r.body.totals
+    eqp('everything handed over', sum.paid, 25000 + 1180 + 200 + 300)
+    eqp('the tax inside it', sum.gst, 180)
+    eqp('what it actually cost', sum.net, 25000 + 1000 + 200 + 300)
+    eqp('paid is always net plus tax', sum.net + sum.gst, sum.paid)
+    eqp('fixed and variable split out', sum.fixed, 25000)
+    eqp('...and add back to the whole', sum.fixed + sum.variable, sum.net)
+    t('the biggest category leads', r.body.byCategory[0].name === 'Rent', r.body.byCategory)
+
+    // The drawer. This is what turns "short by ₹200" into "the courier".
+    const bookBefore = (await api(`/api/v1/reports/day-book?date=${todayKey2}`, {}, token)).body.book
+    eqp('the courier is out of the drawer', bookBefore.cash.paidOut, 200)
+    t('...and is listed so it can be traced', bookBefore.paidOut.some((p) => p.payee === 'Courier'), bookBefore.paidOut)
+    t('only till cash is listed', bookBefore.paidOut.length === 1, bookBefore.paidOut)
+
+    await api(`/api/v1/expenses/${courierId}`, { method: 'DELETE' }, token)
+    const bookAfter = (await api(`/api/v1/reports/day-book?date=${todayKey2}`, {}, token)).body.book
+    eqp('removing it puts the money back', bookAfter.cash.expected - bookBefore.cash.expected, 200)
+    eqp('and nothing is paid out', bookAfter.cash.paidOut, 0)
+
+    // Net profit — the number this whole phase exists for.
+    r = await api('/api/v1/analytics/summary?period=today', {}, token)
+    const a = r.body.summary
+    t('the expenses reach analytics', a.totalExpenses > 0, a.totalExpenses)
+    eqp('net profit is gross profit less what it cost to run the shop',
+      a.netProfit, Math.round((a.estimatedGrossProfit - a.totalExpenses) * 100) / 100)
+    t('which is below the gross figure', a.netProfit < a.estimatedGrossProfit, [a.netProfit, a.estimatedGrossProfit])
+    t('and the categories come with it', a.expensesByCategory.length >= 2, a.expensesByCategory?.length)
+
+    // Monthly costs that have not been entered yet.
+    r = await api('/api/v1/expenses/recurring-due', {}, token)
+    t('rent recorded this month is not chased', !r.body.due.some((d) => d.name === 'Rent'), r.body.due)
+    const lastMonth = new Date(Date.UTC(
+      new Date(todayKey2 + 'T00:00:00Z').getUTCFullYear(),
+      new Date(todayKey2 + 'T00:00:00Z').getUTCMonth() - 2, 15)).toISOString().slice(0, 10)
+    await spend({ categoryId: wages.id, amount: 40000, paidOn: lastMonth, method: 'BANK', isRecurring: true })
+    r = await api('/api/v1/expenses/recurring-due', {}, token)
+    const dueWages = r.body.due.find((d) => d.name === 'Salaries & wages')
+    t('a monthly cost not yet entered is pointed at', !!dueWages, r.body.due)
+    eqp('...with what it was last time', dueWages?.lastAmount, 40000)
+    const stillMissing = await prisma.expense.count({
+      where: { categoryId: wages.id, paidOn: { gte: new Date(todayKey2.slice(0, 7) + '-01') } } })
+    eqp('the month really is still empty for it', stillMissing, 0)
+
+    // An edit goes through the same checks a new one does.
+    const freightExpense = (await api(`/api/v1/expenses?from=${todayKey2}&to=${todayKey2}`, {}, token))
+      .body.expenses.find((e) => e.reference === 'UPI9911')
+    r = await api(`/api/v1/expenses/${freightExpense.id}`, { method: 'PUT', body: JSON.stringify({ gstAmount: 5000 }) }, token)
+    t('an edit cannot put GST above the amount', r.status === 400 && r.body.error === 'GST_EXCEEDS_AMOUNT', r.body)
+    r = await api(`/api/v1/expenses/${freightExpense.id}`, { method: 'PUT', body: JSON.stringify({ amount: 2360, gstAmount: 360 }) }, token)
+    t('a real correction is accepted', r.status === 200, r.body)
+    eqp('and the cost follows it', r.body.expense.netCost, 2000)
+
+    // A category in use is retired, never deleted, or the total loses its label.
+    r = await api(`/api/v1/expense-categories/${rent.id}`, { method: 'PUT', body: JSON.stringify({ isActive: false }) }, token)
+    t('a category can be retired', r.status === 200, r.body)
+    r = await api('/api/v1/expense-categories', {}, token)
+    t('...and drops out of the picker', !r.body.categories.some((c) => c.id === rent.id), r.body.categories?.length)
+    r = await api(`/api/v1/expenses/summary?from=${todayKey2}&to=${todayKey2}`, {}, token)
+    t('while the money spent on it still totals', r.body.byCategory.some((c) => c.name === 'Rent'), r.body.byCategory)
+  }
+
   console.log(`\n${pass} passed, ${fail} failed`)
   await prisma.$disconnect()
   process.exit(fail ? 1 : 0)
