@@ -12,6 +12,6 @@
     "",
     "Generate the pair with: node admin-saas/scripts/gen-license-keys.js"
   ],
-  "saasApiUrl": "",
-  "licensePublicKey": ""
+  "saasApiUrl": "https://cashlio-licence-server.vercel.app",
+  "licensePublicKey": "MCowBQYDK2VwAyEA+F/toH/QJETFwcrtJh97pkQ4orv5SxQmrbYRMQr+Qmk="
 }
