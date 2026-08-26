@@ -11,6 +11,18 @@ files:
   - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
 asarUnpack:
   - resources/**
+# The database and the migrations that shape it travel with the app. They are
+# put beside the app rather than inside the asar because PostgreSQL is a set of
+# executables — they have to exist as real files to be run.
+extraResources:
+  - from: resources/postgres/${platform}
+    to: postgres
+    filter:
+      - '**/*'
+  - from: prisma/migrations
+    to: prisma/migrations
+    filter:
+      - '**/*.sql'
 win:
   executableName: main-local
 nsis:
@@ -20,6 +32,19 @@ nsis:
   createDesktopShortcut: always
 mac:
   entitlementsInherit: build/entitlements.mac.plist
+  entitlements: build/entitlements.mac.plist
+  # This build is not notarised — there is no Apple Developer identity behind
+  # it — so the hardened runtime buys nothing and costs a great deal: it
+  # refuses to load the PostgreSQL libraries the app ships with, and signing
+  # 140 MB of database binaries produced a seal that did not match the bundle,
+  # which macOS reports as "code has no resources but signature indicates they
+  # must be present" and shows the user as an app that opens no window at all.
+  # Apple Silicon refuses to run an unsigned binary at all, so the build is
+  # ad-hoc signed (electron-builder's default when no Developer ID is present).
+  # The hardened runtime stays off: without notarisation it adds nothing, and
+  # it refuses to load the PostgreSQL libraries the app ships with.
+  hardenedRuntime: false
+  gatekeeperAssess: false
   extendInfo:
     - NSCameraUsageDescription: Application requests access to the device's camera.
     - NSMicrophoneUsageDescription: Application requests access to the device's microphone.

@@ -38,3 +38,7 @@ resources/.env
 .tls-build/
 test/.build/
 test/.build/
+
+# The bundled PostgreSQL runtime — fetched per platform by
+# scripts/fetch-postgres.sh, ~150 MB each, never committed.
+resources/postgres/

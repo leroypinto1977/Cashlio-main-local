@@ -9,6 +9,8 @@ import { startExpressServer, stopExpressServer, startSyncEventPruning } from './
 import { setBranchCertFingerprint } from './branchCert'
 import { ensureBranchCert, fingerprintOfPem, fingerprintsMatch } from './tls'
 import { registerPrintingIpc } from './printing'
+import { startBundledPostgres, stopBundledPostgres } from './postgres'
+import { applyMigrations } from './migrate'
 import { verifyBackup, testRestore, restoreOverLive, writeLastRestoreCheck } from './restore'
 import { prisma } from './prisma'
 import { runBackup, listBackups, getBackupStatus, getBackupDir, startBackupSchedule } from './backup'
@@ -91,16 +93,37 @@ ensureSessionSecret()
 // A rejected promise in the main process terminates Electron under Node 20+.
 // Without these the manager app vanishes mid-shift, taking every till's
 // server with it, and leaves nothing behind to explain why.
+/**
+ * Appends a line to the app's own log, creating the directory if it is not
+ * there yet.
+ *
+ * On a first launch userData does not exist, so this used to fail silently and
+ * the one crash worth reading — the one that stops the app before it can
+ * create anything — was the one that never got written down.
+ */
+function logToFile(name: string, line: string): void {
+  try {
+    const dir = app.getPath('userData')
+    fs.mkdirSync(dir, { recursive: true })
+    fs.appendFileSync(join(dir, name), line)
+  } catch {
+    // Logging must never be the thing that brings the app down.
+  }
+}
+
+/** Startup progress, so a packaged app that does nothing can still be read. */
+export function bootLog(message: string): void {
+  const line = `[${new Date().toISOString()}] ${message}\n`
+  console.log(line.trimEnd())
+  logToFile('boot.log', line)
+}
+
 function logCrash(kind: string, err: unknown): void {
   const line = `[${new Date().toISOString()}] ${kind}: ${
     err instanceof Error ? (err.stack ?? err.message) : String(err)
   }\n`
   console.error(line)
-  try {
-    fs.appendFileSync(join(app.getPath('userData'), 'crash.log'), line)
-  } catch {
-    // Logging must never be the thing that brings the app down.
-  }
+  logToFile('crash.log', line)
 }
 process.on('unhandledRejection', (reason) => logCrash('unhandledRejection', reason))
 process.on('uncaughtException', (err) => logCrash('uncaughtException', err))
@@ -184,6 +207,31 @@ app.on('certificate-error', (event, _webContents, url, _error, certificate, call
 app.whenReady().then(async () => {
   // Set app user model id for windows
   electronApp.setAppUserModelId('com.cashlio.manager')
+
+  // The database ships inside the app, so it has to be running before anything
+  // asks it a question. A failure here is fatal and has to say so plainly: the
+  // shop has no data without it, and a blank window with a console error is not
+  // an explanation anybody can act on.
+  bootLog(`starting — packaged=${app.isPackaged} platform=${process.platform}`)
+  try {
+    bootLog('bringing up the database')
+    const pg = await startBundledPostgres()
+    bootLog(pg ? `database up on port ${pg.port}` : 'no bundled database; using DATABASE_URL')
+    if (pg) {
+      const { applied, error } = applyMigrations(process.env.BACKUP_PSQL_PATH!, pg.url)
+      if (error) throw new Error(error)
+      bootLog(`migrations: ${applied.length} applied`)
+    }
+  } catch (e) {
+    const message = e instanceof Error ? (e.stack ?? e.message) : String(e)
+    bootLog(`FATAL: ${message}`)
+    dialog.showErrorBox(
+      'Cashlio could not start its database',
+      `${message}\n\nThe shop's data is safe — nothing has been changed. If this keeps happening, send this message to your supplier.`
+    )
+    app.quit()
+    return
+  }
 
   // Default open or close DevTools by F12 in development
   // and ignore CommandOrControl + R in production.
@@ -397,6 +445,13 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
     app.quit()
   }
+})
+
+// Stop the database with the app rather than leaving it running after the
+// window is gone — an orphaned server holds the data directory, and the next
+// launch would find it locked by a process nobody can see.
+app.on('will-quit', () => {
+  stopBundledPostgres()
 })
 
 // In this file you can include the rest of your app's specific main process

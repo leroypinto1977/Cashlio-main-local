@@ -4,9 +4,17 @@
   <dict>
     <key>com.apple.security.cs.allow-jit</key>
     <true/>
+    <!-- Also what lets the bundled PostgreSQL binaries be spawned. -->
     <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
     <true/>
     <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+    <true/>
+    <!--
+      The app ships its own PostgreSQL and runs it as a child process. macOS
+      otherwise refuses to load libraries not signed by the same team as the
+      process loading them, which is every one of the database's own dylibs.
+    -->
+    <key>com.apple.security.cs.disable-library-validation</key>
     <true/>
   </dict>
 </plist>
