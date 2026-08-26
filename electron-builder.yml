@@ -11,26 +11,42 @@ files:
   - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
 asarUnpack:
   - resources/**
-# The database and the migrations that shape it travel with the app. They are
-# put beside the app rather than inside the asar because PostgreSQL is a set of
-# executables — they have to exist as real files to be run.
+# The migrations travel with the app for every platform; the database itself is
+# named per platform below, because ${platform} in a shared block resolves to
+# the machine doing the building rather than the target — an Apple Silicon Mac
+# quietly puts macOS binaries inside a Windows installer, and the failure only
+# shows up on the first computer that is not the one that built it.
 extraResources:
-  - from: resources/postgres/${platform}
-    to: postgres
-    filter:
-      - '**/*'
   - from: prisma/migrations
     to: prisma/migrations
     filter:
       - '**/*.sql'
 win:
   executableName: main-local
+  extraResources:
+    - from: resources/postgres/win32
+      to: postgres
+      filter:
+        - '**/*'
+  # x64 explicitly. electron-builder otherwise builds for whatever the machine
+  # doing the building happens to be — an Apple Silicon Mac produces an arm64
+  # Windows installer, which is not what is on a shop counter, and which would
+  # not match the x64 PostgreSQL bundled beside it.
+  target:
+    - target: nsis
+      arch:
+        - x64
 nsis:
   artifactName: ${name}-${version}-setup.${ext}
   shortcutName: ${productName}
   uninstallDisplayName: ${productName}
   createDesktopShortcut: always
 mac:
+  extraResources:
+    - from: resources/postgres/darwin
+      to: postgres
+      filter:
+        - '**/*'
   entitlementsInherit: build/entitlements.mac.plist
   entitlements: build/entitlements.mac.plist
   # This build is not notarised — there is no Apple Developer identity behind
