@@ -59,16 +59,31 @@ function validateEnv(): string[] {
   const required: [string, string][] = [
     ['DATABASE_URL', 'the local PostgreSQL connection string'],
     ['JWT_SECRET', 'the session signing secret'],
-    ['LICENSE_PUBLIC_KEY', 'the licence verification key']
+    ['LICENSE_PUBLIC_KEY', 'the licence verification key'],
+    ['SAAS_API_URL', 'the address of the licence server']
   ]
   return required
     .filter(([k]) => !process.env[k])
     .map(([k, why]) => `${k} — ${why}`)
 }
 
+/**
+ * What this build was made knowing: the licence server's address and the key
+ * that verifies what it signs. Baked in by electron.vite.config.ts. Neither is
+ * a secret — the private half never leaves admin-saas — and having them here
+ * is what lets somebody install the app and set it up without first being
+ * talked through creating a dotfile in AppData.
+ */
+declare const __BUILD_CONFIG__: { saasApiUrl: string; licensePublicKey: string }
+const BUILD_CONFIG: { saasApiUrl: string; licensePublicKey: string } =
+  typeof __BUILD_CONFIG__ !== 'undefined'
+    ? __BUILD_CONFIG__
+    : { saasApiUrl: '', licensePublicKey: '' }
+
 // Load .env at runtime. In dev, electron-vite already injects from ./.env.
-// In a packaged build this reads a user-editable file in userData. Nothing
-// secret ships inside the package any more.
+// In a packaged build this reads a user-editable file in userData, which stays
+// supported so a shop can be repointed at a different licence server without a
+// new installer — it just is not required any more.
 function loadRuntimeEnv(): void {
   const candidates = [
     join(app.getPath('userData'), '.env'),
@@ -83,8 +98,20 @@ function loadRuntimeEnv(): void {
       console.log(`[env] loaded ${p}`)
     }
   }
-  // Sensible defaults so the app still boots if no .env is present.
-  if (!process.env.SAAS_API_URL) process.env.SAAS_API_URL = 'http://localhost:3000'
+  // What the build was made with, where nothing has overridden it. A file in
+  // userData still wins, so a shop can be moved to another licence server
+  // without waiting for a new build.
+  if (!process.env.SAAS_API_URL && BUILD_CONFIG.saasApiUrl) {
+    process.env.SAAS_API_URL = BUILD_CONFIG.saasApiUrl
+  }
+  if (!process.env.LICENSE_PUBLIC_KEY && BUILD_CONFIG.licensePublicKey) {
+    process.env.LICENSE_PUBLIC_KEY = BUILD_CONFIG.licensePublicKey
+  }
+  // Only a development fallback. A packaged build with no licence server
+  // configured is caught below rather than quietly pointed at localhost.
+  if (!process.env.SAAS_API_URL && !app.isPackaged) {
+    process.env.SAAS_API_URL = 'http://localhost:3000'
+  }
   if (!process.env.LOCAL_SERVER_PORT) process.env.LOCAL_SERVER_PORT = '52001'
 }
 loadRuntimeEnv()

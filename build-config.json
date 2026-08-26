@@ -1,0 +1,17 @@
+{
+  "_comment": [
+    "What a built copy of this app knows about the licence server before it is",
+    "ever run. Neither value is a secret: the public key is the verifying half",
+    "of the signing pair, and the URL is a public endpoint. The private key",
+    "lives only in admin-saas, and the session secret is generated per install.",
+    "",
+    "Fill these in, then build. A release build refuses to start if they are",
+    "empty, because an installer that cannot reach its licence server is one",
+    "that cannot be set up, and finding that out on someone else's computer is",
+    "the expensive way.",
+    "",
+    "Generate the pair with: node admin-saas/scripts/gen-license-keys.js"
+  ],
+  "saasApiUrl": "",
+  "licensePublicKey": ""
+}
