@@ -38,6 +38,10 @@ win:
         - x64
 nsis:
   artifactName: ${name}-${version}-setup.${ext}
+  # Installs the Visual C++ runtime the bundled PostgreSQL links against. See
+  # build/installer.nsh — without it the database will not start on a machine
+  # that has never had it, which a clean Windows install has not.
+  include: build/installer.nsh
   shortcutName: ${productName}
   uninstallDisplayName: ${productName}
   createDesktopShortcut: always

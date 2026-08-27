@@ -42,3 +42,7 @@ test/.build/
 # The bundled PostgreSQL runtime — fetched per platform by
 # scripts/fetch-postgres.sh, ~150 MB each, never committed.
 resources/postgres/
+
+# Microsoft's Visual C++ redistributable, fetched at build time by
+# scripts/fetch-vc-redist.sh. Their binary, not ours to commit.
+build/vc_redist.x64.exe

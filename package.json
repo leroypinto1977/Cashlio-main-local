@@ -16,7 +16,7 @@
     "build": "npm run typecheck && electron-vite build",
     "postinstall": "electron-builder install-app-deps",
     "build:unpack": "npm run build && electron-builder --dir",
-    "build:win": "npm run check:build-config && npm run build && electron-builder --win --x64",
+    "build:win": "npm run check:build-config && ./scripts/fetch-vc-redist.sh && npm run build && electron-builder --win --x64",
     "build:mac": "npm run check:build-config && npm run build && electron-builder --mac",
     "build:linux": "electron-vite build && electron-builder --linux",
     "test:shared": "tsc src/shared/money.ts src/shared/validation.ts src/shared/units.ts src/shared/credit.ts src/shared/procurement.ts src/shared/warranty.ts --outDir .test-build --module commonjs --target es2020 --skipLibCheck && node test/shared.test.cjs",
