@@ -21,6 +21,16 @@ extraResources:
     to: prisma/migrations
     filter:
       - '**/*.sql'
+  # Prisma's query engine is a native binary living in a dot-directory that
+  # electron-builder does not collect. Node also cannot dlopen anything from
+  # inside an asar, so it ships as a plain resource. Without it @prisma/client
+  # hangs at import — before a window is drawn or a single line is logged, so
+  # the application simply looks as though it never started.
+  - from: node_modules/.prisma/client
+    to: prisma-engine
+    filter:
+      - '*.node'
+      - 'schema.prisma'
 win:
   executableName: main-local
   extraResources:

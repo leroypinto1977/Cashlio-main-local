@@ -114,8 +114,12 @@ function loadRuntimeEnv(): void {
   }
   if (!process.env.LOCAL_SERVER_PORT) process.env.LOCAL_SERVER_PORT = '52001'
 }
-loadRuntimeEnv()
-ensureSessionSecret()
+// Deliberately not called here.
+//
+// Both touch app.getPath('userData'), and asking Electron for a path before it
+// is ready blocks on macOS: the process starts, paints nothing, logs nothing,
+// and sits there. They run at the top of whenReady instead, which is the first
+// moment either is safe and still long before anything reads what they set.
 
 // A rejected promise in the main process terminates Electron under Node 20+.
 // Without these the manager app vanishes mid-shift, taking every till's
@@ -239,7 +243,28 @@ app.whenReady().then(async () => {
   // asks it a question. A failure here is fatal and has to say so plainly: the
   // shop has no data without it, and a blank window with a console error is not
   // an explanation anybody can act on.
+  // First, because everything below reads what these establish — and because
+  // neither is safe to call before this point.
+  loadRuntimeEnv()
+  ensureSessionSecret()
+
   bootLog(`starting — packaged=${app.isPackaged} platform=${process.platform}`)
+
+  // The window comes up first, before the database.
+  //
+  // Bringing PostgreSQL up means running initdb and waiting for the server to
+  // accept connections, and both are synchronous: they block the main thread,
+  // which is the thread Electron paints on. Doing that before the window
+  // exists means nothing is drawn until it finishes — and if it never
+  // finishes, the application is a process in the dock with no window, no
+  // message, and no way for anybody to tell what it is waiting for. That is
+  // not a hypothetical; it is what this did.
+  //
+  // With the window already up, a slow first launch looks like a slow first
+  // launch, and a failed one has somewhere to say so.
+  createWindow()
+  await new Promise((r) => setTimeout(r, 50))   // let the first frame paint
+
   try {
     bootLog('bringing up the database')
     const pg = await startBundledPostgres()
@@ -409,8 +434,7 @@ app.whenReady().then(async () => {
     console.error(
       `[license] Refusing to start: local clock is ${Math.round((clock.driftMs ?? 0) / 60000)} min behind server-issued time. Fix the system clock and relaunch.`
     )
-    // Don't start Express, but still create the window so the user sees an error UI.
-    createWindow()
+    // Don't start Express. The window is already up and shows the error.
     return
   }
 
@@ -455,8 +479,6 @@ app.whenReady().then(async () => {
 
   // Keep the terminals' change log from growing without bound.
   startSyncEventPruning()
-
-  createWindow()
 
   app.on('activate', function () {
     // On macOS it's common to re-create a window in the app when the

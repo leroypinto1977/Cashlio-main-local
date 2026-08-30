@@ -1,5 +1,11 @@
 generator client {
   provider = "prisma-client-js"
+  // The query engine is a native binary, and only the one for the machine
+  // running `prisma generate` is produced by default. A Windows installer built
+  // on a Mac therefore ships a macOS engine, and @prisma/client hangs at import
+  // looking for one it can load — no window, no log, nothing to diagnose.
+  // Naming the targets makes both engines exist so the packager can pick one.
+  binaryTargets = ["native", "windows"]
 }
 
 datasource db {
