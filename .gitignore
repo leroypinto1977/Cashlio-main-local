@@ -46,3 +46,6 @@ resources/postgres/
 # Microsoft's Visual C++ redistributable, fetched at build time by
 # scripts/fetch-vc-redist.sh. Their binary, not ours to commit.
 build/vc_redist.x64.exe
+
+# Local tooling state — per-machine, not project code.
+.claude-flow/
