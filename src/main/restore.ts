@@ -14,6 +14,7 @@ import { createGunzip } from 'node:zlib'
 import { Writable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { prisma } from './prisma'
+import type { PgToolUrl } from './pgUrl'
 import { pgToolUrl, pgToolUrlFor, pgEnv } from './pgUrl'
 
 export { pgToolUrl, pgToolUrlFor } from './pgUrl'
@@ -298,8 +299,19 @@ export async function checkPsql(): Promise<boolean> {
 }
 
 /** Runs one statement against a database, for CREATE/DROP DATABASE. */
-function psqlCommand(dbUrl: string, sql: string): Promise<{ ok: boolean; stderr: string }> {
-  const { url, password } = pgToolUrl(dbUrl)
+/**
+ * Takes an already-normalised URL, not a raw one.
+ *
+ * pgToolUrl lifts the password out of the URL so it can travel in the
+ * environment rather than the argument vector, where `ps` shows it to every
+ * account on the machine. Running a URL through it twice therefore loses the
+ * password: the second call parses a string that no longer has one. That is
+ * what happened here — the rehearsal that proves a backup can be read back
+ * failed on every run with "no password supplied", so the one check that
+ * distinguishes a backup from a file of the right size never ran.
+ */
+function psqlCommand(target: PgToolUrl, sql: string): Promise<{ ok: boolean; stderr: string }> {
+  const { url, password } = target
   return new Promise((resolve) => {
     const child = spawn(psqlPath(), ['--quiet', '--no-psqlrc', '-v', 'ON_ERROR_STOP=1', '-c', sql, url], {
       stdio: ['ignore', 'ignore', 'pipe'],
@@ -313,8 +325,9 @@ function psqlCommand(dbUrl: string, sql: string): Promise<{ ok: boolean; stderr:
 }
 
 /** Streams a gzipped dump into psql. */
-function psqlRestore(dbUrl: string, dumpPath: string): Promise<{ ok: boolean; stderr: string }> {
-  const { url, password } = pgToolUrl(dbUrl)
+/** As psqlCommand: already normalised, password kept alongside. */
+function psqlRestore(target: PgToolUrl, dumpPath: string): Promise<{ ok: boolean; stderr: string }> {
+  const { url, password } = target
   return new Promise((resolve) => {
     // ON_ERROR_STOP so a restore that hits a broken statement fails loudly
     // rather than leaving a half-populated database that looks restored.
@@ -334,8 +347,9 @@ function psqlRestore(dbUrl: string, dumpPath: string): Promise<{ ok: boolean; st
 }
 
 /** Counts rows in an arbitrary database, for checking what came back. */
-async function countsIn(dbUrl: string): Promise<Record<string, number> | null> {
-  const { url, password } = pgToolUrl(dbUrl)
+/** As psqlCommand: already normalised, so the password is not lost. */
+async function countsIn(target: PgToolUrl): Promise<Record<string, number> | null> {
+  const { url, password } = target
   const sql = `SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename NOT LIKE '\\_prisma%'`
   const list = await new Promise<string[] | null>((resolve) => {
     const child = spawn(psqlPath(), ['--quiet', '--no-psqlrc', '-t', '-A', '-c', sql, url], {
@@ -432,8 +446,8 @@ export async function testRestore(dumpPath: string): Promise<RestoreCheck> {
   const scratchName = `cashlio_restore_check_${Date.now()}`
   // CREATE DATABASE cannot run inside the database being created, so it is
   // issued against `postgres`, which every server has.
-  const adminUrl = pgToolUrlFor(dbUrl, 'postgres').url
-  const scratchUrl = pgToolUrlFor(dbUrl, scratchName).url
+  const adminUrl = pgToolUrlFor(dbUrl, 'postgres')
+  const scratchUrl = pgToolUrlFor(dbUrl, scratchName)
 
   const created = await psqlCommand(adminUrl, `CREATE DATABASE "${scratchName}"`)
   if (!created.ok) {
@@ -565,7 +579,7 @@ export async function restoreOverLive(args: LiveRestoreArgs): Promise<LiveRestor
   // this process is still holding open.
   await prisma.$disconnect()
 
-  const done = await psqlRestore(dbUrl, args.dumpPath)
+  const done = await psqlRestore(pgToolUrl(dbUrl), args.dumpPath)
   if (!done.ok) {
     return {
       ok: false,
@@ -574,7 +588,7 @@ export async function restoreOverLive(args: LiveRestoreArgs): Promise<LiveRestor
     }
   }
 
-  const counts = (await countsIn(dbUrl)) ?? {}
+  const counts = (await countsIn(pgToolUrl(dbUrl))) ?? {}
   return {
     ok: true,
     safetyBackup: path.basename(safety.fullPath),
