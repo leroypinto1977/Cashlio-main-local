@@ -3,11 +3,21 @@ productName: Cashlio Manager
 directories:
   buildResources: build
 files:
+  # Naming any pattern here replaces the packager's default of everything, so
+  # the default has to be said out loud before anything is added to it.
+  - '**/*'
   # The database runtimes are delivered per platform by the extraResources
   # blocks below. Without this exclusion they ALSO get swept into the app
   # directory — both of them, on every platform — so a macOS build carried the
   # whole Windows PostgreSQL and codesign spent twenty minutes signing Windows
   # DLLs and several thousand timezone files into a macOS bundle.
+  # @prisma/client is delivered outside the archive with the generated client
+  # below, and must not also be inside it. The two require each other, and a
+  # copy in the asar resolves '.prisma/client' to the one in Resources, which
+  # then looks back for '@prisma/client/runtime' by walking up real
+  # directories — a walk that never re-enters an asar. Both halves live on the
+  # same side of that boundary or neither works.
+  - '!node_modules/@prisma/client/**'
   - '!resources/postgres'
   - '!**/.vscode/*'
   - '!src/*'
@@ -24,20 +34,37 @@ asarUnpack:
 # quietly puts macOS binaries inside a Windows installer, and the failure only
 # shows up on the first computer that is not the one that built it.
 extraResources:
+  # Prisma generates its client into node_modules/.prisma, a dot-directory
+  # that is not a package in package.json — so the packager, which collects
+  # node_modules by walking declared dependencies, never reaches it. The
+  # result is an app that dies on its first line: @prisma/client is present,
+  # and it immediately requires '.prisma/client/default', which is not.
+  #
+  # It cannot be added to `files` for the same reason. It goes here instead,
+  # beside the archive rather than inside it, because Node resolves modules by
+  # walking parent directories and that walk continues out of the asar into
+  # Resources. The engine binaries are excluded: they are large, one per
+  # platform, and ship separately below.
+  - from: node_modules/.prisma/client
+    to: node_modules/.prisma/client
+    filter:
+      - '**/*'
+      - '!*.node'
+  # Its other half. See the exclusion in `files` above for why it cannot stay
+  # in the archive once the generated client has left it.
+  - from: node_modules/@prisma/client
+    to: node_modules/@prisma/client
+    filter:
+      - '**/*'
   - from: prisma/migrations
     to: prisma/migrations
     filter:
       - '**/*.sql'
-  # Prisma's query engine is a native binary living in a dot-directory that
-  # electron-builder does not collect. Node also cannot dlopen anything from
-  # inside an asar, so it ships as a plain resource. Without it @prisma/client
-  # hangs at import — before a window is drawn or a single line is logged, so
-  # the application simply looks as though it never started.
-  - from: node_modules/.prisma/client
-    to: prisma-engine
-    filter:
-      - '*.node'
-      - 'schema.prisma'
+  # Prisma's query engine is a native binary that Node cannot dlopen from
+  # inside an asar, so it ships as a plain resource. It is named per platform
+  # in the win/mac blocks below: a build carries an engine for every target in
+  # binaryTargets, and shipping all of them means the Windows app finds the
+  # macOS dylib first and refuses to start.
 win:
   executableName: main-local
   extraResources:
@@ -45,6 +72,11 @@ win:
       to: postgres
       filter:
         - '**/*'
+    - from: node_modules/.prisma/client
+      to: prisma-engine
+      filter:
+        - 'query_engine-windows*.node'
+        - 'schema.prisma'
   # x64 explicitly. electron-builder otherwise builds for whatever the machine
   # doing the building happens to be — an Apple Silicon Mac produces an arm64
   # Windows installer, which is not what is on a shop counter, and which would
@@ -68,6 +100,11 @@ mac:
       to: postgres
       filter:
         - '**/*'
+    - from: node_modules/.prisma/client
+      to: prisma-engine
+      filter:
+        - 'libquery_engine-darwin*.node'
+        - 'schema.prisma'
   entitlementsInherit: build/entitlements.mac.plist
   entitlements: build/entitlements.mac.plist
   # This build is not notarised — there is no Apple Developer identity behind

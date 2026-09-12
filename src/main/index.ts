@@ -1,3 +1,6 @@
+// Must be first: it installs the handlers that record a failure in any of
+// the imports below. See crashlog.ts.
+import './crashlog'
 import { app, shell, BrowserWindow, ipcMain, dialog } from 'electron'
 import { join } from 'path'
 import os from 'os'
@@ -18,6 +21,7 @@ import { startRefreshLoop, checkClockTamper } from './licenseGuard'
 import { getMachineId } from './machineId'
 import { randomBytes } from 'crypto'
 import { dirname } from 'path'
+
 
 /**
  * Per-install session secret.
@@ -188,9 +192,25 @@ function createWindow(): void {
     }
   })
 
-  mainWindow.on('ready-to-show', () => {
+  // Show on whichever of these arrives first.
+  //
+  // 'ready-to-show' is the documented signal and usually the right one, but it
+  // did not fire at all for this page under Electron 39: the window existed,
+  // the renderer loaded and ran, and nothing was ever put on screen — an app
+  // that looks exactly as though it failed to start. A till that cannot be
+  // seen is a till that cannot be used, so the window is shown when the
+  // content finishes loading too, and unconditionally shortly after that.
+  let shown = false
+  const reveal = (why: string): void => {
+    if (shown || mainWindow.isDestroyed()) return
+    shown = true
     mainWindow.show()
-  })
+    bootLog(`window shown (${why})`)
+  }
+  mainWindow.on('ready-to-show', () => reveal('ready-to-show'))
+  mainWindow.webContents.on('did-finish-load', () => reveal('did-finish-load'))
+  const failsafe = setTimeout(() => reveal('failsafe timer'), 10_000)
+  mainWindow.on('closed', () => clearTimeout(failsafe))
 
   mainWindow.webContents.setWindowOpenHandler((details) => {
     shell.openExternal(details.url)
@@ -218,6 +238,8 @@ function createWindow(): void {
  * point of doing it this way rather than switching certificate checking off.
  */
 let ownCertFingerprint: string | null = null
+/** The certificate established at startup, reused when Express starts. */
+let branchTls: Awaited<ReturnType<typeof ensureBranchCert>> | null = null
 
 app.on('certificate-error', (event, _webContents, url, _error, certificate, callback) => {
   const presented = fingerprintOfPem(certificate.data)
@@ -262,6 +284,30 @@ app.whenReady().then(async () => {
   //
   // With the window already up, a slow first launch looks like a slow first
   // launch, and a failed one has somewhere to say so.
+  // The branch certificate, before the window exists.
+  //
+  // The window's very first act is to call its own API over HTTPS, and that
+  // handshake is judged by the 'certificate-error' handler against
+  // ownCertFingerprint. Establishing the certificate further down — after the
+  // database, as it used to be — meant the fingerprint was still null when the
+  // window asked, so the app refused its own certificate and the manager
+  // screen could reach nothing. Express still starts later; only the identity
+  // it will serve under has to be settled first.
+  try {
+    const tls = await ensureBranchCert(app.getPath('userData'))
+    setBranchCertFingerprint(tls.fingerprint)
+    ownCertFingerprint = tls.fingerprint
+    branchTls = tls
+    bootLog(`branch certificate ready — ${tls.fingerprint.slice(0, 16)}…`)
+  } catch (e) {
+    // Not fatal here: the window is still worth showing, and the server's own
+    // startup below reports the failure where a person will see it.
+    bootLog(`branch certificate failed: ${e instanceof Error ? e.message : String(e)}`)
+  }
+  // Registered before the window loads, for the same reason: the renderer asks
+  // for this on mount, and a handler registered later is simply not there.
+  ipcMain.handle('get-cert-fingerprint', () => ownCertFingerprint)
+
   createWindow()
   await new Promise((r) => setTimeout(r, 50))   // let the first frame paint
 
@@ -442,10 +488,11 @@ app.whenReady().then(async () => {
   // pairing, so the shop's Wi-Fi stops being a place to read sessions and
   // bills off the wire — or to answer in this server's place.
   try {
-    const tls = await ensureBranchCert(app.getPath('userData'))
+    // Established before the window was created, so that the window could
+    // trust it. Only re-read here if that failed.
+    const tls = branchTls ?? (await ensureBranchCert(app.getPath('userData')))
     setBranchCertFingerprint(tls.fingerprint)
     ownCertFingerprint = tls.fingerprint
-    ipcMain.handle('get-cert-fingerprint', () => tls.fingerprint)
     console.log(`[tls] serving ${tls.hosts.join(', ')} — expires ${tls.validTo}`)
     const port = await startExpressServer(parseInt(process.env.LOCAL_SERVER_PORT || '52001'), tls)
     console.log(`Express API started on port ${port}`)
