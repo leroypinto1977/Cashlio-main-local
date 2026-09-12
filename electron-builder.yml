@@ -3,6 +3,12 @@ productName: Cashlio Manager
 directories:
   buildResources: build
 files:
+  # The database runtimes are delivered per platform by the extraResources
+  # blocks below. Without this exclusion they ALSO get swept into the app
+  # directory — both of them, on every platform — so a macOS build carried the
+  # whole Windows PostgreSQL and codesign spent twenty minutes signing Windows
+  # DLLs and several thousand timezone files into a macOS bundle.
+  - '!resources/postgres'
   - '!**/.vscode/*'
   - '!src/*'
   - '!electron.vite.config.{js,ts,mjs,cjs}'
@@ -11,6 +17,7 @@ files:
   - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
 asarUnpack:
   - resources/**
+  - '!resources/postgres/**'
 # The migrations travel with the app for every platform; the database itself is
 # named per platform below, because ${platform} in a shared block resolves to
 # the machine doing the building rather than the target — an Apple Silicon Mac
