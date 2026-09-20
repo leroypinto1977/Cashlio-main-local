@@ -77,6 +77,34 @@ function portFile(): string {
   return path.join(app.getPath('userData'), '.pgport')
 }
 
+/**
+ * What a live server records about itself, in the data directory.
+ *
+ * This is the authority on the port, not `.pgport`: a server we did not start
+ * — one orphaned by a previous run that was killed rather than quit — is on
+ * whichever port it chose then, and asking it anything means going there.
+ */
+function readPostmasterPid(data: string): { pid: number; port: number } | null {
+  try {
+    const lines = fs.readFileSync(path.join(data, 'postmaster.pid'), 'utf8').split('\n')
+    const pid = parseInt((lines[0] ?? '').trim(), 10)
+    const port = parseInt((lines[3] ?? '').trim(), 10)
+    if (pid > 0 && port > 0) return { pid, port }
+  } catch { /* no pid file: nothing is running */ }
+  return null
+}
+
+/**
+ * Is a server already up for this data directory?
+ *
+ * pg_ctl decides, because a `postmaster.pid` left behind by a process that is
+ * gone looks exactly like one belonging to a process that is not.
+ */
+function runningCluster(bin: string, data: string): { pid: number; port: number } | null {
+  const r = spawnSync(exe(bin, 'pg_ctl'), ['-D', data, 'status'], { encoding: 'utf8' })
+  return r.status === 0 ? readPostmasterPid(data) : null
+}
+
 function run(
   cmd: string,
   args: string[],
@@ -142,36 +170,87 @@ export async function startBundledPostgres(): Promise<PostgresHandle | null> {
     }
   }
 
-  // Reuse the port a previous run settled on, so a restart does not strand
-  // anything that remembered it.
+  // A server may already be up for this data directory: the previous run was
+  // killed rather than quit, or a second copy of the app is coming up beside
+  // this one. Adopting it is the only thing that can work — two postmasters
+  // cannot share a data directory — and it is what a person expects: their
+  // shop opens. What used to happen instead was a fatal dialog, because
+  // pg_ctl's word for this is "another server might be running", and the one
+  // phrase this treated as harmless was "already running".
   let port = 0
-  try {
-    const saved = parseInt(fs.readFileSync(portFile(), 'utf8').trim(), 10)
-    if (Number.isFinite(saved) && saved > 0) port = saved
-  } catch { /* first run */ }
-  if (!port) port = await freePort()
-  fs.writeFileSync(portFile(), String(port))
+  const adopt = (found: { pid: number; port: number }, how: string): void => {
+    port = found.port
+    fs.writeFileSync(portFile(), String(port))
+    console.log(`[pg] ${how}: server on 127.0.0.1:${port} (pid ${found.pid})`)
+  }
 
-  const logFile = path.join(app.getPath('userData'), 'postgres.log')
-  // -h 127.0.0.1 binds to the loopback only: the shop's database is not on the
-  // shop's Wi-Fi. Tills reach the shop through the Express server, which has
-  // its own TLS and pairing, not through this.
-  const start = run(exe(bin, 'pg_ctl'), [
-    '-D', data, '-l', logFile, '-w', '-t', '30',
-    '-o', `-p ${port} -h 127.0.0.1`,
-    'start'
-  ])
-  if (!start.ok && !/already running/i.test(start.stdout + start.stderr)) {
-    const tail = (() => {
-      try { return fs.readFileSync(logFile, 'utf8').trim().split('\n').slice(-8).join('\n') } catch { return '' }
-    })()
-    throw new Error(`the database would not start: ${start.stderr.trim().slice(0, 300)}\n${tail}`)
+  const alreadyUp = runningCluster(bin, data)
+  if (alreadyUp) adopt(alreadyUp, 'adopting the server already running')
+
+  if (!port) {
+    // Reuse the port a previous run settled on, so a restart does not strand
+    // anything that remembered it.
+    try {
+      const saved = parseInt(fs.readFileSync(portFile(), 'utf8').trim(), 10)
+      if (Number.isFinite(saved) && saved > 0) port = saved
+    } catch { /* first run */ }
+    if (!port) port = await freePort()
+    fs.writeFileSync(portFile(), String(port))
+
+    // -h 127.0.0.1 binds to the loopback only: the shop's database is not on
+    // the shop's Wi-Fi. Tills reach the shop through the Express server, which
+    // has its own TLS and pairing, not through this.
+    const startWith = (log: string): ReturnType<typeof run> =>
+      run(exe(bin, 'pg_ctl'), [
+        '-D', data, '-l', log, '-w', '-t', '30',
+        '-o', `-p ${port} -h 127.0.0.1`,
+        'start'
+      ])
+
+    let logFile = path.join(app.getPath('userData'), 'postgres.log')
+    let start = startWith(logFile)
+
+    // On Windows the log file can be held open by a process this one cannot
+    // see, and pg_ctl treats that as fatal before it has even tried to start
+    // the server. Where the log goes is not worth failing a shop's morning
+    // over, so it goes somewhere else — one file per process, not per attempt,
+    // so a machine that hits this every launch does not fill up with them.
+    if (!start.ok && /could not open log file/i.test(start.stdout + start.stderr)) {
+      logFile = path.join(app.getPath('userData'), `postgres-${process.pid}.log`)
+      console.log(`[pg] log file was locked — writing to ${path.basename(logFile)} instead`)
+      start = startWith(logFile)
+    }
+
+    if (!start.ok) {
+      // pg_ctl can report failure over a server that is up: it gave up waiting,
+      // or it refused to start beside one that was already there. Ask again
+      // before calling this fatal.
+      const nowUp = runningCluster(bin, data)
+      if (nowUp) {
+        adopt(nowUp, 'server came up despite pg_ctl reporting failure')
+      } else {
+        const tail = (() => {
+          try { return fs.readFileSync(logFile, 'utf8').trim().split('\n').slice(-8).join('\n') } catch { return '' }
+        })()
+        throw new Error(
+          `the database would not start: ${(start.stderr || start.stdout).trim().slice(0, 300)}\n${tail}`
+        )
+      }
+    }
   }
 
   const adminUrl = `postgresql://${DB_USER}:${encodeURIComponent(password)}@127.0.0.1:${port}/postgres`
   const exists = run(exe(bin, 'psql'), ['-t', '-A', '-c',
     `SELECT 1 FROM pg_database WHERE datname = '${DB_NAME}'`, adminUrl])
-  if (exists.ok && exists.stdout.trim() !== '1') {
+  // A server that will not answer is a failure, and saying so here is the
+  // difference between one clear sentence and Prisma's account of the same
+  // problem several screens later.
+  if (!exists.ok) {
+    throw new Error(
+      `the database is running on port ${port} but would not answer: ${exists.stderr.trim().slice(0, 300)}`
+    )
+  }
+  if (exists.stdout.trim() !== '1') {
     const created = run(exe(bin, 'psql'), ['-c', `CREATE DATABASE "${DB_NAME}"`, adminUrl])
     if (!created.ok) throw new Error(`could not create the shop database: ${created.stderr.trim().slice(0, 300)}`)
   }

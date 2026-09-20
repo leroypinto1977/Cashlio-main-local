@@ -257,7 +257,36 @@ app.on('certificate-error', (event, _webContents, url, _error, certificate, call
   callback(false)
 })
 
+/**
+ * One copy of this application per machine.
+ *
+ * Two copies is not a cosmetic problem. Each one brings up the database, and
+ * two of them cannot: a data directory belongs to one server, so the second
+ * finds the first's and stops with a message about the database that reads,
+ * to a shopkeeper, as the shop being broken. It is easy to get there without
+ * meaning to — the installer offers to run the app, and the desktop shortcut
+ * is right there — so the second copy now steps aside and shows the window
+ * that is already open.
+ */
+const isPrimaryInstance = app.requestSingleInstanceLock()
+if (!isPrimaryInstance) {
+  console.log('[app] another copy of Cashlio is already running — handing over to it')
+  app.quit()
+}
+
+app.on('second-instance', () => {
+  const [existing] = BrowserWindow.getAllWindows()
+  if (!existing) return
+  if (existing.isMinimized()) existing.restore()
+  existing.show()
+  existing.focus()
+})
+
 app.whenReady().then(async () => {
+  // The lock was lost above: this copy is on its way out and must not touch
+  // the data directory on the way.
+  if (!isPrimaryInstance) return
+
   // Set app user model id for windows
   electronApp.setAppUserModelId('com.cashlio.manager')
 
