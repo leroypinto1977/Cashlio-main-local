@@ -1,3 +1,4 @@
+import './lib/webShim'
 import './assets/main.css'
 
 import { StrictMode } from 'react'

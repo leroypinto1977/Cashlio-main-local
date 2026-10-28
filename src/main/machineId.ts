@@ -104,6 +104,8 @@ let cached: string | null = null
  * machine and fail the hardware check on a shop that had done nothing wrong.
  */
 export function getMachineId(userDataDir?: string): string {
+  // A hosted test server has no hardware of its own to identify; it is given one.
+  if (process.env.MACHINE_ID) return process.env.MACHINE_ID
   if (cached) return cached
 
   const file = userDataDir ? join(userDataDir, 'machine.id') : null

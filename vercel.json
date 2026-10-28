@@ -1,0 +1,7 @@
+{
+  "framework": null,
+  "installCommand": "npm ci --ignore-scripts",
+  "buildCommand": "./scripts/build-web.sh",
+  "outputDirectory": ".vercel/output",
+  "git": { "deploymentEnabled": { "main": true, "*": false } }
+}

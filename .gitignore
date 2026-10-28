@@ -49,3 +49,5 @@ build/vc_redist.x64.exe
 
 # Local tooling state — per-machine, not project code.
 .claude-flow/
+.vercel
+.env*
