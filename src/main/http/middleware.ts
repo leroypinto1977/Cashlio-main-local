@@ -2,7 +2,7 @@ import { Request, Response, NextFunction } from 'express'
 import jwt from 'jsonwebtoken'
 import { prisma } from '../prisma'
 import { getLicenseStatus, refreshIfStale } from '../licenseGuard'
-import { getServerMac } from '../machineId'
+import { getMachineId } from '../machineId'
 
 declare global {
   namespace Express {
@@ -26,7 +26,7 @@ export function requireActiveLicense() {
       // than whenever the four-hourly loop next happens to fire. It does not
       // block: a shop on a bad line has to keep billing.
       if (process.env.SAAS_API_URL) {
-        refreshIfStale(process.env.SAAS_API_URL, getServerMac())
+        refreshIfStale(process.env.SAAS_API_URL, getMachineId())
       }
       const status = await getLicenseStatus()
       if (status.locked) {

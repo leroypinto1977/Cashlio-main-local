@@ -40,7 +40,9 @@ router.get('/api/v1/system/status', async (_req, res) => {
 
 router.post('/api/v1/system/save-config', async (req, res) => {
   try {
-    const { licenseKey, hardwareId, branchName = 'PENDING_SETUP', shopName = 'My Shop' } = req.body
+    const { licenseKey, branchName = 'PENDING_SETUP', shopName = 'My Shop' } = req.body
+    // A hosted server is activated as itself; the browser asking cannot know who that is.
+    const hardwareId = process.env.MACHINE_ID || req.body.hardwareId
 
     // This used to fall back to a fixed placeholder, which would have given
     // every installation in the world the same identity — collapsing the

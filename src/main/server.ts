@@ -32,7 +32,7 @@ import { router as syncRoutes } from './routes/sync'
  * Each router keeps its own routes in their original order, so that ordering
  * is preserved within a file as well as between them.
  */
-const app = express()
+export const app = express()
 
 
 
