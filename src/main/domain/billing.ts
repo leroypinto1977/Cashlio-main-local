@@ -282,6 +282,12 @@ export async function createBillCore(tx: TxClient, args: CreateBillArgs, billNum
   // The moment of sale, not the moment of arrival. Everything dated off the
   // bill — the day's takings, credit ageing, warranty cover — hangs on this.
   const soldAt = args.soldAt ?? new Date()
+  // A bill-level discount has to be a real amount. Number('abc') is NaN, and
+  // NaN slips through every comparison below — including the credit check.
+  const requestedBillDiscount = Number(args.discountAmount ?? 0)
+  if (!Number.isFinite(requestedBillDiscount) || requestedBillDiscount < 0) {
+    throw Object.assign(new Error('INVALID_DISCOUNT'), { code: 'INVALID_DISCOUNT' })
+  }
   type FinalLine = {
     productId: string; itemCode: string; productName: string; unitOfMeasure: string
     hsnCode: string | null
@@ -360,7 +366,11 @@ export async function createBillCore(tx: TxClient, args: CreateBillArgs, billNum
       })
     }
 
-    const maxFlatDiscount = round2(item.quantity * unitRate * (MAX_LINE_DISCOUNT_PCT / 100))
+    // Measured against what the percentage discount leaves, so the two
+    // together can never take a line past MAX_LINE_DISCOUNT_PCT.
+    const maxFlatDiscount = round2(
+      item.quantity * unitRate * ((MAX_LINE_DISCOUNT_PCT - lineDiscountPct) / 100)
+    )
     if (lineDiscountAmt < 0 || lineDiscountAmt > maxFlatDiscount) {
       throw Object.assign(new Error('INVALID_LINE_DISCOUNT'), {
         code: 'INVALID_LINE_DISCOUNT', productName: product.name,
@@ -471,7 +481,7 @@ export async function createBillCore(tx: TxClient, args: CreateBillArgs, billNum
   }
 
   const { interState, placeOfSupply } = await resolveTaxContext(tx, args.customerId)
-  const totals = computeInvoiceTotals(lines, args.discountAmount, interState)
+  const totals = computeInvoiceTotals(lines, requestedBillDiscount, interState)
   lines.forEach((l, i) => {
     const t = totals.lines[i]
     l.billDiscountAmt = t.billDiscountAmt
@@ -482,6 +492,18 @@ export async function createBillCore(tx: TxClient, args: CreateBillArgs, billNum
     l.igstAmount = t.igstAmount
   })
   const { subtotal, billDiscount, totalAmount, taxableValue, gstAmount, cgstAmount, sgstAmount, igstAmount } = totals
+  // Each discount is capped on its own above; this caps what they add up to.
+  // Without it a bill-level discount still reaches 100% off — the result the
+  // rate check exists to stop — and stock leaves under a ₹0 invoice.
+  if (!args.allowPriceOverride) {
+    const catalogueValue = round2(lines.reduce((s, l) => s + l.quantity * l.unitRate, 0))
+    const floor = round2(catalogueValue * ((100 - MAX_LINE_DISCOUNT_PCT) / 100))
+    if (totalAmount < floor) {
+      throw Object.assign(new Error('INVALID_DISCOUNT'), {
+        code: 'INVALID_DISCOUNT', maxPercent: MAX_LINE_DISCOUNT_PCT
+      })
+    }
+  }
   // What was actually handed over decides how much is still owed.
   const tenders: Tender[] = args.settleInFull
     ? [{ method: args.paymentMethod, amount: totalAmount }]

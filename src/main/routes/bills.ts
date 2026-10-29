@@ -290,6 +290,16 @@ router.post('/api/v1/bills', requireActiveLicense(), requireAuth(), async (req, 
         maxAmount: e.maxAmount
       })
     }
+    if (e.code === 'INVALID_DISCOUNT') {
+      return res.status(400).json({
+        success: false,
+        error: 'INVALID_DISCOUNT',
+        message: e.maxPercent
+          ? `Discounts on this bill add up to more than ${e.maxPercent}% off.`
+          : 'That bill discount is not a valid amount.',
+        maxPercent: e.maxPercent
+      })
+    }
     if (e.code === 'PRODUCT_INACTIVE') {
       return res.status(409).json({
         success: false,

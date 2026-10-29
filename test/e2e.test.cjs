@@ -714,6 +714,16 @@ async function api(path, opts = {}, token) {
   r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
     originDeviceId: device.id, paymentMethod: 'CASH', items: gline({ lineDiscountAmt: 99999 }) })}, cashierToken)
   t('oversized flat discount refused', r.status === 400 && r.body.error === 'INVALID_LINE_DISCOUNT', r.body)
+  // Each cap held on its own, but 90% plus a 10% flat amount still came to ₹0.
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, paymentMethod: 'CASH', items: gline({ lineDiscountPct: 90, lineDiscountAmt: 4500 }) })}, cashierToken)
+  t('stacked line discounts cannot pass 90%', r.status === 400 && r.body.error === 'INVALID_LINE_DISCOUNT', r.body)
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, paymentMethod: 'CASH', items: gline({}), discountAmount: 999999 })}, cashierToken)
+  t('a bill discount cannot take the bill to ₹0', r.status === 400 && r.body.error === 'INVALID_DISCOUNT', r.body)
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, paymentMethod: 'CASH', items: gline({}), discountAmount: 'free' })}, cashierToken)
+  t('a non-numeric bill discount is refused', r.status === 400 && r.body.error === 'INVALID_DISCOUNT', r.body)
   r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
     originDeviceId: device.id, paymentMethod: 'CASH', items: gline({ unitRate: 1 }) })}, cashierToken)
   t('cashier cannot set the price', r.status === 403 && r.body.error === 'PRICE_OVERRIDE_NOT_ALLOWED', r.body)
