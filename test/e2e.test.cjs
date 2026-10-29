@@ -714,6 +714,16 @@ async function api(path, opts = {}, token) {
   r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
     originDeviceId: device.id, paymentMethod: 'CASH', items: gline({ lineDiscountAmt: 99999 }) })}, cashierToken)
   t('oversized flat discount refused', r.status === 400 && r.body.error === 'INVALID_LINE_DISCOUNT', r.body)
+  // Each cap held on its own, but 90% plus a 10% flat amount still came to ₹0.
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, paymentMethod: 'CASH', items: gline({ lineDiscountPct: 90, lineDiscountAmt: 4500 }) })}, cashierToken)
+  t('stacked line discounts cannot pass 90%', r.status === 400 && r.body.error === 'INVALID_LINE_DISCOUNT', r.body)
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, paymentMethod: 'CASH', items: gline({}), discountAmount: 999999 })}, cashierToken)
+  t('a bill discount cannot take the bill to ₹0', r.status === 400 && r.body.error === 'INVALID_DISCOUNT', r.body)
+  r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
+    originDeviceId: device.id, paymentMethod: 'CASH', items: gline({}), discountAmount: 'free' })}, cashierToken)
+  t('a non-numeric bill discount is refused', r.status === 400 && r.body.error === 'INVALID_DISCOUNT', r.body)
   r = await api('/api/v1/bills', { method: 'POST', body: JSON.stringify({
     originDeviceId: device.id, paymentMethod: 'CASH', items: gline({ unitRate: 1 }) })}, cashierToken)
   t('cashier cannot set the price', r.status === 403 && r.body.error === 'PRICE_OVERRIDE_NOT_ALLOWED', r.body)
@@ -1502,6 +1512,18 @@ async function api(path, opts = {}, token) {
     // The last super admin cannot switch themselves off, or be switched off.
     const selfOff = await api(`/api/v1/users/${admin.id}`, { method: 'PUT', body: JSON.stringify({ isActive: false }) }, token)
     eqp('you cannot switch off your own account', selfOff.status, 409)
+  }
+
+  console.log('\n— a burst of guesses is held to the same limit —')
+  {
+    // Sent together, these all used to pass the check before any one of them
+    // had been counted.
+    const burst = await Promise.all(Array.from({ length: 30 }, (_, i) =>
+      api('/api/v1/auth/login', { method: 'POST', body: JSON.stringify({
+        username: 'burst-target', password: `wrong-${i}` }) })))
+    const checked = burst.filter((x) => x.status === 401).length
+    t('no more than ten guesses are checked', checked <= 10, { checked })
+    t('the rest are turned away', burst.some((x) => x.status === 429), burst.map((x) => x.status))
   }
 
   console.log('\n— guessing a password takes more than a minute —')
