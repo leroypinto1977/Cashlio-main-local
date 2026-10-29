@@ -1514,6 +1514,18 @@ async function api(path, opts = {}, token) {
     eqp('you cannot switch off your own account', selfOff.status, 409)
   }
 
+  console.log('\n— a burst of guesses is held to the same limit —')
+  {
+    // Sent together, these all used to pass the check before any one of them
+    // had been counted.
+    const burst = await Promise.all(Array.from({ length: 30 }, (_, i) =>
+      api('/api/v1/auth/login', { method: 'POST', body: JSON.stringify({
+        username: 'burst-target', password: `wrong-${i}` }) })))
+    const checked = burst.filter((x) => x.status === 401).length
+    t('no more than ten guesses are checked', checked <= 10, { checked })
+    t('the rest are turned away', burst.some((x) => x.status === 429), burst.map((x) => x.status))
+  }
+
   console.log('\n— guessing a password takes more than a minute —')
   {
     let last

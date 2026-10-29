@@ -331,7 +331,9 @@ const LOGIN_MAX_FAILURES = 10
 const loginFailures = new Map<string, { count: number; first: number }>()
 
 function loginKeys(username: string, ip: string): string[] {
-  return [`u:${username.toLowerCase()}`, `a:${ip}`]
+  // Real usernames are at most 32 characters; the cap stops a 2 MB "username"
+  // from becoming a 2 MB key that sits in the map for the whole window.
+  return [`u:${username.toLowerCase().slice(0, 64)}`, `a:${ip}`]
 }
 
 function loginBlockedFor(keys: string[], now = Date.now()): number {
@@ -362,6 +364,12 @@ function noteLoginFailure(keys: string[], now = Date.now()): void {
     for (const [k, e] of loginFailures) {
       if (now - e.first > LOGIN_WINDOW_MS) loginFailures.delete(k)
     }
+    // Still over: drop the oldest. Entries inside the window never expire on
+    // their own, so without this the ceiling was not a ceiling.
+    for (const k of loginFailures.keys()) {
+      if (loginFailures.size <= 5000) break
+      loginFailures.delete(k)
+    }
   }
 }
 
@@ -390,10 +398,15 @@ router.post('/api/v1/auth/login', async (req, res) => {
       })
     }
 
+    // Counted now, before the first await, and forgiven below on success.
+    // Counted after the password check, every request that arrived while the
+    // first was still being checked saw a clean slate — so a burst sent all at
+    // once was never limited at all.
+    noteLoginFailure(keys)
+
     const user = username ? await prisma.user.findUnique({ where: { username } }) : null
 
     if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
-      noteLoginFailure(keys)
       return res.status(401).json({ success: false, error: 'INVALID_CREDENTIALS' })
     }
 
